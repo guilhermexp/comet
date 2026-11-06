@@ -7,9 +7,9 @@
 //!
 //! * `COMET_OMP_LIVE_TURNS`   turns, one process each (default 4, minimum 2)
 //! * `COMET_OMP_LIVE_MODEL`   `provider/model` (default `anthropic/claude-sonnet-5-5`)
-//! * `COMET_OMP_LIVE_OUT`     directory for `report.txt` and the session copy
+//! * `COMET_OMP_LIVE_OUT`     base directory; each test owns a named subdirectory
 //! * `COMET_OMP_LIVE_CAPTURE` `1` sets `PI_REQ_DEBUG=1`: omp then writes every
-//!   provider request/response to `rr-session-N.json` in `<out>/capture/`
+//!   provider request/response to `rr-session-N.json` in `<out>/<test>/capture/`
 //!   (its working directory). No omp change; the request-diff evidence uses it.
 //!
 //! The harness registers host tools through the fixture workers controller, so
@@ -184,6 +184,9 @@ fn report(analysis: &Analysis) -> String {
 
 fn request(model: &str, cwd: &Path, resume: Option<String>, prompt: String) -> RunRequest {
     RunRequest {
+        access: Default::default(),
+        extra_mcp: Default::default(),
+        plan: Default::default(),
         prompt,
         harness: Some(HarnessId::Omp),
         model: Some(model.to_owned()),
@@ -262,8 +265,52 @@ struct Live {
     harness: OmpHarness,
 }
 
+/// Prepare only this test's capture namespace before any process is launched.
+fn prepare_capture(out: &Path) -> PathBuf {
+    let cwd = out.join("capture");
+    match std::fs::remove_dir_all(&cwd) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("failed to clear capture {}: {error}", cwd.display()),
+    }
+    std::fs::create_dir_all(&cwd).unwrap();
+    cwd
+}
+
+#[test]
+fn preparing_live_capture_discards_previous_process_boundaries_and_requests() {
+    let root = tempfile::tempdir().unwrap();
+    let out = root.path().join("this-test");
+    let cwd = prepare_capture(&out);
+    std::fs::write(cwd.join("rr-session-900.json"), "old request").unwrap();
+    note_process_boundary(&cwd);
+    let sibling = root.path().join("other-test/capture");
+    std::fs::create_dir_all(&sibling).unwrap();
+    std::fs::write(sibling.join("boundaries.json"), "[700]").unwrap();
+
+    let cwd = prepare_capture(&out);
+    std::fs::write(cwd.join("rr-session-1.json"), "new request").unwrap();
+    note_process_boundary(&cwd);
+    let boundaries: Vec<u64> =
+        serde_json::from_str(&std::fs::read_to_string(cwd.join("boundaries.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        boundaries,
+        [1],
+        "only this execution may contribute process boundaries"
+    );
+    assert!(
+        !cwd.join("rr-session-900.json").exists(),
+        "old request evidence must not survive"
+    );
+    assert_eq!(
+        std::fs::read_to_string(sibling.join("boundaries.json")).unwrap(),
+        "[700]"
+    );
+}
+
 /// `None` unless `COMET_OMP_LIVE_CACHE=1`.
-fn live() -> Option<Live> {
+fn live(test_name: &str) -> Option<Live> {
     if std::env::var("COMET_OMP_LIVE_CACHE").as_deref() != Ok("1") {
         eprintln!("skipped: set COMET_OMP_LIVE_CACHE=1 to run the live OMP cache tests");
         return None;
@@ -277,10 +324,10 @@ fn live() -> Option<Live> {
         .unwrap_or_else(|_| "anthropic/claude-sonnet-5-5".into());
     let out = std::env::var_os("COMET_OMP_LIVE_OUT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("comet-omp-live-cache"));
+        .unwrap_or_else(|| std::env::temp_dir().join("comet-omp-live-cache"))
+        .join(test_name);
     let capture = std::env::var("COMET_OMP_LIVE_CAPTURE").as_deref() == Ok("1");
-    let cwd = out.join("capture");
-    std::fs::create_dir_all(&cwd).unwrap();
+    let cwd = prepare_capture(&out);
     let mut env = HashMap::new();
     if capture {
         env.insert("PI_REQ_DEBUG".to_owned(), "1".to_owned());
@@ -425,7 +472,9 @@ impl Live {
 /// `OmpHarness::run` resuming the previous session file.
 #[tokio::test]
 async fn a_resumed_omp_process_keeps_the_prompt_cache() {
-    let Some(live) = live() else { return };
+    let Some(live) = live("a_resumed_omp_process_keeps_the_prompt_cache") else {
+        return;
+    };
     let mut session: Option<String> = None;
     for turn in 1..=live.turns {
         let (controls, steer_tx) = controls();
@@ -457,7 +506,9 @@ async fn a_resumed_omp_process_keeps_the_prompt_cache() {
 /// as a `prompt` into the same real omp process.
 #[tokio::test]
 async fn a_warm_omp_process_takes_every_next_message_as_a_prompt() {
-    let Some(live) = live() else { return };
+    let Some(live) = live("a_warm_omp_process_takes_every_next_message_as_a_prompt") else {
+        return;
+    };
     let (controls, steer_tx) = controls();
     let mut stream = live
         .harness

@@ -38,6 +38,10 @@ fn init_quiesce_env() {
 
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
+        access: Default::default(),
+        plan: Default::default(),
+        extra_mcp: Default::default(),
+
         mcp: None,
         prompt: prompt.into(),
         harness: None,

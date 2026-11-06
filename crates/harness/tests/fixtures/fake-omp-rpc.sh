@@ -154,6 +154,29 @@ while IFS= read -r line; do
   # test can count launches (distinct pids) and wire commands.
   [ -z "${FAKE_OMP_LOG:-}" ] || printf '%s %s\n' "$$" "$(field type "$line")" >> "$FAKE_OMP_LOG"
   [ -z "${FAKE_OMP_LOG:-}" ] || printf '%s\n' "$line" >> "$FAKE_OMP_LOG.raw"
+  if [ "$scenario" = "prompt-order" ]; then
+    case "$(field type "$line")" in
+      prompt)
+        if [ "$(field message "$line")" = "first" ]; then
+          respond "$line" '{}'
+          emit '{"type":"agent_end","messages":[]}'
+        else
+          pending_prompt=$line
+          emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"wire-prompt"}}'
+        fi
+        continue ;;
+      steer)
+        respond "$line" '{}'
+        emit "{\"type\":\"message_start\",\"message\":{\"role\":\"user\",\"steering\":true,\"content\":[{\"type\":\"text\",\"text\":\"$(field message "$line")\"}]}}"
+        emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"wire-steer"}}'
+        continue ;;
+      release_prompt_ack)
+        release_ack=$line
+        respond "$pending_prompt" '{}'
+        respond "$release_ack" '{}'
+        continue ;;
+    esac
+  fi
   case "$(field type "$line")" in
     negotiate_protocol)
       if [ "$scenario" = "refuses-chunked-frames" ]; then

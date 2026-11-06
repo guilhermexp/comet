@@ -274,6 +274,7 @@ pub(crate) fn spaces(now: i64) -> Vec<Space> {
             checkout_id: git.then(|| format!("co-{id}")),
             repository_id: None,
             github_repo: None,
+            icon: None,
             created_at: ms(now - ago),
         };
     let zeron = |mut space: Space| {
@@ -450,6 +451,8 @@ pub(crate) fn seed(
                 reasoning: Some(demo.reasoning),
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
+                access: Default::default(),
+                plan: false,
             }),
             last_message_preview: Some(demo.preview.into()),
             last_message_at: Some(ms(last)),
@@ -463,6 +466,7 @@ pub(crate) fn seed(
             parent_chat_id: demo.parent.map(str::to_owned),
             origin_chat_id: None,
             worked_projects: None,
+            child_kind: None,
         };
         doc.upsert_chat(&chat)?;
         if let Some(status) = demo.status {
@@ -471,6 +475,7 @@ pub(crate) fn seed(
                 last_turn_outcome: None,
                 terminal_activity: None,
                 running_subagents: 0,
+                background_tasks: Vec::new(),
                 chat_id: demo.id.into(),
                 device_id: demo.device.into(),
                 status,
@@ -495,6 +500,7 @@ pub(crate) fn seed(
                     state,
                     base_ref: "main".into(),
                     head_ref: source.branch.clone(),
+                    signals: None,
                 }),
                 updated_at: Utc::now(),
             });

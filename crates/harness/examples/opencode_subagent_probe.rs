@@ -65,10 +65,13 @@ async fn main() {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        access: Default::default(),
+        plan: false,
         attachments: Vec::new(),
         resume: None,
         worktree: None,
         env: Default::default(),
+        extra_mcp: Vec::new(),
     };
     let mut stream = OpencodeHarness::new()
         .run(request, controls)

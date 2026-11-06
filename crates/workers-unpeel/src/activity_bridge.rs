@@ -12,8 +12,6 @@ use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -424,17 +422,10 @@ fn update_registry_at(path: &Path, port: u16, register: bool) {
         return;
     }
     let lock_path = parent.join("app-ports.lock");
-    let Ok(lock) = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .open(lock_path)
-    else {
+    let Ok(lock) = unpeel_core::platform::open_lock_file(&lock_path, false) else {
         return;
     };
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+    if unpeel_core::platform::lock_exclusive(&lock).is_err() {
         return;
     }
     let mut ports = std::fs::read_to_string(path)
@@ -468,9 +459,7 @@ fn update_registry_at(path: &Path, port: u16, register: bool) {
             }
         }
     }
-    unsafe {
-        libc::flock(lock.as_raw_fd(), libc::LOCK_UN);
-    }
+    let _ = unpeel_core::platform::unlock(&lock);
 }
 
 fn start_hook_ingress(change_epoch: Arc<AtomicU64>) -> Result<HookIngress, String> {

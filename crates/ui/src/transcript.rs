@@ -34,11 +34,13 @@ use std::rc::Rc;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use crate::markdown::parser::{InlineRun, InlineStyle};
 use gpui::{
     AnyElement, BorderStyle, Bounds, ClipboardItem, Context, Entity, ListAlignment, ListOffset,
     ListScrollEvent, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ObjectFit, Pixels, Point, ScrollHandle, SharedString, StyledImage as _, StyledText,
-    Subscription, Task, TextRun, Window, canvas, div, img, list, point, prelude::*, px, quad, size,
+    ObjectFit, Pixels, Point, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
+    StyledImage as _, StyledText, Subscription, Task, TextRun, Window, canvas, div, img, list,
+    point, prelude::*, px, quad, size,
 };
 
 use zeron_doc::{
@@ -81,6 +83,11 @@ fn jump_visibility(was_shown: bool, distance: f32) -> bool {
 const MAX_SAVED_VIEWPORTS: usize = 256;
 /// Bound locally-authored queue ids waiting to become transcript prompts.
 const MAX_PENDING_QUEUED_TURNS: usize = 256;
+
+/// A blank transcript waits this long before showing its loader, so a quick
+/// open never flashes one. An executor timer, not an animation delay:
+/// reduced motion snaps animations, it never skips a wait.
+const LOADER_DELAY: Duration = Duration::from_millis(300);
 /// Text-selection edge scrolling runs only during a drag. A 24 ms cadence is
 /// smooth enough to track text while avoiding a permanent animation-frame loop
 /// on low-end devices.
@@ -328,6 +335,10 @@ fn user_message_attachment_summary(
     })
 }
 
+/// Lines a folded bubble's bottom fade spans.
+const USER_FOLD_FADE_LINES: f32 = 1.5;
+/// Lines a folded prompt's Markdown lays out past the fold, under its fade.
+const USER_FOLD_OVERDRAW_LINES: usize = 2;
 /// Between a caption over a user bubble (provider switch, agent sender) and
 /// the bubble.
 const USER_CAPTION_GAP: f32 = 6.0;
@@ -859,6 +870,10 @@ pub enum RowKind {
         /// GitHub/YouTube chips over the projected display text. Like file
         /// mentions, these are derived once while building the cached row.
         url_chips: Arc<Vec<crate::url_chips::UrlChipSpan>>,
+        /// `text` parsed as Markdown, when it uses any and carries no chips
+        /// (their pills paint over `text`'s own layout). `None` shows `text`
+        /// as typed.
+        markdown: Option<UserMarkdown>,
         /// Image refs parsed out of the message text (message-attachments.ts):
         /// thumbnails load from the owning device via ReadAttachmentChunk.
         attachments: Arc<Vec<crate::attachments::UserImageAttachment>>,
@@ -2000,6 +2015,14 @@ fn rows_for_entry_with_todo_history(
             }
             None => (text, Vec::new()),
         };
+        let markdown = (mentions.is_empty() && url_chips.is_empty())
+            .then(|| crate::markdown::parse_message(&text))
+            .filter(|tree| !plain_markdown(tree))
+            .map(|tree| UserMarkdown {
+                folded: folded_markdown(&tree, USER_COLLAPSED_LINES + USER_FOLD_OVERDRAW_LINES)
+                    .map(Arc::new),
+                full: Arc::new(tree),
+            });
         return vec![Row {
             id: entry.id.clone().into(),
             version: (raw.len() as u64) << 1 | pending as u64,
@@ -2008,6 +2031,7 @@ fn rows_for_entry_with_todo_history(
                 text: text.into(),
                 mentions: Arc::new(mentions),
                 url_chips: Arc::new(url_chips),
+                markdown,
                 attachments: Arc::new(attachments),
                 appshot_presentations,
                 badges: Arc::new(badges),
@@ -3968,6 +3992,20 @@ fn tool_payload_height(invocation: Option<&ToolDetail>, result: Option<&ToolDeta
         + TOOL_PAYLOAD_CHROME
 }
 
+/// Tool image preview frame height; widths follow each image's aspect.
+/// Analytic height an open chip's image strip adds (separator + frames).
+
+/// The open image context menu: what to copy and where it lives.
+struct ImageMenu {
+    path: String,
+    devices: Vec<String>,
+    /// A reply's Markdown image: its chat and type. Copy image reads it
+    /// through `ReadChatImageChunk`, under that chat's jail, like the preview.
+    chat_image: Option<(String, &'static str)>,
+    position: Point<Pixels>,
+    active: Option<usize>,
+}
+
 /// Height of the "Show full output/diff" affordance row appended below an
 /// open detail whose full payload lives in the sidecar (chat2-sync A3).
 pub const BLOB_AFFORDANCE_HEIGHT: f32 = 24.0;
@@ -4705,6 +4743,15 @@ pub struct Transcript {
     /// only then may the working trailer render — a frozen snapshot must
     /// never spin, whatever its entries claim.
     doc_live: bool,
+    /// Why this blank transcript is still loading (see
+    /// [`AppState::transcript_loading`]). Its loader shows once it has held
+    /// for [`LOADER_DELAY`].
+    loading: Option<crate::state::TranscriptLoading>,
+    loader_shown: bool,
+    loader_delay: Option<Task<()>>,
+    /// Memory-only viewport state for primary chats visited in this window.
+    /// A transcript instance is shared across tabs, so the active ListState is
+    /// reset on every attach and cannot retain these positions by itself.
     saved_viewports: SavedViewportCache,
     pending_viewport: Option<SavedViewport>,
     viewport_generation: u64,
@@ -4813,6 +4860,15 @@ pub struct Transcript {
     /// re-engaged inside the 70px band, after an own-send first overflows, and
     /// on the jump button.
     pinned: bool,
+    /// The latest wheel/touch input headed for the top of a scrollable list
+    /// and broke the pin as it arrived ([`Transcript::on_scroll_wheel`]); the
+    /// deferred decision in [`Transcript::handle_scroll`] must not re-engage
+    /// it.
+    input_escaped: bool,
+    /// The list took the wheel event in flight ([`Transcript::handle_scroll`]
+    /// runs first): a wheel the list never saw (one an overlay above it let
+    /// bubble) must not break the pin.
+    list_took_input: bool,
     /// A locally-sent prompt currently held near the viewport top while its
     /// reply grows into the empty space below it.
     own_turn: Option<OwnTurnAnchor>,
@@ -4866,6 +4922,12 @@ pub struct Transcript {
     /// follows only when what's lit changes, so scrolling the rail by hand
     /// holds.
     rail_followed: Option<(SharedString, SharedString)>,
+    /// The rail's ticks paired with their rows, kept until the transcript,
+    /// its echoes or its rows change: rebuilding them walks every entry, too
+    /// much for each scroll frame of a long chat.
+    rail_ticks: Option<crate::rail::RailTicks>,
+    /// Bumped whenever `rows` is replaced.
+    rows_revision: u64,
     /// `(row id, entry id)` under the pointer — reveals the entry's timestamp
     /// strip (zeron chat-view.tsx `group-hover`; the rows report hover
     /// themselves). Keyed by ROW so a row→row move within one entry can't
@@ -4909,6 +4971,11 @@ pub struct Transcript {
     /// In-flight ReadAttachmentChunk loads, keyed by device, path, and (for a
     /// generated image) its declared raster MIME — one per source.
     attachment_loads: HashMap<crate::attachments::AttachmentKey, Task<()>>,
+    /// Local images replies name in Markdown: the open chat, the reads its
+    /// rows ask for while laying out, and the rows each image shows in.
+    reply_images: Rc<RefCell<crate::reply_images::ReplyImages>>,
+    /// In-flight ReadChatImageChunk loads (at most `reply_images::MAX_LOADS`).
+    reply_image_loads: HashMap<crate::attachments::AttachmentKey, Task<()>>,
     /// Inline `show_visual` visuals, keyed by row id.
     visuals: HashMap<SharedString, Entity<crate::visuals::VisualFrame>>,
     /// Scheduled retry wake-ups for errored sources (the 2s→15s ladder).
@@ -5225,9 +5292,14 @@ impl Transcript {
             })
             .ok();
         });
-        let observe = cx.observe(&state, |this: &mut Self, _, cx| this.sync(cx));
-        cx.on_release(|this: &mut Self, cx| this.tool_images.clear(cx))
-            .detach();
+        let observe = cx.observe(&state, |this: &mut Self, _, cx| {
+            this.sync(cx);
+            this.sync_loader(cx);
+        });
+        cx.on_release(|this: &mut Self, cx| {
+            this.tool_images.clear(cx);
+        })
+        .detach();
         let text_changes = cx.subscribe(
             &state,
             |this: &mut Self, state, event: &crate::state::TranscriptTextChanged, cx| {
@@ -5263,6 +5335,9 @@ impl Transcript {
             chat_id: doc_override.clone(),
             land_end_pending: doc_override.is_some() && !follow,
             doc_live: doc_override.is_some() && follow,
+            loading: None,
+            loader_shown: false,
+            loader_delay: None,
             doc_override,
             saved_viewports: SavedViewportCache::default(),
             pending_viewport: None,
@@ -5306,6 +5381,8 @@ impl Transcript {
             show_jump_button: false,
             last_scroll_distance: 0.0,
             pinned,
+            input_escaped: false,
+            list_took_input: false,
             own_turn: None,
             pending_queued_turns: PendingQueuedTurns::default(),
             user_collapse_scroll: None,
@@ -5330,6 +5407,8 @@ impl Transcript {
             rail_bounds: Rc::new(Cell::new(None)),
             rail_scroll: gpui::ScrollHandle::new(),
             rail_followed: None,
+            rail_ticks: None,
+            rows_revision: 0,
             hovered_entry: None,
             copied_code: None,
             copied_clear: None,
@@ -5350,6 +5429,8 @@ impl Transcript {
             mermaid_copied_svg: None,
             mermaid_copied_code: None,
             attachment_loads: HashMap::new(),
+            reply_images: Rc::default(),
+            reply_image_loads: HashMap::new(),
             visuals: HashMap::new(),
             attachment_retries: HashMap::new(),
             blob_details: HashMap::new(),
@@ -5364,7 +5445,100 @@ impl Transcript {
             _text_changes: text_changes,
         };
         this.sync(cx);
+        this.sync_loader(cx);
         this
+    }
+
+    /// Follow [`AppState::transcript_loading`], arming the loader's delay
+    /// when loading begins and dropping it the moment anything shows.
+    fn sync_loader(&mut self, cx: &mut Context<Self>) {
+        // A subagent tab reads a doc its parent's sync never speaks for.
+        let loading = if self.doc_override.is_some() {
+            None
+        } else {
+            self.state
+                .read(cx)
+                .transcript_loading(crate::state::clock_now())
+        };
+        if loading == self.loading {
+            return;
+        }
+        self.loading = loading;
+        if loading.is_none() {
+            self.loader_delay = None;
+            if std::mem::take(&mut self.loader_shown) {
+                cx.notify();
+            }
+        } else if self.loader_shown {
+            cx.notify(); // its caption changed
+        } else if self.loader_delay.is_none() {
+            self.loader_delay = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(LOADER_DELAY).await;
+                this.update(cx, |this, cx| {
+                    this.loader_delay = None;
+                    if this.loading.is_some() {
+                        this.loader_shown = true;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }));
+        }
+    }
+
+    /// Centered over the blank list: the zeron loader and what it waits on.
+    fn render_loader(
+        &self,
+        loading: crate::state::TranscriptLoading,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::state::TranscriptLoading as L;
+        let theme = Theme::of(cx).clone();
+        let caption = match loading {
+            L::Opening => "Opening…",
+            L::Syncing => "Syncing…",
+            L::Reconnecting => "Reconnecting…",
+            L::Offline => "Offline — this chat loads when you're back online",
+        };
+        let caption = div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .text_size(crate::typography::ui_rems(12.0))
+            .text_color(theme.text_faint)
+            // Hard offline waits on nothing this app does: the amber dot the
+            // composer and sidebar use, not a spinner.
+            .when(loading == L::Offline, |row| {
+                row.child(div().size(px(5.0)).rounded_full().bg(theme.warning))
+            })
+            .child(SharedString::from(caption));
+        // The overlay is positioned by a still wrapper: `fade_in` restyles
+        // its element `relative` every frame, which would drop it into the
+        // flow below the full-height list, where the pane clips it.
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(motion::fade_in(
+                "transcript-loader",
+                div()
+                    .debug_selector(|| "transcript-loader".into())
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(8.0))
+                    .when(loading != L::Offline, |column| {
+                        column.child(crate::loaders::ring_spinner(
+                            "transcript-loader",
+                            20.0,
+                            theme.text_muted,
+                        ))
+                    })
+                    .child(caption),
+            ))
+            .into_any_element()
     }
 
     // ---- rail plumbing (rendering lives in crate::rail) ----
@@ -5410,6 +5584,10 @@ impl Transcript {
         }
     }
 
+    pub(crate) fn state_entity(&self) -> &Entity<AppState> {
+        &self.state
+    }
+
     pub(crate) fn rail_hover(&self) -> Option<usize> {
         self.rail_hover
     }
@@ -5424,6 +5602,14 @@ impl Transcript {
 
     pub(crate) fn rail_followed_mut(&mut self) -> &mut Option<(SharedString, SharedString)> {
         &mut self.rail_followed
+    }
+
+    pub(crate) fn rail_ticks_mut(&mut self) -> &mut Option<crate::rail::RailTicks> {
+        &mut self.rail_ticks
+    }
+
+    pub(crate) fn rows_revision(&self) -> u64 {
+        self.rows_revision
     }
 
     pub(crate) fn rail_bounds(&self) -> &Rc<Cell<Option<Bounds<Pixels>>>> {
@@ -5576,6 +5762,7 @@ impl Transcript {
         self.scroll_anim = None;
         self.user_collapse_scroll = None;
         self.cancel_user_hold();
+        self.list_took_input = true;
         let released_own_turn = self.own_turn.as_ref().is_some_and(|anchor| anchor.held);
         self.release_own_turn_hold();
         if self.own_turn.is_some() {
@@ -5594,6 +5781,8 @@ impl Transcript {
         cx.defer(move |cx| {
             this.update(cx, |this: &mut Transcript, cx| {
                 this.discard_pending_viewport();
+                this.list_took_input = false;
+                let escaped = std::mem::take(&mut this.input_escaped);
                 // Input owns the viewport immediately, including wheel-down
                 // after background streaming. A held turn can be stale while
                 // frame callbacks are paused; reasserting its old prompt here
@@ -5604,8 +5793,8 @@ impl Transcript {
                     this.last_scroll_distance = distance;
                     // Reaching the end preserves normal tail-follow intent
                     // without reasserting a possibly stale prompt hold.
-                    this.pinned =
-                        distance <= AT_BOTTOM_PX || Self::should_restick(distance, previous);
+                    this.pinned = !escaped
+                        && (distance <= AT_BOTTOM_PX || Self::should_restick(distance, previous));
                     this.spring.reset();
                     this.spring_last_tick = None;
                     // Re-stick only when returning to a short turn's actual
@@ -5617,7 +5806,11 @@ impl Transcript {
                                 >= Self::own_send_inset(ix) - OWN_SEND_SCROLL_SLACK_PX - 2.0
                         })
                     });
-                    if !released_own_turn && at_hold && Self::should_restick(distance, previous) {
+                    if !released_own_turn
+                        && !escaped
+                        && at_hold
+                        && Self::should_restick(distance, previous)
+                    {
                         if let Some(anchor) = this.own_turn.as_mut() {
                             anchor.held = true;
                             anchor.positioned = false;
@@ -5636,7 +5829,7 @@ impl Transcript {
                 let distance = this.distance_from_bottom();
                 let previous = this.last_scroll_distance;
                 this.last_scroll_distance = distance;
-                if distance > previous + 1.0 && distance > AT_BOTTOM_PX {
+                if escaped || (distance > previous + 1.0 && distance > AT_BOTTOM_PX) {
                     // User input moving away from the bottom breaks the pin.
                     // Content growth never lands here — it doesn't fire the
                     // scroll handler (mugen §1e: interrupt from input, not
@@ -5687,6 +5880,32 @@ impl Transcript {
         self.selection_drag_position = Some(event.position);
         self.materialize_scroll_anchor();
         cx.notify();
+    }
+
+    /// A wheel notch headed for the top breaks the pin as it arrives, however
+    /// little it moved, as use-stick-to-bottom's wheel handler does. The
+    /// distance test in [`Self::handle_scroll`] can't see that on its own: a
+    /// smoothed notch starts and ends with sub-pixel slices, and its slices
+    /// arrive on frames, where the spring's step runs before that deferred
+    /// decision, pulling the view back and recording the distance it then
+    /// compares against. Precise (trackpad) input keeps the distance test.
+    /// Children bubble first, so the list has applied the input by now, or
+    /// never saw it.
+    fn on_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        let toward_top = matches!(event.delta, ScrollDelta::Lines(delta) if delta.y > 0.0);
+        self.input_escaped = std::mem::take(&mut self.list_took_input)
+            && toward_top
+            && self.list.max_offset_for_scrollbar().y > px(0.0);
+        if self.input_escaped {
+            self.pinned = false;
+            self.spring.reset();
+            self.spring_last_tick = None;
+        }
     }
 
     fn on_selection_mouse_move(
@@ -6417,6 +6636,8 @@ impl Transcript {
             }
             self.visuals.clear();
             self.chat_id = selected;
+            self.rows.clear();
+            self.rows_revision = self.rows_revision.wrapping_add(1);
             self.tool_images.clear(cx);
             self.image_copy = None;
             self.user_collapse_scroll = None;
@@ -6683,6 +6904,8 @@ impl Transcript {
         match diff_rows(&self.rows, &new_rows) {
             None => {
                 self.rows = new_rows;
+                self.rows_revision = self.rows_revision.wrapping_add(1);
+                self.refresh_protected_attachments(cx);
                 self.release_departed_tool_images(cx);
                 if typography_changed && !self.rows.is_empty() {
                     self.list.remeasure_items(0..self.rows.len());
@@ -6707,6 +6930,11 @@ impl Transcript {
                     visit_row_ids(row, &mut |id| {
                         self.render_cache.borrow_mut().invalidate_row(id);
                     });
+                    if matches!(row.kind, RowKind::User { .. }) {
+                        self.render_cache
+                            .borrow_mut()
+                            .invalidate_row(&user_markdown_key(&row.id));
+                    }
                 }
                 let after = old_range.start + count;
                 if old_range.len() == count {
@@ -6738,6 +6966,7 @@ impl Transcript {
         if typography_changed && !self.rows.is_empty() {
             self.list.remeasure_items(0..self.rows.len());
         }
+        self.rows_revision = self.rows_revision.wrapping_add(1);
         if old_last != self.rows.len().checked_sub(1) {
             if let Some(ix) = old_last.filter(|&ix| ix < self.rows.len()) {
                 // Bottom chrome moves to the new tail too.
@@ -8458,6 +8687,7 @@ impl Transcript {
             .flatten();
 
         let inner = self.render_row_body(ix, &row, window, &theme, cx);
+        self.ensure_reply_image_loads(cx);
 
         // Hover-revealed metadata strip: a RESERVED 32px lane under the
         // entry's last row. Timestamp, copy action, and copied feedback only
@@ -8607,6 +8837,7 @@ impl Transcript {
                 text,
                 mentions,
                 url_chips,
+                markdown,
                 attachments,
                 appshot_presentations,
                 badges,
@@ -8657,117 +8888,17 @@ impl Transcript {
                     );
                 }
                 if !text.is_empty() {
-                    let line_height = f32::from(
-                        crate::typography::ui_rems(USER_LINE_HEIGHT).to_pixels(window.rem_size()),
+                    let content = self.render_user_body(
+                        &row.id,
+                        row_ix,
+                        text.clone(),
+                        mentions,
+                        url_chips,
+                        markdown.clone(),
+                        theme,
+                        window,
+                        cx,
                     );
-                    let collapsed_text_h = USER_COLLAPSED_LINES as f32 * line_height;
-                    // The separate continuation row keeps the collapsed
-                    // height stable while the five text lines stay clipped.
-                    let collapsed_h = collapsed_text_h + line_height;
-                    let measured_h = self
-                        .user_heights
-                        .entry(row.id.clone())
-                        .or_insert_with(|| Rc::new(Cell::new(0.0)))
-                        .clone();
-                    let measured = measured_h.get();
-                    let fold = self.user_folds.get(&row.id).copied().unwrap_or_default();
-                    let expanded = fold.open.unwrap_or(false);
-                    let collapsible = text.lines().count() > USER_COLLAPSED_LINES
-                        || (measured > 0.0 && user_message_overflows(measured, line_height))
-                        || (measured == 0.0 && user_message_needs_collapse(&text));
-                    let full_h = measured_h.get().max(collapsed_h);
-                    if let Some(fold) = self.user_folds.get_mut(&row.id) {
-                        fold.user_expansion_height = (full_h - collapsed_h).max(0.0);
-                    }
-                    let duration_ms = fold
-                        .duration_ms
-                        .max(user_resize_duration_ms(full_h - collapsed_h));
-                    let fold_spec = user_resize_spec(full_h - collapsed_h);
-                    let fold_animating = collapsible
-                        && fold.epoch > 0
-                        && !motion::reduced_motion(cx)
-                        && fold.toggled_at.is_some_and(|at| {
-                            at.elapsed() < Duration::from_millis(duration_ms + 200)
-                        });
-                    let hold_key = row.id.clone();
-                    let hold_height = measured_h.clone();
-                    let hold_selection: Arc<str> = format!("{}:u", row.id).into();
-                    let chip_overlays = self.chip_overlays(&row.id, &mentions, &theme, cx);
-                    // Only a message with URL chips can activate a link.
-                    let chip_link = (!url_chips.is_empty()).then(|| self.link_ui(cx)).flatten();
-                    let text_body =
-                        div()
-                            .debug_selector(|| "user-bubble-text".into())
-                            .child(user_bubble_text(
-                                &row.id,
-                                text.clone(),
-                                mentions,
-                                url_chips,
-                                &theme,
-                                measured_h.clone(),
-                                cx.entity_id(),
-                                chip_overlays,
-                                Rc::new(cx.listener(|this, path: &SharedString, window, cx| {
-                                    this.open_chip_image(path, window, cx);
-                                })),
-                                chip_link,
-                            ));
-                    let body = div()
-                        .id(SharedString::from(format!("{}-body", row.id)))
-                        .when(collapsible, |el| {
-                            let down_key = hold_key.clone();
-                            let down_height = hold_height.clone();
-                            let down_selection = hold_selection.clone();
-                            el.on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.arm_user_hold(
-                                        down_key.clone(),
-                                        row_ix,
-                                        collapsed_h,
-                                        down_height.clone(),
-                                        down_selection.clone(),
-                                        cx,
-                                    );
-                                }),
-                            )
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, _| this.cancel_user_hold()),
-                            )
-                            .on_mouse_up_out(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, _| this.cancel_user_hold()),
-                            )
-                            .on_mouse_move(cx.listener(|this, _, _, _| this.cancel_user_hold()))
-                        });
-                    let clipped_body: AnyElement = if fold_animating {
-                        let from = fold.from;
-                        let to = if expanded { full_h } else { collapsed_h };
-                        let ellipsis_h = if expanded { 0.0 } else { line_height };
-                        body.child(div().overflow_hidden().child(text_body).with_animation(
-                            SharedString::from(format!("{}-user-resize-{}", row.id, fold.epoch)),
-                            fold_spec.animation(),
-                            move |el, t| {
-                                el.h(px((motion::lerp(from, to, t) - ellipsis_h).max(0.0)))
-                            },
-                        ))
-                        .when(!expanded, |el| {
-                            el.child(div().h(px(line_height)).child("..."))
-                        })
-                        .into_any_element()
-                    } else if collapsible && !expanded {
-                        body.child(
-                            div()
-                                .h(px(collapsed_text_h))
-                                .overflow_hidden()
-                                .child(text_body),
-                        )
-                        .child(div().h(px(line_height)).child("..."))
-                        .into_any_element()
-                    } else {
-                        body.child(text_body).into_any_element()
-                    };
                     let bubble = div()
                         .min_w_0()
                         .max_w(px(self.content_width * 0.8))
@@ -8779,18 +8910,7 @@ impl Transcript {
                         .line_height(crate::typography::ui_rems(USER_LINE_HEIGHT))
                         .text_color(theme.text)
                         .when(pending, |el| el.opacity(0.65))
-                        .child(clipped_body)
-                        .when(collapsible, |el| {
-                            el.child(self.render_user_expander(
-                                &row.id,
-                                row_ix,
-                                expanded,
-                                collapsed_h,
-                                measured_h,
-                                &theme,
-                                cx,
-                            ))
-                        });
+                        .child(content);
                     column = column.child(div().w_full().flex().justify_end().child(bubble));
                 } else if let Some(summary) = user_message_attachment_summary(&attachments) {
                     column = column.child(
@@ -8824,7 +8944,7 @@ impl Transcript {
                         column_and_table_bleed_for(self.viewport_width(), self.content_width);
                     let opts = RenderOptions {
                         tasks: None,
-                        media: None,
+                        media: Some(self.reply_media(cx)),
                         row_key: row.id.clone(),
                         veil: None,
                         cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
@@ -8896,7 +9016,7 @@ impl Transcript {
                     column_and_table_bleed_for(self.viewport_width(), self.content_width);
                 let opts = RenderOptions {
                     tasks: None,
-                    media: None,
+                    media: Some(self.reply_media(cx)),
                     row_key: row.id.clone(),
                     veil: veil.clone(),
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
@@ -10549,6 +10669,27 @@ impl Transcript {
         self.image_menu.open(ImageMenu {
             path,
             devices,
+            chat_image: None,
+            position,
+            active: None,
+        });
+        window.focus(&self.image_menu_focus, cx);
+        cx.notify();
+    }
+
+    /// The image menu for an image a reply in `chat` names in Markdown, read
+    /// from `host` within that chat's folder.
+    fn open_chat_image_menu(
+        &mut self,
+        request: &crate::reply_images::ReplyImageRequest,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.image_menu.open(ImageMenu {
+            path: request.path.clone(),
+            devices: vec![request.host.clone()],
+            chat_image: Some((request.chat_id.clone(), request.mime)),
             position,
             active: None,
         });
@@ -10592,16 +10733,23 @@ impl Transcript {
             return;
         };
         let (path, devices) = (menu.path.clone(), menu.devices.clone());
+        let chat_image = menu.chat_image.clone();
         self.close_image_menu(cx);
         match action {
             0 => cx.write_to_clipboard(gpui::ClipboardItem::new_string(path)),
-            1 => self.copy_image(path, devices, cx),
+            1 => self.copy_image(path, devices, chat_image, cx),
             _ => {}
         }
     }
 
     /// Copy the original file (not the preview) from its owning device.
-    fn copy_image(&mut self, path: String, devices: Vec<String>, cx: &mut Context<Self>) {
+    fn copy_image(
+        &mut self,
+        path: String,
+        devices: Vec<String>,
+        chat_image: Option<(String, &'static str)>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
@@ -10610,11 +10758,21 @@ impl Transcript {
             let executor = cx.background_executor().clone();
             for device in &devices {
                 let target = (local.as_deref() != Some(device.as_str())).then_some(device.as_str());
-                if let Some((_, mime, bytes)) = crate::attachments::read_attachment_bytes(
-                    &engine, &executor, target, &path, None,
-                )
-                .await
-                {
+                let read = match &chat_image {
+                    Some((chat, mime)) => {
+                        crate::attachments::read_chat_image_bytes(
+                            &engine, &executor, target, chat, &path, mime,
+                        )
+                        .await
+                    }
+                    None => {
+                        crate::attachments::read_attachment_bytes(
+                            &engine, &executor, target, &path, None,
+                        )
+                        .await
+                    }
+                };
+                if let Some((_, mime, bytes)) = read {
                     let format =
                         gpui::ImageFormat::from_mime_type(&mime).unwrap_or(gpui::ImageFormat::Png);
                     // SVG is markup an agent may have written: copy the parsed,
@@ -10689,6 +10847,253 @@ impl Transcript {
         ))
     }
 
+    /// The inside of a user bubble: the prompt text, clipped to
+    /// [`USER_COLLAPSED_LINES`] until expanded, plus the expander chevron for
+    /// prompts past the cap. Returns the bubble's children in order.
+    ///
+    /// The collapsed form clips a normally-laid-out text element at exactly
+    /// five line boxes. Do not use gpui's `line_clamp` here: on an auto-width
+    /// flex item it answers intrinsic-width probes with the truncated layout,
+    /// collapsing the bubble to min-content width (one character per line).
+    /// A plain height clip preserves the original bubble width calculation and
+    /// never feeds measured layout back into the virtualized list. The clip's
+    /// bottom fades out rather than cutting: Markdown's block gaps and code
+    /// washes don't sit on the line grid, so a hard edge would slice a line.
+    fn render_user_body(
+        &mut self,
+        row_id: &SharedString,
+        row_ix: usize,
+        text: SharedString,
+        mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
+        url_chips: Arc<Vec<crate::url_chips::UrlChipSpan>>,
+        markdown: Option<UserMarkdown>,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let chip_link = (!url_chips.is_empty()).then(|| self.link_ui(cx)).flatten();
+        let chip_overlays = self.chip_overlays(row_id, &mentions, theme, cx);
+        let fold = self.user_folds.get(row_id).copied().unwrap_or_default();
+        let expanded = fold.open.unwrap_or(false);
+        let line_height =
+            f32::from(crate::typography::ui_rems(USER_LINE_HEIGHT).to_pixels(window.rem_size()));
+        let collapsed_h = USER_COLLAPSED_LINES as f32 * line_height;
+        let measured_h = self
+            .user_heights
+            .entry(row_id.clone())
+            .or_insert_with(|| Rc::new(Cell::new(0.0)))
+            .clone();
+        let measured = measured_h.get();
+        let collapsible = text.lines().count() > USER_COLLAPSED_LINES
+            || (measured > 0.0 && measured > collapsed_h + 0.5)
+            || (measured == 0.0 && user_message_needs_collapse(&text));
+        let full_h = measured_h.get().max(collapsed_h);
+        if let Some(fold) = self.user_folds.get_mut(row_id) {
+            // Wrapping can change with the window width while expanded.
+            fold.user_expansion_height = (full_h - collapsed_h).max(0.0);
+        }
+
+        // Height motion uses the same ease-out curve as sidebars, tool folds,
+        // and pane transitions, with duration scaled to travel distance. The
+        // full text remains laid out behind the clip; only the viewport over it
+        // changes, so glyph wrapping never shifts.
+        let duration_ms = fold
+            .duration_ms
+            .max(user_resize_duration_ms(full_h - collapsed_h));
+        let animating = collapsible
+            && fold.epoch > 0
+            && fold
+                .toggled_at
+                .is_some_and(|at| at.elapsed() < Duration::from_millis(duration_ms + 200))
+            && !motion::reduced_motion(cx);
+        // At rest folded, a long prompt's Markdown lays out only what fills
+        // the fold; motion and the open bubble need all of it.
+        let folded = collapsible && !expanded && !animating;
+
+        let hold_key = row_id.clone();
+        let hold_height = measured_h.clone();
+        let hold_selection: Arc<str> = format!("{row_id}:u").into();
+        let body = div()
+            .id(SharedString::from(format!("{row_id}-body")))
+            // A long press toggles instead of double-click. A normal release
+            // remains available for text selection, and pointer movement
+            // cancels the pending toggle before a drag can select text.
+            .when(collapsible, |el| {
+                let down_key = hold_key.clone();
+                let down_height = hold_height.clone();
+                let down_selection = hold_selection.clone();
+                el.on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.arm_user_hold(
+                            down_key.clone(),
+                            row_ix,
+                            collapsed_h,
+                            down_height.clone(),
+                            down_selection.clone(),
+                            cx,
+                        );
+                    }),
+                )
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |this, _, _, _| {
+                        this.cancel_user_hold();
+                    }),
+                )
+                .on_mouse_up_out(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |this, _, _, _| {
+                        this.cancel_user_hold();
+                    }),
+                )
+                .on_mouse_move(cx.listener(|this, _, _, _| {
+                    this.cancel_user_hold();
+                }))
+            })
+            .child(match markdown {
+                Some(UserMarkdown {
+                    folded: Some(part), ..
+                }) if folded => {
+                    // The part is shorter than the prompt: its height isn't
+                    // the one the fold animates to.
+                    self.render_user_markdown(row_id, &part, None, theme, window, cx)
+                }
+                Some(UserMarkdown { full, .. }) => self.render_user_markdown(
+                    row_id,
+                    &full,
+                    Some(measured_h.clone()),
+                    theme,
+                    window,
+                    cx,
+                ),
+                None => user_bubble_text(
+                    row_id,
+                    text,
+                    mentions,
+                    url_chips,
+                    theme,
+                    measured_h.clone(),
+                    cx.entity_id(),
+                    chip_overlays,
+                    Rc::new(cx.listener(|this, path: &SharedString, window, cx| {
+                        this.open_chip_image(path, window, cx);
+                    })),
+                    chip_link,
+                ),
+            });
+        // The fade covers the last line and a half, so the clip never shows
+        // a sliced glyph row. It rides a collapse down; an expansion reveals
+        // from a plain edge.
+        let fade = |clip: gpui::AnyElement| {
+            crate::edge_fade::edge_faded(line_height * USER_FOLD_FADE_LINES, false, true, clip)
+                .compose_vertical()
+                .into_any_element()
+        };
+        let body: AnyElement = if animating {
+            let from = fold.from;
+            let to = if expanded { full_h } else { collapsed_h };
+            let resize = user_resize_spec(full_h - collapsed_h);
+            let clip = div()
+                .overflow_hidden()
+                .child(body)
+                .with_animation(
+                    SharedString::from(format!("{row_id}-user-resize-{}", fold.epoch)),
+                    resize.animation(),
+                    move |el, t| el.h(px(motion::lerp(from, to, t).max(0.0))),
+                )
+                .into_any_element();
+            if expanded { clip } else { fade(clip) }
+        } else if collapsible && !expanded {
+            fade(
+                div()
+                    .h(px(collapsed_h))
+                    .overflow_hidden()
+                    .child(body)
+                    .into_any_element(),
+            )
+        } else {
+            body.into_any_element()
+        };
+        div()
+            .relative()
+            .child(body)
+            .when(collapsible, |el| {
+                el.child(self.render_user_expander(
+                    row_id,
+                    row_ix,
+                    expanded,
+                    collapsed_h,
+                    measured_h,
+                    theme,
+                    cx,
+                ))
+            })
+            .into_any_element()
+    }
+
+    /// A prompt's Markdown, rendered like a reply's at the bubble's size: its
+    /// own selection keys, links and fences. The canvas behind it records the
+    /// full height for the fold, as [`user_bubble_text`] does for plain text.
+    fn render_user_markdown(
+        &mut self,
+        row_id: &SharedString,
+        tree: &Arc<BlockTree>,
+        measured_h: Option<Rc<Cell<f32>>>,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let row_key = user_markdown_key(row_id);
+        // Kept across frames like a reply's blocks; replacing the row drops it.
+        self.rendered_rows.insert(row_key.clone());
+        let link = self.link_ui(cx);
+        let tree = self.inline_code_tree(tree, link.as_ref(), cx);
+        let opts = RenderOptions {
+            tasks: None,
+            media: None,
+            row_key: row_key.clone(),
+            veil: None,
+            cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
+            now: Instant::now(),
+            copy: Some(self.copy_ui_for(&row_key, cx)),
+            link,
+            workspace_root: self.workspace_root(cx),
+            code: None,
+            open_file: self.open_file_link(cx),
+            file_root: self.workspace_root(cx).map(|root| root.to_string()),
+            selection_group: None,
+            block_width: self.content_width * 0.8 - 32.0,
+            table_bleed_budget: 0.0,
+            math: crate::settings::math_style(cx),
+        };
+        let highlight = self.code_highlight_for(&row_key, &tree, None, cx);
+        let entity_id = cx.entity_id();
+        div()
+            .relative()
+            .when_some(measured_h, |el, measured_h| {
+                el.child(
+                    canvas(
+                        move |bounds, _, _| bounds.size.height,
+                        move |_, height, _, cx| {
+                            // Passive geometry cache, like the plain bubble's.
+                            let height = f32::from(height);
+                            if (measured_h.get() - height).abs() > 0.5 {
+                                measured_h.set(height);
+                                cx.notify(entity_id);
+                            }
+                        },
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+            })
+            .child(render::render_tree(&tree, &opts, theme, window, &|ix| {
+                highlight.get(&ix).cloned().flatten()
+            }))
+            .into_any_element()
+    }
+
     /// `Message from [logo] Chat` over an agent-sent bubble, in the switch
     /// seam's caption style: the sending chat's provider mark and live title
     /// (the header's title for a chat this workspace doesn't list). A known
@@ -10730,33 +11135,8 @@ impl Transcript {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let chat =
-            chat_id.and_then(|id| self.state.read(cx).chats.iter().find(|chat| chat.id == id));
-        let known = chat.is_some();
-        let title: SharedString = chat
-            .and_then(|chat| chat.title.as_deref())
-            .map(str::trim)
-            .filter(|title| !title.is_empty())
-            .map_or_else(
-                || {
-                    if chat.is_some() {
-                        // Listed but untitled: its short id, as the header says.
-                        chat_id
-                            .unwrap_or_default()
-                            .chars()
-                            .take(8)
-                            .collect::<String>()
-                            .into()
-                    } else {
-                        single_line(&fallback).into()
-                    }
-                },
-                |title| single_line(title).into(),
-            );
-        let mark = chat
-            .and_then(|chat| chat.config.as_ref())
-            .map(|config| crate::pickers::harness_brand_icon(config.harness))
-            .unwrap_or((crate::icons::CHAT_ROUND_LINE, None));
+        let ChatIdentity { title, mark, known } =
+            chat_identity(self.state.read(cx), chat_id, &fallback);
         let chat_id = chat_id.unwrap_or_default().to_owned();
         div()
             .w_full()
@@ -10782,6 +11162,179 @@ impl Transcript {
                     }),
             )
             .into_any_element()
+    }
+
+    /// A plain text link aligned with the message's left edge, following the
+    /// folded text. No pill, border, or button wash.
+
+    /// The chat whose replies this transcript shows, for the images they
+    /// name. A subagent tab draws none: its doc isn't the chat it borrows.
+    fn reply_chat(&self, cx: &gpui::App) -> Option<crate::reply_images::ReplyChat> {
+        if self.doc_override.is_some() {
+            return None;
+        }
+        let id = self.chat_id.as_deref()?;
+        let chat = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == id)?;
+        Some(crate::reply_images::ReplyChat {
+            id: chat.id.clone(),
+            cwd: chat.cwd.clone(),
+            host: chat.device_id.clone(),
+        })
+    }
+
+    /// Local images held by the Chat's folder; Mermaid keeps the fork renderer.
+    fn reply_media(&mut self, cx: &Context<Self>) -> render::MediaUi {
+        self.reply_images.borrow_mut().show(self.reply_chat(cx));
+        let images = self.reply_images.clone();
+        let viewer = cx.weak_entity();
+        let media = render::MediaUi {
+            image: Some(Rc::new(move |image, id, theme| {
+                use crate::reply_images::{ReplyImage, frame, sized};
+                // `{row}-image-{block}-{run}`: the row to remeasure on landing.
+                let row = SharedString::from(id.rsplit_once("-image-")?.0.to_owned());
+                let element = match images.borrow_mut().lookup(&image.source, row)? {
+                    ReplyImage::Loaded(loaded, request) => {
+                        let (open, menu) = (viewer.clone(), viewer.clone());
+                        sized(frame(id), &loaded.image, theme)
+                            .debug_selector(|| "reply-image".into())
+                            .on_mouse_down(
+                                gpui::MouseButton::Right,
+                                move |event: &gpui::MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    let _ = menu.update(cx, |this, cx| {
+                                        this.open_chat_image_menu(
+                                            &request,
+                                            event.position,
+                                            window,
+                                            cx,
+                                        )
+                                    });
+                                },
+                            )
+                            .on_click(move |_, window, cx| {
+                                let preview = crate::attachments::PreviewImage::new(
+                                    loaded.name.clone(),
+                                    loaded.image.clone(),
+                                );
+                                let _ = open.update(cx, |this, cx| {
+                                    this.open_image_preview(preview, window, cx)
+                                });
+                            })
+                            .into_any_element()
+                    }
+                    ReplyImage::Loading => frame(id)
+                        .text_color(theme.text_muted)
+                        .child("Loading image…")
+                        .into_any_element(),
+                };
+                Some(element)
+            })),
+            diagram: None,
+        };
+        media
+    }
+
+    /// Start the image reads this paint asked for, a few at a time: a landed
+    /// read repaints, and the repaint asks again for the rest.
+    fn ensure_reply_image_loads(&mut self, cx: &mut Context<Self>) {
+        let wanted = self.reply_images.borrow_mut().take_wanted();
+        for request in wanted {
+            if self.reply_image_loads.len() >= crate::reply_images::MAX_LOADS {
+                return;
+            }
+            if self.reply_image_loads.contains_key(&request.key)
+                || !crate::attachments::begin_load_for(&request.key)
+            {
+                continue;
+            }
+            self.spawn_reply_image_load(request, cx);
+        }
+    }
+
+    fn spawn_reply_image_load(
+        &mut self,
+        request: crate::reply_images::ReplyImageRequest,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::attachments::{read_chat_image, store_error_for, store_loaded_for};
+        let key = request.key.clone();
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            store_error_for(&key);
+            return;
+        };
+        let local = self.state.read(cx).local_device_id.clone();
+        // Only the chat's host reads its folder; the relay forwards there.
+        let target =
+            (local.as_deref() != Some(request.host.as_str())).then(|| request.host.clone());
+        let claim = crate::attachments::AttachmentLoadGuard(key.clone());
+        let task = cx.spawn(async move |this, cx| {
+            let _claim = claim;
+            let loaded = read_chat_image(
+                &engine,
+                cx.background_executor(),
+                target.as_deref(),
+                &request.chat_id,
+                &request.path,
+                request.mime,
+            )
+            .await;
+            let landed = loaded.is_some();
+            match loaded {
+                Some(loaded) => store_loaded_for(&request.key, loaded.name.into(), loaded.image),
+                None => store_error_for(&request.key),
+            }
+            this.update(cx, |this, cx| {
+                this.reply_image_loads.remove(&request.key);
+                let rows = this.reply_images.borrow_mut().finish(&request.key, landed);
+                this.diagram_layout_changed(&rows, cx);
+                cx.notify();
+            })
+            .ok();
+        });
+        self.reply_image_loads.insert(key, task);
+    }
+
+    /// A diagram replaced its source (or the reverse): remeasure the rows
+    /// painting it and let the bottom pin and the own-turn runway absorb the
+    /// height change, exactly like any other layout-affecting row update.
+    fn diagram_layout_changed(&mut self, rows: &[SharedString], cx: &mut Context<Self>) {
+        let mut changed = false;
+        for (ix, row) in self.rows.iter().enumerate() {
+            if rows.contains(&row.id) {
+                self.list.remeasure_items(ix..ix + 1);
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+        self.viewport_layout_revision = self.viewport_layout_revision.wrapping_add(1);
+        if self.pinned {
+            self.wake_spring();
+        }
+        if self.own_turn.is_some() {
+            self.own_turn_kick = true;
+        }
+        cx.notify();
+    }
+
+    /// Open an image in the shared lightbox; Escape returns focus here.
+    fn open_image_preview(
+        &mut self,
+        preview: crate::attachments::PreviewImage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.attachment_preview_return_focus = window.focused(cx);
+        preview.viewer.reset();
+        self.attachment_preview = Some(preview);
+        window.focus(&self.attachment_preview_focus, cx);
+        cx.notify();
     }
 
     fn render_visual(
@@ -12174,7 +12727,7 @@ pub struct AgentSender {
 /// agent sent: the agent keeps reading it in the stored prompt, while the
 /// transcript shows the sender above the bubble and only the body inside it.
 /// Replaces the fork's former in-bubble bold "Message from" attribution.
-fn agent_message_sender(text: &str) -> Option<(AgentSender, &str)> {
+pub(crate) fn agent_message_sender(text: &str) -> Option<(AgentSender, &str)> {
     let (sender, body) = zeron_proto::agent_messages::agent_message_sender(text)?;
     Some((
         AgentSender {
@@ -12291,6 +12844,172 @@ fn user_bubble_runs(
 /// run when there are none), with the same selection machinery as rendered
 /// markdown — the element registers into the frame's document-ordered
 /// registry, so drags select, span into adjacent rows, and Cmd+C copies.
+/// How a chat between chats shows: chat `chat_id`'s live title and provider
+/// mark when this workspace lists it, else `fallback` (the title its header
+/// recorded).
+pub(crate) struct ChatIdentity {
+    pub title: SharedString,
+    pub mark: (&'static str, Option<gpui::Hsla>),
+    /// Whether the chat is listed, so it can open.
+    pub known: bool,
+}
+
+pub(crate) fn chat_identity(
+    state: &AppState,
+    chat_id: Option<&str>,
+    fallback: &str,
+) -> ChatIdentity {
+    let chat = chat_id.and_then(|id| state.chats.iter().find(|chat| chat.id == id));
+    let title: SharedString = chat
+        .and_then(|chat| chat.title.as_deref())
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map_or_else(
+            || {
+                if chat.is_some() {
+                    // Listed but untitled: its short id, as the header says.
+                    chat_id
+                        .unwrap_or_default()
+                        .chars()
+                        .take(8)
+                        .collect::<String>()
+                        .into()
+                } else {
+                    single_line(fallback).into()
+                }
+            },
+            |title| single_line(title).into(),
+        );
+    ChatIdentity {
+        title,
+        mark: chat
+            .and_then(|chat| chat.config.as_ref())
+            .map(|config| crate::pickers::harness_brand_icon(config.harness))
+            .unwrap_or((crate::icons::CHAT_ROUND_LINE, None)),
+        known: chat.is_some(),
+    }
+}
+
+/// A prompt's Markdown, and for one too long to fold whole, the leading part
+/// that fills the fold.
+#[derive(Clone)]
+pub struct UserMarkdown {
+    pub full: Arc<BlockTree>,
+    pub folded: Option<Arc<BlockTree>>,
+}
+
+/// The leading part of `tree` that fills `lines` lines: whole blocks, then
+/// the first items of a list, rows of a table or lines of a fence. Counts
+/// source lines, which never outnumber the lines they wrap to, so the part
+/// is never shorter than the fold. `None` when the whole tree is that short.
+fn folded_markdown(tree: &BlockTree, lines: usize) -> Option<BlockTree> {
+    fn take(block: &Block, budget: &mut usize) -> Option<Block> {
+        if *budget == 0 {
+            return None;
+        }
+        let spend =
+            |budget: &mut usize, lines: usize| *budget = budget.saturating_sub(lines.max(1));
+        let runs_lines = |runs: &[InlineRun]| {
+            1 + runs
+                .iter()
+                .map(|r| r.text.matches('\n').count())
+                .sum::<usize>()
+        };
+        Some(match block {
+            Block::Paragraph { runs } | Block::Heading { runs, .. } => {
+                spend(budget, runs_lines(runs));
+                block.clone()
+            }
+            Block::CodeBlock { language, code } => {
+                // The fence's header takes a line of its own.
+                spend(budget, 1);
+                let kept: Vec<&str> = code.lines().take((*budget).max(1)).collect();
+                spend(budget, kept.len());
+                Block::CodeBlock {
+                    language: language.clone(),
+                    code: kept.join("\n"),
+                }
+            }
+            Block::Table {
+                header,
+                rows,
+                align,
+            } => {
+                spend(budget, 1);
+                let kept = rows.len().min((*budget).max(1));
+                spend(budget, kept);
+                Block::Table {
+                    header: header.clone(),
+                    rows: rows[..kept].to_vec(),
+                    align: align.clone(),
+                }
+            }
+            Block::BlockQuote { children } => Block::BlockQuote {
+                children: children
+                    .iter()
+                    .map_while(|child| take(child, budget))
+                    .collect(),
+            },
+            Block::List {
+                ordered_start,
+                items,
+            } => Block::List {
+                ordered_start: *ordered_start,
+                items: items
+                    .iter()
+                    .map_while(|item| {
+                        let kept: Vec<Block> =
+                            item.iter().map_while(|child| take(child, budget)).collect();
+                        (!kept.is_empty()).then_some(kept)
+                    })
+                    .collect(),
+            },
+            Block::Math { .. } => {
+                spend(budget, 2);
+                block.clone()
+            }
+            Block::Rule => {
+                spend(budget, 1);
+                block.clone()
+            }
+        })
+    }
+    let mut budget = lines;
+    let blocks: Vec<Arc<crate::markdown::parser::TopBlock>> = tree
+        .blocks
+        .iter()
+        .map_while(|top| {
+            let block = take(&top.block, &mut budget)?;
+            Some(Arc::new(crate::markdown::parser::TopBlock {
+                range: top.range.clone(),
+                block,
+            }))
+        })
+        .collect();
+    // Something left out: the last block cut short, or blocks after it.
+    let whole = blocks.len() == tree.blocks.len()
+        && blocks
+            .iter()
+            .zip(&tree.blocks)
+            .all(|(part, top)| part.block == top.block);
+    (!whole).then_some(BlockTree { blocks })
+}
+
+/// The render key of a user row's Markdown: its selection, element ids and
+/// cached flattening, apart from the row's own.
+fn user_markdown_key(row_id: &str) -> SharedString {
+    format!("{row_id}:u").into()
+}
+
+/// Whether a prompt's Markdown is only unstyled paragraphs: it reads the same
+/// as typed, so the bubble keeps its plain text.
+fn plain_markdown(tree: &BlockTree) -> bool {
+    tree.blocks.iter().all(|top| match &top.block {
+        Block::Paragraph { runs } => runs.iter().all(|run| run.style == InlineStyle::default()),
+        _ => false,
+    })
+}
+
 fn user_bubble_text(
     row_id: &SharedString,
     text: SharedString,
@@ -12430,6 +13149,7 @@ fn user_bubble_text(
     .absolute()
     .size_full();
     let selectable = render::selectable_text_wrap()
+        .debug_selector(|| "user-bubble-text".into())
         .child(underlay)
         .child(text_element)
         .into_any_element();
@@ -12689,7 +13409,7 @@ fn fork_marker(source_title: SharedString, theme: &Theme) -> AnyElement {
 
 /// `[mark] Name` in a user-message caption: a provider's brand mark (or any
 /// glyph) beside its name. A side without a mark shows its name alone.
-fn caption_label(
+pub(crate) fn caption_label(
     name: SharedString,
     mark: Option<(&'static str, Option<gpui::Hsla>)>,
     color: gpui::Hsla,
@@ -13136,14 +13856,6 @@ fn file_badge_name(path: &str) -> &str {
     path.rsplit(['/', '\\'])
         .find(|component| !component.is_empty())
         .unwrap_or(path)
-}
-
-/// The open image context menu and the device candidates for copying its file.
-struct ImageMenu {
-    path: String,
-    devices: Vec<String>,
-    position: Point<Pixels>,
-    active: Option<usize>,
 }
 
 /// The chip's content row: icon tile + label + detail line (+ trailing tile
@@ -14187,6 +14899,7 @@ impl Render for Transcript {
             .on_mouse_move(cx.listener(Self::on_selection_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_selection_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_selection_mouse_up))
+            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             // FIRST child ⇒ paints first: clears this transcript's slice of the
             // frame's markdown text-selection registry before any row's text
             // elements re-register (document paint order = selection order;
@@ -14208,6 +14921,12 @@ impl Render for Transcript {
             )
             .child(rail);
         let root = root.children(self.render_image_menu(cx));
+        let loader = self
+            .loader_shown
+            .then_some(self.loading)
+            .flatten()
+            .map(|loading| self.render_loader(loading, cx));
+        let root = root.children(loader);
         // Full-size viewer for a clicked user-bubble thumbnail
         // (AttachmentPreviewDialog: bare lightbox, click closes).
         if let Some(preview) = self.attachment_preview.clone() {
@@ -14276,6 +14995,105 @@ mod tests {
         assert!(!jump_visibility(shown, AT_BOTTOM_PX));
         assert!(!jump_visibility(false, 319.0));
         assert!(jump_visibility(false, 321.0));
+    }
+
+    #[gpui::test]
+    fn a_glided_notch_leaves_the_bottom_and_stays_where_it_lands(cx: &mut gpui::TestAppContext) {
+        struct Root(Entity<Transcript>);
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                crate::smooth_scroll::smooth_scroll(self.0.clone())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+            let state = cx.new(|_| AppState::new());
+            state.update(cx, |state, _| {
+                state.selected_chat = Some("chat".into());
+                state.transcript_replayed = true;
+                state.transcript = vec![assistant(
+                    "reply",
+                    MessageStatus::Complete,
+                    vec![text_part("text", &"History.\n\n".repeat(120))],
+                )];
+                state.transcript_revision += 1;
+            });
+            cx.new(|cx| Transcript::new(state, cx))
+        });
+        transcript.update(cx, |this, cx| {
+            this.rail_enabled = false;
+            this.sync(cx);
+        });
+        let (_, cx) = cx.add_window_view(|_, _| Root(transcript.clone()));
+        // Frames at 120Hz in real time: the glide and the bottom spring both
+        // read the clock.
+        let frame = |cx: &mut gpui::VisualTestContext| {
+            std::thread::sleep(Duration::from_millis(8));
+            cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear();
+            });
+        };
+        for _ in 0..30 {
+            frame(cx);
+        }
+        let distance = |cx: &mut gpui::VisualTestContext| {
+            transcript.read_with(cx, |this, _| this.distance_from_bottom())
+        };
+        assert!(transcript.read_with(cx, |this, _| this.pinned));
+        assert!(distance(cx) <= 1.0, "{}", distance(cx));
+
+        // A wheel the list never took (an overlay above it let it bubble)
+        // leaves the pin alone.
+        transcript.update_in(cx, |this, window, cx| {
+            this.on_scroll_wheel(
+                &gpui::ScrollWheelEvent {
+                    delta: gpui::ScrollDelta::Lines(gpui::point(0.0, 3.0)),
+                    ..Default::default()
+                },
+                window,
+                cx,
+            );
+            assert!(this.pinned, "a wheel the list never saw broke the pin");
+            // Precise input keeps the distance test it always had.
+            this.list_took_input = true;
+            this.on_scroll_wheel(
+                &gpui::ScrollWheelEvent {
+                    delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(0.5))),
+                    ..Default::default()
+                },
+                window,
+                cx,
+            );
+            assert!(
+                this.pinned && !this.input_escaped,
+                "a trackpad took the escape"
+            );
+        });
+
+        // One 3-line notch up. Its glide starts and ends with slices well
+        // under a pixel.
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: gpui::point(px(200.0), px(200.0)),
+            delta: gpui::ScrollDelta::Lines(gpui::point(0.0, 3.0)),
+            ..Default::default()
+        });
+        // The glide lands within 200ms; the rest shows the view stays there.
+        for _ in 0..50 {
+            frame(cx);
+        }
+        assert!(
+            !transcript.read_with(cx, |this, _| this.pinned),
+            "scrolling up must release the bottom"
+        );
+        let landed = distance(cx);
+        assert!(
+            (landed - 60.0).abs() <= 1.0,
+            "a 3-line notch scrolls 60px, as it does without smoothing: {landed}"
+        );
     }
 
     #[gpui::test]
@@ -15694,6 +16512,10 @@ mod tests {
     #[test]
     fn assistant_turn_projects_completed_work_before_the_final_answer() {
         let read = MessagePart::Tool {
+            exit_code: Default::default(),
+            output_truncated: Default::default(),
+            output_lines: Default::default(),
+
             id: "read-1".into(),
             call: ToolCall::ReadFile {
                 path: "src/lib.rs".into(),
@@ -15737,6 +16559,262 @@ mod tests {
         assert!(matches!(children[2].kind, RowKind::Markdown { .. }));
         assert!(matches!(children[3].kind, RowKind::ToolGroup { .. }));
         assert!(matches!(rows[1].kind, RowKind::Markdown { .. }));
+    }
+
+    #[gpui::test]
+    fn reply_markdown_images_draw_only_from_their_own_chat(cx: &mut gpui::TestAppContext) {
+        use crate::attachments::{
+            AttachmentKey, AttachmentSnapshot, attachment_snapshot_for, store_loaded_for,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let chat = |id: &str| zeron_proto::Chat {
+            origin_chat_id: Default::default(),
+            worked_projects: Default::default(),
+
+            id: id.into(),
+            device_id: "reply-host".into(),
+            title: None,
+            archived: false,
+            cwd: Some("/fixture/reply".into()),
+            branch: None,
+            checkout_id: None,
+            source_context: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: chrono::DateTime::UNIX_EPOCH,
+            harness_session_id: None,
+            harness_session_cwd: None,
+            harness_session_harness: None,
+            parent_chat_id: None,
+            child_kind: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: None,
+        };
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.chats = vec![chat("reply-chat"), chat("reply-other")];
+            state
+        });
+        let transcript = cx.new(|cx| Transcript::new(state, cx));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(64, 48)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let shown = "/fixture/reply/shots/before.png";
+        store_loaded_for(
+            &AttachmentKey::chat_image("reply-host", "reply-chat", shown, "image/png"),
+            "before.png".into(),
+            Arc::new(gpui::Image::from_bytes(
+                gpui::ImageFormat::Png,
+                bytes.into_inner(),
+            )),
+        );
+        let text = "![before](shots/before.png)\n\n![web](https://example.com/a.png)\n\n![later](later.png)";
+        let entry = assistant("a", MessageStatus::Complete, vec![text_part("t", text)]);
+        transcript.update(cx, |this, _| {
+            this.chat_id = Some("reply-chat".into());
+            this.rows = rows_for_entry(&entry, false, &mut parse);
+        });
+        struct RowsFixture(Entity<Transcript>);
+        impl Render for RowsFixture {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                if self.0.read(cx).attachment_preview.is_some() {
+                    return self.0.clone().into_any_element();
+                }
+                self.0.update(cx, |this, cx| {
+                    let rows: Vec<_> = (0..this.rows.len())
+                        .map(|ix| this.render_row(ix, window, cx))
+                        .collect();
+                    div().w(px(700.0)).children(rows).into_any_element()
+                })
+            }
+        }
+        let (fixture, cx) = cx.add_window_view(|_, _| RowsFixture(transcript.clone()));
+        cx.run_until_parked();
+        // The relative path resolved against the chat's folder, and its read
+        // (refused here: no engine) was for that chat.
+        assert!(matches!(
+            attachment_snapshot_for(&AttachmentKey::chat_image(
+                "reply-host",
+                "reply-chat",
+                "/fixture/reply/later.png",
+                "image/png",
+            )),
+            AttachmentSnapshot::Error { .. }
+        ));
+        let image = cx
+            .debug_bounds("reply-image")
+            .expect("the chat's own image is drawn");
+        cx.simulate_click(image.center(), gpui::Modifiers::default());
+        transcript.read_with(cx, |this, _| {
+            let preview = this
+                .attachment_preview
+                .as_ref()
+                .expect("the lightbox opens");
+            assert_eq!(preview.name.as_ref(), "before.png");
+        });
+        // Right-click offers Copy path / Copy image, reading the original
+        // through the same chat's jail.
+        transcript.update(cx, |this, _| this.attachment_preview = None);
+        fixture.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        let image = cx.debug_bounds("reply-image").expect("drawn again");
+        cx.simulate_mouse_down(
+            image.center(),
+            gpui::MouseButton::Right,
+            gpui::Modifiers::default(),
+        );
+        transcript.read_with(cx, |this, _| {
+            let menu = this.image_menu.as_open().expect("the image menu opens");
+            assert_eq!(menu.path, shown);
+            assert_eq!(menu.devices, ["reply-host"]);
+            assert_eq!(
+                menu.chat_image,
+                Some(("reply-chat".to_owned(), "image/png"))
+            );
+        });
+        // The same reply in another chat doesn't reuse the first chat's read.
+        transcript.update(cx, |this, cx| {
+            this.close_image_menu(cx);
+            this.chat_id = Some("reply-other".into());
+        });
+        fixture.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("reply-image").is_none());
+        // A subagent tab draws none.
+        transcript.update(cx, |this, cx| {
+            this.chat_id = Some("reply-chat".into());
+            this.doc_override = Some("reply-doc".into());
+            assert!(this.reply_chat(cx).is_none());
+        });
+    }
+
+    #[test]
+    fn prompts_written_in_markdown_render_it() {
+        let markdown = |text: &str| {
+            let mut entry = user_entry("u1");
+            entry.parts = vec![text_part("u1-text", text)];
+            let rows = rows_for_entry(&entry, false, &mut parse);
+            let RowKind::User { markdown, .. } = &rows[0].kind else {
+                panic!("expected a user row");
+            };
+            markdown.clone()
+        };
+        let tree = markdown("Keep **this**\nand `that`\n\n- one\n- two")
+            .unwrap()
+            .full;
+        assert_eq!(tree.blocks.len(), 2);
+        // Typed newlines stay line breaks.
+        let Block::Paragraph { runs } = &tree.blocks[0].block else {
+            panic!("expected a paragraph");
+        };
+        assert!(runs.iter().any(|run| run.text.contains('\n')));
+        // Prose reads the same as typed, so it keeps the plain bubble.
+        assert!(markdown("just a question\n\nand another").is_none());
+        // Chips paint over the plain text's layout, so a prompt with one
+        // stays plain.
+        let link = zeron_proto::attachment_mentions::attachment_mention_link(1, Some("notes.md"));
+        assert!(markdown(&format!("**read** {link}")).is_none());
+        // An agent's message renders its body, under the sender caption.
+        let routed = "[Message from Zeron chat cd27c5c2. Reply to it with the Zeron `send_message` tool, chat cd27c5c2-0000-4000-8000-000000000000.]\n\nRun `cargo test`.";
+        assert!(markdown(routed).is_some());
+    }
+
+    #[test]
+    fn long_prompts_fold_to_their_leading_markdown() {
+        let markdown = |text: &str| {
+            let mut entry = user_entry("u1");
+            entry.parts = vec![text_part("u1-text", text)];
+            let rows = rows_for_entry(&entry, false, &mut parse);
+            let RowKind::User { markdown, .. } = &rows[0].kind else {
+                panic!("expected a user row");
+            };
+            markdown.clone().unwrap()
+        };
+        let lines = USER_COLLAPSED_LINES + USER_FOLD_OVERDRAW_LINES;
+        // A prompt that fits whole folds to itself.
+        assert!(markdown("**short**\n\n- one\n- two").folded.is_none());
+        // A long report keeps its heading and the items that fill the fold.
+        let report: String = (1..=240).map(|i| format!("{i}. **case {i}**\n")).collect();
+        let report = markdown(&format!("## Sweep\n\n{report}"));
+        let folded = report.folded.unwrap();
+        assert_eq!(folded.blocks.len(), 2);
+        let Block::List { items, .. } = &folded.blocks[1].block else {
+            panic!("expected the list");
+        };
+        assert_eq!(items.len(), lines - 1);
+        let Block::List { items: all, .. } = &report.full.blocks[1].block else {
+            panic!("expected the list");
+        };
+        // A prefix: each kept item is the item it was.
+        assert_eq!(items[..], all[..items.len()]);
+        // A long fence keeps its first lines; blocks after the fold go.
+        let fence: String = (1..=50).map(|i| format!("line {i}\n")).collect();
+        let fenced = markdown(&format!("Run:\n\n```\n{fence}```\n\nthen **this**"));
+        let folded = fenced.folded.unwrap();
+        assert_eq!(folded.blocks.len(), 2);
+        let Block::CodeBlock { code, .. } = &folded.blocks[1].block else {
+            panic!("expected the fence");
+        };
+        assert_eq!(code.lines().count(), lines - 2);
+        assert!(code.starts_with("line 1\nline 2"));
+    }
+
+    #[test]
+    fn generated_image_owner_candidates_and_same_length_corrections() {
+        assert_eq!(
+            generated_image_devices("owner", &["host".into(), "local".into(), "owner".into()]),
+            vec!["owner", "host", "local"]
+        );
+        assert_eq!(
+            generated_image_devices("", &["host".into(), "host".into(), "".into()]),
+            vec!["host"]
+        );
+        let entries: Vec<SessionMessageEntry> =
+            serde_json::from_str(include_str!("../tests/fixtures/generated-images.json")).unwrap();
+        let entry = &entries[0];
+        let original = entry_fingerprint(entry, false);
+        let row_version = rows_for_entry(entry, false, &mut parse)[0].version;
+        for field in 0..4 {
+            let mut changed = entry.clone();
+            if field == 0 {
+                changed.device_id = "another-owner".into();
+            } else if let MessagePart::Image {
+                path,
+                name,
+                mime_type,
+                ..
+            } = &mut changed.parts[0]
+            {
+                match field {
+                    1 => *path = path.replace("loaded", "edited"),
+                    2 => *name = "corrected.png".into(),
+                    _ => *mime_type = "image/gif".into(),
+                }
+            }
+            assert_ne!(entry_fingerprint(&changed, false), original);
+            assert_ne!(
+                rows_for_entry(&changed, false, &mut parse)[0].version,
+                row_version
+            );
+        }
+        for entry in entries {
+            let rows = rows_for_entry(&entry, false, &mut parse);
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].turn_start);
+            assert_eq!(
+                rows[0].timestamp.is_some(),
+                entry.status == Some(MessageStatus::Complete)
+            );
+            assert!(rows[0].copy_text.is_none());
+        }
     }
 
     #[test]
@@ -15971,6 +17049,10 @@ mod tests {
     #[test]
     fn assistant_turn_preserves_specialized_children_and_stable_identity() {
         let todo = MessagePart::Tool {
+            exit_code: Default::default(),
+            output_truncated: Default::default(),
+            output_lines: Default::default(),
+
             id: "todo".into(),
             call: ToolCall::Todo {
                 items: vec![TodoItem {
@@ -16049,6 +17131,10 @@ mod tests {
         preview: Option<zeron_doc::FileChangePreview>,
     ) -> MessagePart {
         MessagePart::Tool {
+            exit_code: Default::default(),
+            output_truncated: Default::default(),
+            output_lines: Default::default(),
+
             id: id.into(),
             call: ToolCall::WriteFile {
                 path: "notes/new.txt".into(),
@@ -16073,6 +17159,10 @@ mod tests {
 
     fn exec_part(id: &str, resolved: bool) -> MessagePart {
         MessagePart::Tool {
+            exit_code: Default::default(),
+            output_truncated: Default::default(),
+            output_lines: Default::default(),
+
             id: id.into(),
             call: ToolCall::Exec {
                 command: "ls".into(),
@@ -16846,6 +17936,10 @@ mod tests {
 
     fn tool_part(id: &str, command: &str) -> MessagePart {
         MessagePart::Tool {
+            exit_code: Default::default(),
+            output_truncated: Default::default(),
+            output_lines: Default::default(),
+
             id: id.into(),
             call: ToolCall::Exec {
                 command: command.into(),
@@ -17419,6 +18513,10 @@ mod tests {
             "todo-entry",
             MessageStatus::Complete,
             vec![MessagePart::Tool {
+                exit_code: Default::default(),
+                output_truncated: Default::default(),
+                output_lines: Default::default(),
+
                 id: "todo-1".into(),
                 call: ToolCall::Todo {
                     items: vec![
@@ -17530,6 +18628,10 @@ mod tests {
             "todo-append-entry",
             MessageStatus::Complete,
             vec![MessagePart::Tool {
+                exit_code: Default::default(),
+                output_truncated: Default::default(),
+                output_lines: Default::default(),
+
                 id: "todo-append".into(),
                 call: ToolCall::Todo {
                     items: vec![
@@ -17587,6 +18689,10 @@ mod tests {
             "todo-progress-entry",
             MessageStatus::Complete,
             vec![MessagePart::Tool {
+                exit_code: Default::default(),
+                output_truncated: Default::default(),
+                output_lines: Default::default(),
+
                 id: "todo-progress".into(),
                 call: ToolCall::Todo {
                     items: make_items(3),
@@ -17757,6 +18863,10 @@ mod tests {
     #[test]
     fn assistant_image_read_tool_adds_a_gallery_without_output_text() {
         let read = |id: &str, path: &str| MessagePart::Tool {
+            exit_code: Default::default(),
+            output_truncated: Default::default(),
+            output_lines: Default::default(),
+
             id: id.into(),
             call: ToolCall::ReadFile { path: path.into() },
             is_error: false,
@@ -17961,6 +19071,9 @@ mod tests {
             subagent_status: Some(SubagentStatus::Running),
             subagent_tail: None,
             subagent_end: None,
+            exit_code: None,
+            output_truncated: false,
+            output_lines: None,
         }
     }
 
@@ -18377,6 +19490,1760 @@ mod tests {
         ));
     }
 
+    // Exercise the real Transcript handlers with GPUI's Linux headless
+    // platform; no renderer, display server, or test-only dependency needed.
+    #[cfg(target_os = "linux")]
+    mod user_fold_scroll {
+        use super::*;
+
+        fn with_transcript(test: impl FnOnce(&mut Transcript, &mut Context<Transcript>) + 'static) {
+            gpui_platform::headless().run(move |cx| {
+                let state = cx.new(|_| AppState::new());
+                let transcript = cx.new(|cx| Transcript::new(state, cx));
+                transcript.update(cx, test);
+                // Quit after the platform loop starts; calloop resets its
+                // stop flag on entry, so quitting in the launch hook hangs.
+                cx.spawn(async move |cx| {
+                    cx.update(|cx| cx.quit());
+                })
+                .detach();
+            });
+        }
+
+        struct CachedTranscript(Entity<Transcript>);
+
+        impl Render for CachedTranscript {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.0
+                    .clone()
+                    .cached(gpui::StyleRefinement::default().size_full())
+            }
+        }
+
+        fn with_window(
+            test: impl FnOnce(Entity<Transcript>, gpui::WindowHandle<CachedTranscript>, &mut gpui::App)
+            + 'static,
+        ) {
+            gpui_platform::headless().run(move |cx| {
+                cx.set_global(Theme::dark());
+                let state = cx.new(|_| AppState::new());
+                let window = cx
+                    .open_window(
+                        gpui::WindowOptions {
+                            window_bounds: Some(gpui::WindowBounds::Windowed(Bounds::new(
+                                Point::default(),
+                                gpui::size(px(1000.0), px(800.0)),
+                            ))),
+                            ..Default::default()
+                        },
+                        |_, cx| {
+                            let transcript = cx.new(|cx| Transcript::new(state, cx));
+                            cx.new(|_| CachedTranscript(transcript))
+                        },
+                    )
+                    .unwrap();
+                let transcript = window.entity(cx).unwrap().read(cx).0.clone();
+                test(transcript, window, cx);
+                cx.spawn(async move |cx| {
+                    cx.update(|cx| cx.quit());
+                })
+                .detach();
+            });
+        }
+
+        fn draw(window: gpui::WindowHandle<CachedTranscript>, cx: &mut gpui::App) {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            })
+            .unwrap();
+        }
+
+        #[test]
+        fn conversation_width_reflows_streaming_text_without_restarting_animations() {
+            with_window(|transcript, window, cx| {
+                let dir = tempfile::tempdir().unwrap();
+                crate::settings::init(Default::default(), dir.path(), cx);
+                let text = "Streaming content should wrap at the configured conversation width. "
+                    .repeat(80);
+                let mut entries = vec![assistant(
+                    "reply",
+                    MessageStatus::Streaming,
+                    vec![text_part("body", &text)],
+                )];
+                transcript.update(cx, |this, cx| {
+                    feed(this, entries.clone(), cx);
+                    this.rail_enabled = false;
+                    this.pinned = false;
+                    this.list.scroll_to(ListOffset {
+                        item_ix: 0,
+                        offset_in_item: px(0.0),
+                    });
+                });
+                draw(window, cx);
+                let original_veil =
+                    transcript.read(cx).veils[&SharedString::from("reply#body.0")].clone();
+                crate::settings::set_transcript_width(560.0, cx);
+                draw(window, cx);
+                let narrow = transcript
+                    .read(cx)
+                    .list
+                    .bounds_for_item(0)
+                    .unwrap()
+                    .size
+                    .height;
+                crate::settings::set_transcript_width(1200.0, cx);
+                draw(window, cx);
+                let this = transcript.read(cx);
+                let wide = this.list.bounds_for_item(0).unwrap().size.height;
+                assert!(
+                    wide < narrow,
+                    "width change must remeasure wrapped rows: {wide:?} vs {narrow:?}"
+                );
+                assert!(Rc::ptr_eq(
+                    &original_veil,
+                    &this.veils[&SharedString::from("reply#body.0")]
+                ));
+                assert!(!this.pinned);
+                assert_eq!(this.list.logical_scroll_top().item_ix, 0);
+                assert!(this.list.logical_scroll_top().offset_in_item.abs() <= px(1.0));
+                let bounds = render::selection_test_bounds("reply#body.0:0");
+                assert!(
+                    bounds.size.width <= px(1000.0 - 2.0 * COLUMN_GUTTER),
+                    "content must fit the fork's viewport gutters: {bounds:?}"
+                );
+                entries[0].parts.push(tool_part("live-tool", "pwd"));
+                transcript.update(cx, |this, cx| {
+                    feed(this, entries, cx);
+                    assert!(
+                        this.tool_reveals
+                            .values()
+                            .find_map(|starts| starts.get(&SharedString::from("live-tool")))
+                            .copied()
+                            .flatten()
+                            .is_some()
+                    );
+                    this.pinned = true;
+                    this.list.scroll_to(ListOffset {
+                        item_ix: this.list.item_count(),
+                        offset_in_item: px(0.0),
+                    });
+                });
+                crate::settings::set_transcript_width(560.0, cx);
+                for _ in 0..80 {
+                    tick(&transcript, window, cx);
+                }
+                assert!(transcript.read(cx).distance_from_bottom() <= 1.0);
+            });
+        }
+
+        #[test]
+        fn replay_keeps_unpainted_opening_text_seeded_and_new_text_live() {
+            with_window(|transcript, window, cx| {
+                let history = vec![assistant(
+                    "reply",
+                    MessageStatus::Streaming,
+                    vec![text_part("body", "historial fuera de pantalla")],
+                )];
+                transcript.update(cx, |this, cx| {
+                    this.state.update(cx, |state, cx| {
+                        state.select_chat(Some("chat".into()), cx);
+                        state
+                            .receive_transcript_update(
+                                zeron_doc::TranscriptUpdate {
+                                    frame: zeron_doc::TranscriptFrame::reset(&history),
+                                    context_usage: None,
+                                    replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(
+                                        &history,
+                                    )),
+                                },
+                                cx,
+                            )
+                            .unwrap();
+                    });
+                    this.sync(cx);
+                    assert!(this.veils.is_empty(), "opening text has not been painted");
+                });
+                let recovered = assistant(
+                    "recovered",
+                    MessageStatus::Complete,
+                    vec![text_part("old", "otro bloque histórico")],
+                );
+                let mut next = history.clone();
+                next[0].parts.push(text_part("fresh", "texto en vivo"));
+                next.push(recovered.clone());
+                let mut cutoff = history.clone();
+                cutoff.push(recovered);
+                transcript.update(cx, |this, cx| {
+                    this.state.update(cx, |state, cx| {
+                        state
+                            .receive_transcript_update(
+                                zeron_doc::TranscriptUpdate {
+                                    frame: zeron_doc::diff_transcript(&history, &next),
+                                    context_usage: None,
+                                    // The RPC must retain its opening cutoff when
+                                    // publishing subsequent changed-part history.
+                                    replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(
+                                        &cutoff,
+                                    )),
+                                },
+                                cx,
+                            )
+                            .unwrap();
+                    });
+                    this.sync(cx);
+                });
+                cx.update_window(window.into(), |_, window, cx| {
+                    transcript.update(cx, |this, cx| {
+                        let _ = this.render_row(0, window, cx);
+                        let _ = this.render_row(1, window, cx);
+                        let old = &this.veils[&SharedString::from("reply#body.0")];
+                        assert!(
+                            old.borrow_mut()
+                                .advance(0, "historial fuera de pantalla", Instant::now())
+                                .is_empty()
+                        );
+                        let fresh = &this.veils[&SharedString::from("reply#fresh.0")];
+                        let spans = fresh
+                            .borrow_mut()
+                            .advance(0, "texto en vivo", Instant::now());
+                        assert_eq!(spans.len(), 1);
+                        assert_eq!(spans[0].0, 0.."texto en vivo".len());
+                    });
+                })
+                .unwrap();
+            });
+        }
+
+        #[test]
+        fn replay_text_prefix_is_visible_while_coalesced_live_suffix_fades() {
+            with_window(|transcript, window, cx| {
+                let history = vec![assistant(
+                    "reply",
+                    MessageStatus::Streaming,
+                    vec![text_part("body", "café histórico")],
+                )];
+                let live = vec![assistant(
+                    "reply",
+                    MessageStatus::Streaming,
+                    vec![text_part("body", "café histórico y nuevo\n\nOtro párrafo")],
+                )];
+                transcript.update(cx, |this, cx| {
+                    this.state.update(cx, |state, cx| {
+                        state.select_chat(Some("chat".into()), cx);
+                        state
+                            .receive_transcript_update(
+                                zeron_doc::TranscriptUpdate {
+                                    frame: zeron_doc::TranscriptFrame::reset(&history),
+                                    context_usage: None,
+                                    replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(
+                                        &history,
+                                    )),
+                                },
+                                cx,
+                            )
+                            .unwrap();
+                        state
+                            .receive_transcript_update(
+                                zeron_doc::TranscriptUpdate {
+                                    frame: zeron_doc::diff_transcript(&history, &live),
+                                    context_usage: None,
+                                    replay_baseline: None,
+                                },
+                                cx,
+                            )
+                            .unwrap();
+                    });
+                    this.sync(cx);
+                });
+                cx.update_window(window.into(), |_, window, cx| {
+                    transcript.update(cx, |this, cx| {
+                        let _ = this.render_row(0, window, cx);
+                        let _ = this.render_row(1, window, cx);
+                        let first = &this.veils[&SharedString::from("reply#body.0")];
+                        let spans =
+                            first
+                                .borrow_mut()
+                                .advance(0, "café histórico y nuevo", Instant::now());
+                        assert_eq!(spans.len(), 1);
+                        assert_eq!(
+                            spans[0].0,
+                            "café histórico".len().."café histórico y nuevo".len()
+                        );
+                        let second = &this.veils[&SharedString::from("reply#body.1")];
+                        let spans = second
+                            .borrow_mut()
+                            .advance(1, "Otro párrafo", Instant::now());
+                        assert_eq!(spans.len(), 1);
+                        assert_eq!(spans[0].0, 0.."Otro párrafo".len());
+                    });
+                })
+                .unwrap();
+                let veil = transcript.read(cx).veils[&SharedString::from("reply#body.0")].clone();
+                // A second history batch in another entry must not restart
+                // the fade of this already visible live suffix.
+                let recovered = assistant(
+                    "other",
+                    MessageStatus::Complete,
+                    vec![text_part("body", "otra respuesta histórica")],
+                );
+                let mut next = live.clone();
+                next.push(recovered.clone());
+                let mut next_history = history.clone();
+                next_history.push(recovered);
+                transcript.update(cx, |this, cx| {
+                    this.state.update(cx, |state, cx| {
+                        state
+                            .receive_transcript_update(
+                                zeron_doc::TranscriptUpdate {
+                                    frame: zeron_doc::diff_transcript(&live, &next),
+                                    context_usage: None,
+                                    replay_baseline: Some(zeron_doc::TranscriptBaseline::capture(
+                                        &next_history,
+                                    )),
+                                },
+                                cx,
+                            )
+                            .unwrap();
+                    });
+                    this.sync(cx);
+                    assert!(Rc::ptr_eq(
+                        &veil,
+                        &this.veils[&SharedString::from("reply#body.0")]
+                    ));
+                });
+            });
+        }
+
+        #[test]
+        fn text_streamed_under_reduced_motion_does_not_fade_in_when_motion_resumes() {
+            fn render_rows(
+                transcript: &Entity<Transcript>,
+                window: gpui::WindowHandle<CachedTranscript>,
+                cx: &mut gpui::App,
+            ) {
+                cx.update_window(window.into(), |_, window, cx| {
+                    transcript.update(cx, |this, cx| {
+                        for ix in 0..this.list.item_count() {
+                            let _ = this.render_row(ix, window, cx);
+                        }
+                    });
+                })
+                .unwrap();
+            }
+            fn streaming(text: &str) -> Vec<SessionMessageEntry> {
+                vec![
+                    prompt("ask"),
+                    assistant(
+                        "reply",
+                        MessageStatus::Streaming,
+                        vec![text_part("body", text)],
+                    ),
+                ]
+            }
+            with_window(|transcript, window, cx| {
+                let body = SharedString::from("reply#body.0");
+                // Attach on the prompt alone, so the reply is live text rather
+                // than an attach-time baseline.
+                transcript.update(cx, |this, cx| feed(this, vec![prompt("ask")], cx));
+                render_rows(&transcript, window, cx);
+
+                // A row that first streams while motion is reduced.
+                cx.set_reduce_motion(true);
+                transcript.update(cx, |this, cx| feed(this, streaming("uno"), cx));
+                render_rows(&transcript, window, cx);
+                assert!(!transcript.read(cx).veils.contains_key(&body));
+                cx.set_reduce_motion(false);
+                render_rows(&transcript, window, cx);
+                let veil = transcript.read(cx).veils[&body].clone();
+                assert!(
+                    veil.borrow_mut()
+                        .advance(0, "uno", Instant::now())
+                        .is_empty(),
+                    "text painted under reduced motion must not dissolve in"
+                );
+
+                // A row already fading when motion pauses, then resumes.
+                cx.set_reduce_motion(true);
+                transcript.update(cx, |this, cx| feed(this, streaming("uno dos"), cx));
+                render_rows(&transcript, window, cx);
+                cx.set_reduce_motion(false);
+                render_rows(&transcript, window, cx);
+                let veil = transcript.read(cx).veils[&body].clone();
+                assert!(
+                    veil.borrow_mut()
+                        .advance(0, "uno dos", Instant::now())
+                        .is_empty(),
+                    "text streamed while paused is already on screen"
+                );
+                let spans = veil.borrow_mut().advance(0, "uno dos tres", Instant::now());
+                assert_eq!(spans.len(), 1);
+                assert_eq!(spans[0].0, "uno dos".len().."uno dos tres".len());
+            });
+        }
+
+        #[test]
+        fn replay_growth_snaps_only_when_following_the_tail() {
+            with_window(|transcript, window, cx| {
+                let entries: Vec<_> = (0..30).map(|ix| prompt(&format!("prompt-{ix}"))).collect();
+                transcript.update(cx, |this, cx| feed(this, entries.clone(), cx));
+                draw(window, cx);
+                let mut updated = entries;
+                for pinned in [false, true] {
+                    transcript.update(cx, |this, cx| {
+                        this.pinned = pinned;
+                        this.list.scroll_to(ListOffset {
+                            item_ix: 5,
+                            offset_in_item: px(12.0),
+                        });
+                        this.spring_kick = true;
+                        updated.push(prompt(&format!("history-{}", updated.len())));
+                        this.state.update(cx, |state, cx| {
+                            let frame = zeron_doc::diff_transcript(&state.transcript, &updated);
+                            state
+                                .receive_transcript_update(
+                                    zeron_doc::TranscriptUpdate {
+                                        frame,
+                                        context_usage: None,
+                                        replay_baseline: Some(
+                                            zeron_doc::TranscriptBaseline::capture(&updated),
+                                        ),
+                                    },
+                                    cx,
+                                )
+                                .unwrap();
+                        });
+                        this.sync(cx);
+                        if !pinned {
+                            let offset = this.list.logical_scroll_top();
+                            assert_eq!(offset.item_ix, 5);
+                            assert_eq!(offset.offset_in_item, px(12.0));
+                        } else {
+                            assert!(!this.spring_kick, "history must not start a scroll chase");
+                        }
+                    });
+                    draw(window, cx);
+                    if pinned {
+                        assert!(transcript.read(cx).distance_from_bottom() <= 0.5);
+                    }
+                }
+            });
+        }
+
+        // These exercise frame-by-frame geometry, including the first paint
+        // after a row append. Eventual settling alone misses visible jumps.
+        #[test]
+        fn runway_short_chat_glides_from_its_bottom_aligned_position() {
+            with_window(|transcript, window, cx| {
+                transcript.update(cx, |this, cx| {
+                    this.rows = vec![viewport_row("prompt", "prompt")];
+                    this.list.reset(1);
+                    this.rail_enabled = false;
+                    cx.notify();
+                });
+                draw(window, cx);
+                transcript.update(cx, |this, cx| {
+                    this.on_own_send("chat".into(), "prompt".into(), cx)
+                });
+                draw(window, cx);
+                let mut previous = transcript.read(cx).list.bounds_for_item(0).unwrap().top();
+                assert!(previous > px(400.0));
+                for _ in 0..80 {
+                    transcript.update(cx, |this, cx| {
+                        this.own_turn_last_tick = Some(Instant::now() - Duration::from_millis(17));
+                        this.step_own_turn(cx);
+                    });
+                    draw(window, cx);
+                    let top = transcript.read(cx).list.bounds_for_item(0).unwrap().top();
+                    assert!(top <= previous + px(0.5), "glide reversed");
+                    assert!(
+                        previous - top < px(150.0),
+                        "glide jumped: {previous:?} -> {top:?}"
+                    );
+                    previous = top;
+                }
+                assert!(previous.abs() < px(1.0));
+            });
+        }
+
+        fn append_runway_rows(this: &mut Transcript, count: usize, cx: &mut Context<Transcript>) {
+            let old_last = this.rows.len() - 1;
+            let mut rows = this.rows.clone();
+            for ix in 0..count {
+                rows.push(viewport_row(&format!("reply-{}", old_last + ix), "reply"));
+            }
+            // Isolate the row-splice layout boundary; the streaming tests
+            // below exercise the real row builder and sync as well.
+            this.list.splice(this.rows.len()..this.rows.len(), count);
+            this.rows = rows;
+            this.list.remeasure_items(old_last..old_last + 1);
+            this.remeasure_last_row();
+            this.own_turn_kick = true;
+            cx.notify();
+        }
+
+        #[test]
+        fn runway_append_consumes_space_before_the_first_paint() {
+            with_window(|transcript, window, cx| {
+                transcript.update(cx, |this, cx| {
+                    this.rows = vec![viewport_row("prompt", "prompt")];
+                    this.list.reset(1);
+                    this.rail_enabled = false;
+                    this.on_own_send("chat".into(), "prompt".into(), cx);
+                    this.list.scroll_to(ListOffset::default());
+                });
+                draw(window, cx);
+                transcript.update(cx, |this, cx| this.step_own_turn(cx));
+                draw(window, cx);
+                let before = transcript.read(cx).list.max_offset_for_scrollbar().y;
+                transcript.update(cx, |this, cx| append_runway_rows(this, 3, cx));
+                draw(window, cx);
+                let after = transcript.read(cx).list.max_offset_for_scrollbar().y;
+                assert!(
+                    (after - before).abs() <= px(1.0),
+                    "append exposed blank scroll space: {before:?} -> {after:?}"
+                );
+            });
+        }
+
+        fn feed(
+            this: &mut Transcript,
+            entries: Vec<SessionMessageEntry>,
+            cx: &mut Context<Transcript>,
+        ) {
+            this.state.update(cx, |state, _| {
+                state.selected_chat = Some("chat".into());
+                state.transcript_replayed = true;
+                state.transcript = entries;
+                state.transcript_revision += 1;
+            });
+            this.sync(cx);
+        }
+
+        fn prompt(id: &str) -> SessionMessageEntry {
+            let mut entry = assistant(
+                id,
+                MessageStatus::Complete,
+                vec![text_part("text", "Please explain this.")],
+            );
+            entry.role = MessageRole::User;
+            entry
+        }
+
+        fn tick(
+            transcript: &Entity<Transcript>,
+            window: gpui::WindowHandle<CachedTranscript>,
+            cx: &mut gpui::App,
+        ) {
+            transcript.update(cx, |this, cx| {
+                this.own_turn_last_tick = Some(Instant::now() - Duration::from_millis(17));
+                this.spring_last_tick = Some(Instant::now() - Duration::from_millis(17));
+                if this.own_turn.is_some() {
+                    this.step_own_turn(cx);
+                }
+                if this.pinned {
+                    this.step_spring(cx);
+                }
+            });
+            draw(window, cx);
+        }
+
+        fn wheel(window: gpui::WindowHandle<CachedTranscript>, delta: f32, cx: &mut gpui::App) {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                        position: gpui::point(px(500.0), px(400.0)),
+                        delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(delta))),
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            })
+            .unwrap();
+        }
+
+        #[test]
+        fn selecting_live_tail_keeps_anchor_visible_during_a_stream_burst() {
+            with_window(|transcript, window, cx| {
+                let text = (0..40)
+                    .map(|i| format!("Paragraph {i} has selectable response text.\n\n"))
+                    .collect::<String>();
+                transcript.update(cx, |this, cx| {
+                    feed(
+                        this,
+                        vec![assistant(
+                            "reply",
+                            MessageStatus::Streaming,
+                            vec![text_part("text", &text)],
+                        )],
+                        cx,
+                    );
+                    this.rail_enabled = false;
+                });
+                draw(window, cx);
+                let bounds = render::selection_test_bounds("reply#text.39:39");
+                let start = bounds.origin + gpui::point(px(1.0), px(8.0));
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.dispatch_event(
+                        gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                            button: MouseButton::Left,
+                            position: start,
+                            click_count: 1,
+                            ..Default::default()
+                        }),
+                        cx,
+                    );
+                })
+                .unwrap();
+                assert!(crate::markdown::selection::is_dragging());
+                assert!(
+                    !transcript.read(cx).pinned,
+                    "text mouse-down must release following"
+                );
+                assert!(
+                    !transcript.read(cx).is_glued(),
+                    "selection must materialize the viewport"
+                );
+                transcript.update(cx, |this, cx| {
+                    feed(
+                        this,
+                        vec![assistant(
+                            "reply",
+                            MessageStatus::Streaming,
+                            vec![text_part("text", &(text.clone() + &text))],
+                        )],
+                        cx,
+                    );
+                });
+                draw(window, cx);
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.dispatch_event(
+                        gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                            position: start + gpui::point(px(90.0), px(0.0)),
+                            pressed_button: Some(MouseButton::Left),
+                            ..Default::default()
+                        }),
+                        cx,
+                    );
+                })
+                .unwrap();
+                assert!(
+                    crate::markdown::selection::selected_text().is_some(),
+                    "streaming must not virtualize the drag anchor before the first move"
+                );
+                crate::markdown::selection::end_active_drag();
+                crate::markdown::selection::clear_if_owner("reply#text.39:39");
+            });
+        }
+
+        #[test]
+        fn active_reply_text_selection_survives_streaming_and_completion() {
+            with_window(|transcript, window, cx| {
+                transcript.update(cx, |this, cx| {
+                    feed(this, vec![prompt("prompt")], cx);
+                    this.rail_enabled = false;
+                    this.state.update(cx, |state, _| {
+                        state.sessions.push(zeron_proto::Session {
+                            context_usage: Default::default(),
+                            error: Default::default(),
+                            turn_stats: Default::default(),
+
+                            last_completed_turn: None,
+                            last_turn_outcome: None,
+                            terminal_activity: None,
+                            running_subagents: 0,
+                            background_tasks: Vec::new(),
+                            chat_id: "chat".into(),
+                            device_id: "test".into(),
+                            status: zeron_proto::SessionStatus::Working,
+                            started_at: Some(chrono::Utc::now()),
+                            updated_at: chrono::Utc::now(),
+                        })
+                    });
+                    this.on_own_send("chat".into(), "prompt".into(), cx);
+                });
+                let entries = |status, text: &str| {
+                    vec![
+                        prompt("prompt"),
+                        assistant("reply", status, vec![text_part("text", text)]),
+                    ]
+                };
+                transcript.update(cx, |this, cx| {
+                    feed(
+                        this,
+                        entries(MessageStatus::Streaming, "Selectable response text."),
+                        cx,
+                    )
+                });
+                for _ in 0..80 {
+                    tick(&transcript, window, cx);
+                }
+                let bounds = render::selection_test_bounds("reply#text.0:0");
+                let start = bounds.origin + gpui::point(px(1.0), px(8.0));
+                let end = start + gpui::point(px(90.0), px(0.0));
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.dispatch_event(
+                        gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                            button: MouseButton::Left,
+                            position: start,
+                            click_count: 1,
+                            ..Default::default()
+                        }),
+                        cx,
+                    );
+                })
+                .unwrap();
+                assert!(crate::markdown::selection::is_dragging());
+                draw(window, cx);
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.dispatch_event(
+                        gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                            position: end,
+                            pressed_button: Some(MouseButton::Left),
+                            ..Default::default()
+                        }),
+                        cx,
+                    );
+                })
+                .unwrap();
+                let selected =
+                    crate::markdown::selection::selected_text().expect("active text must select");
+                assert!(!selected.is_empty());
+                transcript.update(cx, |this, cx| {
+                    feed(
+                        this,
+                        entries(
+                            MessageStatus::Streaming,
+                            "Selectable response text. More output.",
+                        ),
+                        cx,
+                    )
+                });
+                draw(window, cx);
+                assert_eq!(
+                    crate::markdown::selection::selected_text(),
+                    Some(selected.clone())
+                );
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.dispatch_event(
+                        gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                            button: MouseButton::Left,
+                            position: end,
+                            ..Default::default()
+                        }),
+                        cx,
+                    );
+                })
+                .unwrap();
+                transcript.update(cx, |this, cx| {
+                    feed(
+                        this,
+                        entries(
+                            MessageStatus::Complete,
+                            "Selectable response text. More output.",
+                        ),
+                        cx,
+                    )
+                });
+                draw(window, cx);
+                assert_eq!(crate::markdown::selection::selected_text(), Some(selected));
+                crate::markdown::selection::clear_if_owner("reply#text.0:0");
+            });
+        }
+
+        #[test]
+        fn runway_first_echo_starts_a_glide_in_an_empty_chat() {
+            with_window(|transcript, window, cx| {
+                transcript.update(cx, |this, cx| {
+                    feed(this, vec![], cx);
+                    this.rail_enabled = false;
+                });
+                draw(window, cx);
+                transcript.update(cx, |this, cx| {
+                    this.on_own_send("chat".into(), "prompt".into(), cx)
+                });
+                draw(window, cx); // notification before the optimistic echo
+                transcript.update(cx, |this, cx| feed(this, vec![prompt("prompt")], cx));
+                draw(window, cx);
+                let mut previous = transcript.read(cx).list.bounds_for_item(0).unwrap().top();
+                assert!(
+                    previous > px(400.0),
+                    "first echo skipped its glide: {previous:?}"
+                );
+                for _ in 0..80 {
+                    tick(&transcript, window, cx);
+                    let top = transcript.read(cx).list.bounds_for_item(0).unwrap().top();
+                    assert!(top <= previous + px(0.5));
+                    assert!(previous - top < px(150.0));
+                    previous = top;
+                }
+                assert!(previous.abs() <= px(1.0));
+            });
+        }
+
+        #[test]
+        fn runway_real_stream_consumes_reservation_then_follows_until_completion() {
+            with_window(|transcript, window, cx| {
+                transcript.update(cx, |this, cx| {
+                    feed(this, vec![prompt("prompt")], cx);
+                    this.rail_enabled = false;
+                });
+                draw(window, cx);
+                transcript.update(cx, |this, cx| {
+                    this.on_own_send("chat".into(), "prompt".into(), cx)
+                });
+                draw(window, cx);
+                for _ in 0..80 {
+                    tick(&transcript, window, cx);
+                }
+                let mut text = String::new();
+                let mut handed_off = false;
+                for chunk in 0..30 {
+                    text.push_str(&format!("\n\nSection {chunk}. A paragraph to explain the result.\n\n```text\ncontent {chunk}\n```\n"));
+                    transcript.update(cx, |this, cx| {
+                        feed(
+                            this,
+                            vec![
+                                prompt("prompt"),
+                                assistant(
+                                    "reply",
+                                    MessageStatus::Streaming,
+                                    vec![text_part("text", &text)],
+                                ),
+                            ],
+                            cx,
+                        )
+                    });
+                    draw(window, cx); // assert the first paint, before correction
+                    let this = transcript.read(cx);
+                    if this.own_turn.is_some() && !this.list.tail_reservation_filled() {
+                        assert!(
+                            this.list.max_offset_for_scrollbar().y <= px(2.5),
+                            "provisional blank space after chunk {chunk}"
+                        );
+                    }
+                    for _ in 0..50 {
+                        tick(&transcript, window, cx);
+                    }
+                    let this = transcript.read(cx);
+                    if this.own_turn.is_none() {
+                        handed_off = true;
+                        assert!(this.pinned, "overflow lost automatic following");
+                        assert!(
+                            this.distance_from_bottom() <= 1.0,
+                            "stream stopped following at chunk {chunk}"
+                        );
+                    }
+                }
+                assert!(handed_off, "long output never retired the runway");
+                transcript.update(cx, |this, cx| {
+                    feed(
+                        this,
+                        vec![
+                            prompt("prompt"),
+                            assistant(
+                                "reply",
+                                MessageStatus::Complete,
+                                vec![text_part("text", &text)],
+                            ),
+                        ],
+                        cx,
+                    )
+                });
+                draw(window, cx);
+                for _ in 0..50 {
+                    tick(&transcript, window, cx);
+                }
+                assert!(transcript.read(cx).distance_from_bottom() <= 1.0);
+            });
+        }
+
+        #[test]
+        fn runway_wheel_down_cannot_enter_a_temporary_gap_or_reverse() {
+            with_window(|transcript, window, cx| {
+                transcript.update(cx, |this, cx| {
+                    this.rows = vec![viewport_row("prompt", "prompt")];
+                    this.list.reset(1);
+                    this.rail_enabled = false;
+                    this.on_own_send("chat".into(), "prompt".into(), cx);
+                    this.list.scroll_to(ListOffset::default());
+                });
+                draw(window, cx);
+                transcript.update(cx, |this, cx| append_runway_rows(this, 3, cx));
+                draw(window, cx);
+                let mut previous = px(0.0);
+                for _ in 0..20 {
+                    wheel(window, -60.0, cx);
+                    assert!(
+                        !transcript.read(cx).own_turn.as_ref().unwrap().held,
+                        "real wheel event must release the hold"
+                    );
+                    tick(&transcript, window, cx);
+                    let this = transcript.read(cx);
+                    let top = this
+                        .list
+                        .bounds_for_item(0)
+                        .map(|bounds| bounds.top())
+                        .unwrap_or_else(|| {
+                            // A genuine bottom pin uses GPUI's end sentinel, for
+                            // which bounds_for_item intentionally returns None.
+                            this.list.viewport_bounds().top()
+                                + this.list.offset_for_item(0)
+                                + this.list.scroll_px_offset_for_scrollbar().y
+                        });
+                    assert!(top >= px(-2.5), "wheel entered a blank runway: {top:?}");
+                    assert!(
+                        top <= previous + px(0.5),
+                        "downward wheel reversed: {previous:?} -> {top:?}"
+                    );
+                    previous = top;
+                }
+            });
+        }
+
+        #[test]
+        fn runway_background_burst_and_downward_input_reach_the_new_tail() {
+            with_window(|transcript, window, cx| {
+                transcript.update(cx, |this, cx| {
+                    feed(this, vec![prompt("prompt")], cx);
+                    this.rail_enabled = false;
+                });
+                draw(window, cx);
+                transcript.update(cx, |this, cx| {
+                    this.on_own_send("chat".into(), "prompt".into(), cx)
+                });
+                draw(window, cx);
+                for _ in 0..80 {
+                    tick(&transcript, window, cx);
+                }
+                // Apply many commits with no layouts or animation frames,
+                // just as when the native window has stopped requesting them.
+                let mut text = String::new();
+                for chunk in 0..40 {
+                    text.push_str(&format!(
+                        "\n\nSection {chunk}\n\n```text\nresult {chunk}\n```\n"
+                    ));
+                    transcript.update(cx, |this, cx| {
+                        feed(
+                            this,
+                            vec![
+                                prompt("prompt"),
+                                assistant(
+                                    "reply",
+                                    MessageStatus::Streaming,
+                                    vec![text_part("text", &text)],
+                                ),
+                            ],
+                            cx,
+                        )
+                    });
+                }
+                draw(window, cx);
+                let mut previous = -transcript.read(cx).list.scroll_px_offset_for_scrollbar().y;
+                for _ in 0..100 {
+                    wheel(window, -180.0, cx);
+                    tick(&transcript, window, cx);
+                    let this = transcript.read(cx);
+                    let current = -this.list.scroll_px_offset_for_scrollbar().y;
+                    assert!(
+                        current >= previous - px(1.0),
+                        "refocus wheel snapped backward: {previous:?} -> {current:?}"
+                    );
+                    previous = current;
+                }
+                let this = transcript.read(cx);
+                assert!(this.own_turn.is_none());
+                assert!(
+                    this.distance_from_bottom() <= 1.0,
+                    "downward input never reached new output"
+                );
+                assert!(previous > px(800.0));
+            });
+        }
+
+        #[test]
+        fn runway_second_send_and_steer_keep_the_previous_viewport_until_echo() {
+            with_window(|transcript, window, cx| {
+                transcript.update(cx, |this, cx| {
+                    feed(this, vec![prompt("first")], cx);
+                    this.rail_enabled = false;
+                });
+                draw(window, cx);
+                transcript.update(cx, |this, cx| {
+                    this.on_own_send("chat".into(), "first".into(), cx)
+                });
+                draw(window, cx);
+                for _ in 0..80 {
+                    tick(&transcript, window, cx);
+                }
+                let mut entries = vec![prompt("first")];
+                for (ix, status) in [MessageStatus::Complete, MessageStatus::Streaming]
+                    .into_iter()
+                    .enumerate()
+                {
+                    entries.push(assistant(
+                        &format!("reply-{ix}"),
+                        status,
+                        vec![text_part("text", "A short answer.")],
+                    ));
+                    transcript.update(cx, |this, cx| feed(this, entries.clone(), cx));
+                    draw(window, cx);
+                    for _ in 0..10 {
+                        tick(&transcript, window, cx);
+                    }
+                    let before = transcript.read(cx).list.scroll_px_offset_for_scrollbar().y;
+                    let id = format!("next-{ix}");
+                    transcript.update(cx, |this, cx| {
+                        this.on_own_send("chat".into(), id.clone(), cx)
+                    });
+                    draw(window, cx); // the echoed prompt has not landed yet
+                    assert!(
+                        (transcript.read(cx).list.scroll_px_offset_for_scrollbar().y - before)
+                            .abs()
+                            <= px(1.0),
+                        "waiting for echo moved the viewport"
+                    );
+                    entries.push(prompt(&id));
+                    transcript.update(cx, |this, cx| feed(this, entries.clone(), cx));
+                    draw(window, cx);
+                    let anchor = transcript.read(cx).own_turn_anchor_ix().unwrap();
+                    let mut previous = transcript
+                        .read(cx)
+                        .list
+                        .bounds_for_item(anchor)
+                        .unwrap()
+                        .top();
+                    assert!(previous > px(Transcript::own_send_inset(anchor) + 40.0));
+                    for _ in 0..80 {
+                        tick(&transcript, window, cx);
+                        let top = transcript
+                            .read(cx)
+                            .list
+                            .bounds_for_item(anchor)
+                            .unwrap()
+                            .top();
+                        assert!(top <= previous + px(0.5), "repeat send reversed");
+                        assert!(
+                            top >= px(Transcript::own_send_inset(anchor) - 2.5),
+                            "repeat send overshot"
+                        );
+                        assert!(previous - top < px(150.0), "repeat send jumped");
+                        previous = top;
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn runway_user_scroll_up_stays_released_when_output_overflows() {
+            with_window(|transcript, window, cx| {
+                transcript.update(cx, |this, cx| {
+                    let mut entries = vec![prompt("old")];
+                    entries.push(assistant(
+                        "history",
+                        MessageStatus::Complete,
+                        vec![text_part("text", &"History paragraph.\n\n".repeat(80))],
+                    ));
+                    entries.push(prompt("prompt"));
+                    feed(this, entries, cx);
+                    this.rail_enabled = false;
+                });
+                draw(window, cx);
+                transcript.update(cx, |this, cx| {
+                    this.on_own_send("chat".into(), "prompt".into(), cx)
+                });
+                draw(window, cx);
+                for _ in 0..80 {
+                    tick(&transcript, window, cx);
+                }
+                wheel(window, 300.0, cx);
+                draw(window, cx);
+                assert!(!transcript.read(cx).own_turn.as_ref().unwrap().held);
+                let before = transcript.read(cx).list.logical_scroll_top();
+                transcript.update(cx, |this, cx| {
+                    let mut entries = this.state.read(cx).transcript.clone();
+                    entries.push(assistant(
+                        "reply",
+                        MessageStatus::Streaming,
+                        vec![text_part("text", &"Long streamed reply.\n\n".repeat(80))],
+                    ));
+                    feed(this, entries, cx);
+                });
+                draw(window, cx);
+                for _ in 0..80 {
+                    tick(&transcript, window, cx);
+                }
+                let this = transcript.read(cx);
+                assert!(!this.pinned, "background growth stole the user's viewport");
+                let after = this.list.logical_scroll_top();
+                assert_eq!(before.item_ix, after.item_ix);
+                assert!((before.offset_in_item - after.offset_in_item).abs() <= px(1.0));
+            });
+        }
+
+        #[test]
+        fn runway_resizes_in_the_same_layout_without_a_provisional_gap() {
+            struct SizedTranscript {
+                transcript: Entity<Transcript>,
+                height: f32,
+            }
+            impl Render for SizedTranscript {
+                fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                    div()
+                        .w_full()
+                        .h(px(self.height))
+                        .child(self.transcript.clone())
+                }
+            }
+            with_window(|transcript, original, cx| {
+                transcript.update(cx, |this, cx| {
+                    this.rows = vec![viewport_row("prompt", "prompt")];
+                    this.list.reset(1);
+                    this.rail_enabled = false;
+                    this.on_own_send("chat".into(), "prompt".into(), cx);
+                    this.list.scroll_to(ListOffset::default());
+                });
+                // A ListState has one viewport. Detach the helper window before
+                // mounting this same Transcript in the resizable host.
+                original
+                    .update(cx, |_, window, _| window.remove_window())
+                    .unwrap();
+                let window = cx
+                    .open_window(gpui::WindowOptions::default(), |_, cx| {
+                        cx.new(|_| SizedTranscript {
+                            transcript: transcript.clone(),
+                            height: 600.0,
+                        })
+                    })
+                    .unwrap();
+                for height in [600.0, 900.0, 450.0, 800.0] {
+                    window
+                        .update(cx, |root, window, cx| {
+                            root.height = height;
+                            cx.notify();
+                            window.refresh();
+                        })
+                        .unwrap();
+                    cx.update_window(window.into(), |_, window, cx| {
+                        let _ = window.draw(cx);
+                    })
+                    .unwrap();
+                    let this = transcript.read(cx);
+                    assert_eq!(this.list.viewport_bounds().size.height, px(height));
+                    assert!(
+                        (this.list.max_offset_for_scrollbar().y - px(2.0)).abs() <= px(0.5),
+                        "resize exposed blank space"
+                    );
+                    assert!(this.list.bounds_for_item(0).unwrap().top().abs() <= px(0.5));
+                }
+            });
+        }
+
+        #[test]
+        fn runway_direct_jump_to_an_unmeasured_tail_does_not_reserve_unknown_rows() {
+            with_window(|transcript, window, cx| {
+                transcript.update(cx, |this, cx| {
+                    this.rows = (0..100)
+                        .map(|ix| viewport_row(&format!("row-{ix}"), &format!("entry-{ix}")))
+                        .collect();
+                    this.list.reset(100);
+                    this.list.scroll_to(ListOffset {
+                        item_ix: 99,
+                        offset_in_item: px(0.0),
+                    });
+                    this.pinned = false;
+                    this.rail_enabled = false;
+                    cx.notify();
+                });
+                draw(window, cx);
+                let natural = transcript.read(cx).list.offset_for_item(100)
+                    - transcript.read(cx).list.offset_for_item(99);
+                transcript.update(cx, |this, cx| {
+                    this.list.reset(100); // discard all prefix height hints
+                    this.on_own_send("chat".into(), "entry-0".into(), cx);
+                    this.release_own_turn_hold();
+                    this.list.scroll_to(ListOffset {
+                        item_ix: 99,
+                        offset_in_item: px(0.0),
+                    });
+                });
+                draw(window, cx);
+                let this = transcript.read(cx);
+                assert_eq!(
+                    this.list.offset_for_item(100) - this.list.offset_for_item(99),
+                    natural,
+                    "unknown prefix rows created a blank tail"
+                );
+                assert!(this.distance_from_bottom() <= 1.0);
+            });
+        }
+
+        #[test]
+        fn runway_wheel_down_at_the_end_keeps_following_when_streaming_overflows() {
+            with_window(|transcript, window, cx| {
+                transcript.update(cx, |this, cx| {
+                    feed(this, vec![prompt("prompt")], cx);
+                    this.rail_enabled = false;
+                });
+                draw(window, cx);
+                transcript.update(cx, |this, cx| {
+                    this.on_own_send("chat".into(), "prompt".into(), cx)
+                });
+                draw(window, cx);
+                for _ in 0..80 {
+                    tick(&transcript, window, cx);
+                }
+                wheel(window, -60.0, cx);
+                // Let the real wheel handler's deferred ListState read finish
+                // before delivering more output, as in the native event loop.
+                cx.defer(move |cx| {
+                    assert!(
+                        transcript.read(cx).pinned,
+                        "downward input at the runway end must retain follow intent"
+                    );
+                    let mut text = String::new();
+                    for chunk in 0..20 {
+                        text.push_str(&format!(
+                            "\n\nSection {chunk}\n\n```text\ncontent {chunk}\n```\n"
+                        ));
+                        transcript.update(cx, |this, cx| {
+                            feed(
+                                this,
+                                vec![
+                                    prompt("prompt"),
+                                    assistant(
+                                        "reply",
+                                        MessageStatus::Streaming,
+                                        vec![text_part("text", &text)],
+                                    ),
+                                ],
+                                cx,
+                            )
+                        });
+                        draw(window, cx);
+                        for _ in 0..40 {
+                            tick(&transcript, window, cx);
+                        }
+                    }
+                    let this = transcript.read(cx);
+                    assert!(this.own_turn.is_none());
+                    assert!(this.pinned);
+                    assert!(
+                        this.distance_from_bottom() <= 1.0,
+                        "output stopped following after the runway filled"
+                    );
+                });
+            });
+        }
+
+        #[test]
+        fn runway_down_then_up_before_overflow_preserves_the_user_viewport() {
+            with_window(|transcript, window, cx| {
+                transcript.update(cx, |this, cx| {
+                    feed(
+                        this,
+                        vec![
+                            prompt("old"),
+                            assistant(
+                                "history",
+                                MessageStatus::Complete,
+                                vec![text_part("text", &"History.\n\n".repeat(80))],
+                            ),
+                            prompt("prompt"),
+                        ],
+                        cx,
+                    );
+                    this.rail_enabled = false;
+                });
+                draw(window, cx);
+                transcript.update(cx, |this, cx| {
+                    this.on_own_send("chat".into(), "prompt".into(), cx)
+                });
+                draw(window, cx);
+                for _ in 0..80 {
+                    tick(&transcript, window, cx);
+                }
+                wheel(window, -60.0, cx);
+                cx.defer(move |cx| {
+                    assert!(transcript.read(cx).pinned);
+                    draw(window, cx);
+                    wheel(window, 300.0, cx);
+                    assert!(
+                        !transcript.read(cx).pinned,
+                        "upward input must cancel the spring synchronously"
+                    );
+                    cx.defer(move |cx| {
+                        assert!(!transcript.read(cx).pinned);
+                        let before = transcript.read(cx).list.logical_scroll_top();
+                        transcript.update(cx, |this, cx| {
+                            let mut entries = this.state.read(cx).transcript.clone();
+                            entries.push(assistant(
+                                "reply",
+                                MessageStatus::Streaming,
+                                vec![text_part("text", &"New output.\n\n".repeat(80))],
+                            ));
+                            feed(this, entries, cx);
+                        });
+                        draw(window, cx);
+                        for _ in 0..80 {
+                            tick(&transcript, window, cx);
+                        }
+                        let this = transcript.read(cx);
+                        assert!(!this.pinned);
+                        let after = this.list.logical_scroll_top();
+                        assert_eq!(before.item_ix, after.item_ix);
+                        assert!((before.offset_in_item - after.offset_in_item).abs() <= px(1.0));
+                    });
+                });
+            });
+        }
+
+        #[test]
+        fn runway_absorbs_tail_shrinkage_in_the_same_layout() {
+            with_window(|transcript, window, cx| {
+                transcript.update(cx, |this, cx| {
+                    let mut row = viewport_row("prompt", "prompt");
+                    row.kind = RowKind::ErrorChip {
+                        message: "line\n".repeat(12).into(),
+                    };
+                    this.rows = vec![row];
+                    this.list.reset(1);
+                    this.pinned = false;
+                    this.rail_enabled = false;
+                    cx.notify();
+                });
+                draw(window, cx);
+                transcript.update(cx, |this, cx| {
+                    this.on_own_send("chat".into(), "prompt".into(), cx)
+                });
+                draw(window, cx);
+                transcript.update(cx, |this, cx| {
+                    this.list.scroll_to(ListOffset {
+                        item_ix: 0,
+                        offset_in_item: px(0.0),
+                    });
+                    this.step_own_turn(cx);
+                });
+                draw(window, cx);
+                let before = transcript.read(cx).list.bounds_for_item(0).unwrap();
+                transcript.update(cx, |this, cx| {
+                    // Simulate completion removing content from the last row.
+                    this.rows[0].kind = RowKind::ErrorChip {
+                        message: "done".into(),
+                    };
+                    this.list.remeasure_items(0..1);
+                    cx.notify();
+                });
+                // No controller tick between the change and this paint.
+                draw(window, cx);
+                let after = transcript.read(cx).list.bounds_for_item(0).unwrap();
+                assert_eq!(
+                    before.top(),
+                    after.top(),
+                    "completion must not move the prompt"
+                );
+                assert_eq!(
+                    before.size.height, after.size.height,
+                    "the runway absorbs the shrink"
+                );
+                transcript.update(cx, |this, cx| {
+                    this.rows[0].kind = RowKind::ErrorChip {
+                        message: "line\n".repeat(100).into(),
+                    };
+                    this.list.remeasure_items(0..1);
+                    cx.notify();
+                });
+                draw(window, cx);
+                let overflow_height = transcript
+                    .read(cx)
+                    .list
+                    .bounds_for_item(0)
+                    .unwrap()
+                    .size
+                    .height;
+                transcript.update(cx, |this, cx| {
+                    this.step_own_turn(cx);
+                    assert!(
+                        this.own_turn.is_none(),
+                        "overflow must retire the reservation"
+                    );
+                    assert!(this.pinned, "a held turn hands off to tail-follow");
+                });
+                draw(window, cx);
+                assert_eq!(
+                    transcript
+                        .read(cx)
+                        .list
+                        .bounds_for_item(0)
+                        .unwrap()
+                        .size
+                        .height,
+                    overflow_height,
+                    "retiring the minimum must be height-neutral"
+                );
+            });
+        }
+
+        const MERMAID_FENCE: &str =
+            "```mermaid\nflowchart TD\n    A[Request] --> B[Plan]\n    B --> C[Done]\n```\n";
+
+        #[test]
+        fn send_glide_never_crosses_the_prompt_during_remeasurement() {
+            with_window(|transcript, window, cx| {
+                transcript.update(cx, |this, cx| {
+                    this.rows = (0..12)
+                        .map(|ix| viewport_row(&format!("row-{ix}"), &format!("entry-{ix}")))
+                        .collect();
+                    this.list.reset(this.rows.len());
+                    this.rail_enabled = false;
+                    cx.notify();
+                });
+                draw(window, cx);
+                transcript.update(cx, |this, cx| {
+                    this.on_own_send("chat".into(), "entry-11".into(), cx)
+                });
+                draw(window, cx);
+                let start_top = transcript.read(cx).list.bounds_for_item(11).unwrap().top();
+                assert!(
+                    start_top > px(Transcript::own_send_inset(11) + 100.0),
+                    "installing the runway must preserve the start of the glide"
+                );
+                let mut previous_top = start_top;
+                for _ in 0..90 {
+                    draw(window, cx);
+                    transcript.update(cx, |this, cx| {
+                        // Pending-echo changes can invalidate the prompt before
+                        // the queued glide runs. Exercise that exact ordering.
+                        this.remeasure_last_row();
+                        this.own_turn_last_tick = Some(Instant::now() - Duration::from_millis(17));
+                        this.step_own_turn(cx);
+                    });
+                    draw(window, cx);
+                    let this = transcript.read(cx);
+                    let bounds = this.list.bounds_for_item(11).unwrap();
+                    assert!(
+                        bounds.top() <= previous_top + px(0.5),
+                        "the glide must not reverse"
+                    );
+                    previous_top = bounds.top();
+                    let target =
+                        this.list.viewport_bounds().top() + px(Transcript::own_send_inset(11));
+                    assert!(
+                        bounds.top() >= target - px(0.5),
+                        "send overshot: {:?} < {:?}",
+                        bounds.top(),
+                        target
+                    );
+                }
+                let this = transcript.read(cx);
+                let bounds = this.list.bounds_for_item(11).unwrap();
+                assert!(
+                    (f32::from(bounds.top() - this.list.viewport_bounds().top())
+                        - Transcript::own_send_inset(11))
+                    .abs()
+                        <= 1.0
+                );
+            });
+        }
+
+        #[test]
+        fn background_overflow_retires_hold_before_the_tail_is_measured() {
+            with_window(|transcript, window, cx| {
+                transcript.update(cx, |this, cx| {
+                    this.rows = (0..100)
+                        .map(|ix| viewport_row(&format!("row-{ix}"), &format!("entry-{ix}")))
+                        .collect();
+                    this.list.reset(this.rows.len());
+                    this.list.scroll_to(ListOffset {
+                        item_ix: 0,
+                        offset_in_item: px(0.0),
+                    });
+                    this.pinned = false;
+                    this.rail_enabled = false;
+                    this.own_turn = Some(OwnTurnAnchor {
+                        chat_id: "chat".into(),
+                        message_id: "entry-0".into(),
+                        held: true,
+                        positioned: true,
+                        seen_prompt: true,
+                    });
+                    cx.notify();
+                });
+                draw(window, cx);
+                transcript.update(cx, |this, cx| {
+                    assert!(
+                        this.list.bounds_for_item(99).is_none(),
+                        "tail must remain virtualized"
+                    );
+                    this.step_own_turn(cx);
+                    assert!(
+                        this.own_turn.is_none(),
+                        "a filled hold cannot wait on off-screen bounds"
+                    );
+                    assert!(this.pinned);
+                });
+            });
+        }
+
+        #[test]
+        fn wheel_down_releases_stale_hold_before_a_background_frame_can_run() {
+            with_transcript(|this, cx| {
+                this.rows = vec![
+                    viewport_row("prompt", "prompt"),
+                    viewport_row("reply", "reply"),
+                ];
+                this.list.reset(2);
+                this.own_turn = Some(OwnTurnAnchor {
+                    chat_id: "chat".into(),
+                    message_id: "prompt".into(),
+                    held: true,
+                    positioned: true,
+                    seen_prompt: true,
+                });
+                this.own_turn_scheduled = true;
+                // A downward scroll into output received while no layout/frame
+                // callbacks were running. No preceding upward gesture.
+                this.list.scroll_to(ListOffset {
+                    item_ix: 1,
+                    offset_in_item: px(20.0),
+                });
+                this.handle_scroll(
+                    &ListScrollEvent {
+                        visible_range: 1..2,
+                        count: 2,
+                        is_scrolled: true,
+                        is_following_tail: false,
+                    },
+                    cx,
+                );
+                assert!(
+                    !this.own_turn.as_ref().unwrap().held,
+                    "input must cancel the queued hold synchronously"
+                );
+                let entity = cx.entity();
+                cx.defer(move |cx| {
+                    let this = entity.read(cx);
+                    assert!(!this.own_turn.as_ref().unwrap().held);
+                    assert_eq!(this.list.logical_scroll_top().item_ix, 1);
+                    assert_eq!(this.list.logical_scroll_top().offset_in_item, px(20.0));
+                });
+            });
+        }
+
+        #[test]
+        fn expanding_streaming_prompt_does_not_retire_its_runway() {
+            with_window(|transcript, window, cx| {
+                let mut user = prompt("prompt");
+                user.parts = vec![text_part("text", &"A long prompt line.\n".repeat(80))];
+                transcript.update(cx, |this, cx| {
+                    feed(
+                        this,
+                        vec![
+                            user.clone(),
+                            assistant(
+                                "reply",
+                                MessageStatus::Streaming,
+                                vec![text_part("text", "A short live reply.")],
+                            ),
+                        ],
+                        cx,
+                    );
+                    this.rail_enabled = false;
+                    this.on_own_send("chat".into(), "prompt".into(), cx);
+                });
+                for _ in 0..80 {
+                    tick(&transcript, window, cx);
+                }
+                let before = transcript.read(cx).list.max_offset_for_scrollbar();
+                let toggle = |this: &mut Transcript, cx: &mut Context<Transcript>| {
+                    let full_h = this.user_heights["prompt"].get();
+                    this.toggle_user_fold(
+                        "prompt".into(),
+                        0,
+                        USER_LINE_HEIGHT * USER_COLLAPSED_LINES as f32,
+                        full_h,
+                        true,
+                    );
+                    this.user_folds.get_mut("prompt").unwrap().toggled_at =
+                        Some(Instant::now() - Duration::from_secs(5));
+                    cx.notify();
+                };
+                transcript.update(cx, toggle);
+                draw(window, cx);
+                tick(&transcript, window, cx);
+                assert!(
+                    transcript.read(cx).own_turn.is_some(),
+                    "Show more must not consume the runway as assistant output"
+                );
+                transcript.update(cx, toggle);
+                draw(window, cx);
+                tick(&transcript, window, cx);
+                assert!(transcript.read(cx).own_turn.is_some());
+                assert!(
+                    (transcript.read(cx).list.max_offset_for_scrollbar().y - before.y).abs()
+                        <= px(1.0),
+                    "Show less must restore the original reservation"
+                );
+                transcript.update(cx, toggle);
+                draw(window, cx);
+                transcript.update(cx, |this, cx| {
+                    feed(
+                        this,
+                        vec![
+                            user,
+                            assistant(
+                                "reply",
+                                MessageStatus::Streaming,
+                                vec![text_part("text", &"More assistant output.\n\n".repeat(80))],
+                            ),
+                        ],
+                        cx,
+                    )
+                });
+                transcript.update(cx, |this, cx| this.jump_to_bottom(cx));
+                for _ in 0..80 {
+                    tick(&transcript, window, cx);
+                }
+                assert!(
+                    transcript.read(cx).own_turn.is_none(),
+                    "real output must still retire the reservation while the prompt is expanded"
+                );
+            });
+        }
+
+        #[test]
+        fn folding_releases_sent_turn_hold_without_removing_reservation() {
+            with_transcript(|transcript, _| {
+                for reduced_motion in [false, true] {
+                    for open in [false, true] {
+                        transcript.own_turn = Some(OwnTurnAnchor {
+                            chat_id: "chat".into(),
+                            message_id: "prompt".into(),
+                            held: true,
+                            positioned: true,
+                            seen_prompt: true,
+                        });
+                        transcript.pinned = true;
+                        transcript.spring_kick = true;
+                        transcript.own_turn_last_tick = Some(Instant::now());
+                        transcript
+                            .user_folds
+                            .entry("prompt".into())
+                            .or_default()
+                            .open = Some(open);
+
+                        // No row bounds yet: ownership must transfer even if
+                        // geometry is unavailable during a list remeasurement.
+                        transcript.toggle_user_fold(
+                            "prompt".into(),
+                            0,
+                            110.0,
+                            2200.0,
+                            reduced_motion,
+                        );
+
+                        let turn = transcript.own_turn.as_ref().unwrap();
+                        assert!(
+                            !turn.held,
+                            "an outgrown reservation must not re-engage the pin"
+                        );
+                        assert!(transcript.own_turn_last_tick.is_none());
+                        assert!(!transcript.pinned);
+                        assert!(!transcript.spring_kick);
+                        assert_eq!(transcript.user_folds["prompt"].open, Some(!open));
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn navigation_cancels_fold_compensation_before_queued_frame() {
+            with_transcript(|transcript, cx| {
+                for navigation in ["wheel", "rail", "bottom", "send"] {
+                    transcript.user_collapse_scroll = Some(UserCollapseScroll {
+                        started_at: Instant::now(),
+                        duration_ms: 850,
+                        height_delta: 2000.0,
+                        row_ix: 0,
+                        initial_top: -1000.0,
+                        target_top: 80.0,
+                    });
+                    transcript.user_collapse_scroll_scheduled = true;
+                    let hold_token = transcript.user_hold_token;
+                    match navigation {
+                        "wheel" => transcript.handle_scroll(
+                            &ListScrollEvent {
+                                visible_range: 0..0,
+                                count: 0,
+                                is_scrolled: true,
+                                is_following_tail: false,
+                            },
+                            cx,
+                        ),
+                        "rail" => transcript.begin_scroll_navigation(),
+                        "bottom" => transcript.jump_to_bottom(cx),
+                        "send" => transcript.on_own_send("chat".into(), "prompt".into(), cx),
+                        _ => unreachable!(),
+                    }
+                    assert!(transcript.user_collapse_scroll.is_none(), "{navigation}");
+                    assert_ne!(
+                        transcript.user_hold_token, hold_token,
+                        "cancel stale long presses"
+                    );
+                    assert!(
+                        transcript.user_collapse_scroll_scheduled,
+                        "keep the queued-frame guard"
+                    );
+
+                    // A frame queued before the input must neither move the
+                    // viewport nor resurrect the canceled compensation.
+                    let offset = transcript.list.logical_scroll_top();
+                    transcript.user_collapse_scroll_scheduled = false;
+                    transcript.step_user_collapse_scroll(cx);
+                    let after = transcript.list.logical_scroll_top();
+                    assert_eq!(after.item_ix, offset.item_ix);
+                    assert_eq!(after.offset_in_item, offset.offset_in_item);
+                    assert!(transcript.user_collapse_scroll.is_none());
+                }
+            });
+        }
+    }
+
+    /// Explicit multiline and long soft-wrapped prompts get a fold affordance;
+    /// short messages stay untouched.
+    #[test]
+    fn long_prompts_collapse_and_short_ones_do_not() {
+        assert!(!user_message_needs_collapse("short message"));
+        assert!(!user_message_needs_collapse("1\n2\n3\n4\n5"));
+        assert!(user_message_needs_collapse("1\n2\n3\n4\n5\n6"));
+        assert!(
+            !user_message_needs_collapse(&"x".repeat(240)),
+            "ordinary two- or three-line prose must not grow a toggle"
+        );
+        assert!(!user_message_needs_collapse(
+            &"x".repeat(USER_COLLAPSE_CHARS)
+        ));
+        assert!(user_message_needs_collapse(
+            &"x".repeat(USER_COLLAPSE_CHARS + 1)
+        ));
+    }
+
+    /// The toggle is render-local: expanding a prompt must not change the
+    /// row's identity or version, or the list would splice (and the
+    /// virtualizer would drop the scroll anchor) on every click.
+    #[test]
+    fn expanding_a_prompt_is_not_a_row_change() {
+        let mut entry = assistant("u3", MessageStatus::Complete, vec![]);
+        entry.role = MessageRole::User;
+        entry.status = None;
+        entry.parts = vec![text_part("t0", &"a line\n".repeat(40))];
+        let before = rows_for_entry(&entry, false, &mut parse);
+        let after = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].id, after[0].id);
+        assert_eq!(before[0].version, after[0].version);
+    }
+
     #[test]
     fn user_rows_split_attachment_refs_from_text() {
         let content = crate::attachments::with_attachments(
@@ -18469,20 +21336,6 @@ mod tests {
         assert_eq!(user_fold_target_top(300.0, 100.0, 700.0, 500.0), 188.0);
         assert_eq!(user_fold_target_top(300.0, 100.0, 700.0, 200.0), 300.0);
         assert_eq!(user_fold_target_top(50.0, 100.0, 700.0, 200.0), 100.0);
-    }
-
-    #[test]
-    fn long_prompts_collapse_and_short_ones_do_not() {
-        assert!(!user_message_needs_collapse("short message"));
-        assert!(!user_message_needs_collapse("1\n2\n3\n4\n5"));
-        assert!(user_message_needs_collapse("1\n2\n3\n4\n5\n6"));
-        assert!(!user_message_needs_collapse(&"x".repeat(240)));
-        assert!(!user_message_needs_collapse(
-            &"x".repeat(USER_COLLAPSE_CHARS)
-        ));
-        assert!(user_message_needs_collapse(
-            &"x".repeat(USER_COLLAPSE_CHARS + 1)
-        ));
     }
 
     fn att(path: &str) -> crate::attachments::UserImageAttachment {
@@ -20633,6 +23486,239 @@ mod tests {
         let rows = rows_for_entry(&entry, false, &mut parse);
         assert_eq!(top_gap_for(Some(&rows[0]), &rows[1]), render::MD_BLOCK_GAP);
         assert_eq!(top_gap_for(Some(&rows[1]), &rows[2]), render::MD_BLOCK_GAP);
+    }
+
+    /// The engine end of a test state: requests are kept, never answered,
+    /// so whatever is selected stays as unreplayed as on a slow link.
+    type SilentEngine = (
+        tokio::sync::mpsc::Receiver<String>,
+        tokio::sync::mpsc::Sender<String>,
+    );
+
+    fn test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// Remote chats "a" and "b" on omarchy, under reduced motion. Call
+    /// inside the test runtime.
+    fn remote_chats_state(
+        cx: &mut gpui::TestAppContext,
+        dir: &std::path::Path,
+    ) -> (Entity<AppState>, SilentEngine) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir, cx);
+            crate::motion::set_reduced_motion(cx, true);
+        });
+        let (out, requests) = tokio::sync::mpsc::channel::<String>(256);
+        let (replies, inbound) = tokio::sync::mpsc::channel::<String>(256);
+        let engine =
+            crate::state::EngineHandle::from_test_client(zeron_rpc::RpcClient::new(out, inbound));
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.local_device_id = Some("local".into());
+            state.chats = ["a", "b"]
+                .into_iter()
+                .map(|id| {
+                    serde_json::from_value(serde_json::json!({
+                        "id": id, "deviceId": "omarchy", "archived": false,
+                        "createdAt": chrono::Utc::now(),
+                    }))
+                    .unwrap()
+                })
+                .collect();
+            state.set_test_engine(engine);
+            state
+        });
+        (state, (requests, replies))
+    }
+
+    fn user_message(id: &str) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: id.into(),
+            role: MessageRole::User,
+            parts: Vec::new(),
+            created_at: 0,
+            device_id: "omarchy".into(),
+            status: None,
+            continuation_of: None,
+            duration_ms: None,
+        }
+    }
+
+    fn advance(cx: &mut gpui::TestAppContext, by: Duration) {
+        cx.executor().advance_clock(by);
+        cx.run_until_parked();
+    }
+
+    /// Reduced motion snaps animations, never waits: a quick open must not
+    /// flash the loader either way, and a slow one must still get it.
+    #[gpui::test]
+    fn transcript_loader_waits_its_delay_under_reduced_motion(cx: &mut gpui::TestAppContext) {
+        let runtime = test_runtime();
+        let _guard = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _engine) = remote_chats_state(cx, dir.path());
+        let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
+        state.update(cx, |state, cx| state.select_chat(Some("a".into()), cx));
+        cx.run_until_parked();
+        let loader = |cx: &mut gpui::TestAppContext| {
+            transcript.read_with(cx, |this, _| {
+                this.loader_shown.then_some(this.loading).flatten()
+            })
+        };
+        assert_eq!(loader(cx), None);
+        advance(cx, LOADER_DELAY - Duration::from_millis(1));
+        assert_eq!(loader(cx), None, "too quick to flash a loader");
+        advance(cx, Duration::from_millis(1));
+        assert_eq!(loader(cx), Some(crate::state::TranscriptLoading::Opening));
+        // Replayed empty: a remote copy is not known empty until synced.
+        state.update(cx, |state, cx| {
+            state.transcript_replayed = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(loader(cx), Some(crate::state::TranscriptLoading::Syncing));
+        // Content arrives: the loader leaves at once.
+        state.update(cx, |state, cx| {
+            state.transcript = vec![user_message("m1")];
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(loader(cx), None);
+        assert!(transcript.read_with(cx, |this, _| this.loader_delay.is_none()));
+    }
+
+    /// The loader overlays the pane it loads, centered in it — not laid out
+    /// below the full-height list, where the pane clips it.
+    #[gpui::test]
+    fn transcript_loader_renders_centered_in_its_pane(cx: &mut gpui::TestAppContext) {
+        let runtime = test_runtime();
+        let _guard = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _engine) = remote_chats_state(cx, dir.path());
+        let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
+        state.update(cx, |state, cx| state.select_chat(Some("a".into()), cx));
+        cx.run_until_parked();
+        advance(cx, LOADER_DELAY);
+        assert!(transcript.read_with(cx, |this, _| this.loader_shown));
+        struct Pane(Entity<Transcript>);
+        impl Render for Pane {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .debug_selector(|| "transcript-pane".into())
+                    .w(px(800.0))
+                    .h(px(600.0))
+                    .child(self.0.clone())
+            }
+        }
+        let (_pane, window) = cx.add_window_view(|_, _| Pane(transcript.clone()));
+        window.update(|window, cx| window.draw(cx).clear());
+        let pane = window.debug_bounds("transcript-pane").unwrap();
+        let loader = window
+            .debug_bounds("transcript-loader")
+            .expect("the loader renders");
+        assert!(
+            loader.top() >= pane.top()
+                && loader.bottom() <= pane.bottom()
+                && loader.left() >= pane.left()
+                && loader.right() <= pane.right(),
+            "the loader lies inside its pane: {loader:?} in {pane:?}"
+        );
+        assert!(
+            f32::from(loader.center().y - pane.center().y).abs() < 1.0,
+            "the loader is centered: {loader:?} in {pane:?}"
+        );
+    }
+
+    /// Leaving a chat caches its transcript; coming back shows it at once,
+    /// so the revisit never reads as loading.
+    #[gpui::test]
+    fn cached_revisit_never_shows_the_loader(cx: &mut gpui::TestAppContext) {
+        let runtime = test_runtime();
+        let _guard = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _engine) = remote_chats_state(cx, dir.path());
+        let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
+        state.update(cx, |state, cx| {
+            state.select_chat(Some("a".into()), cx);
+            state.transcript = vec![user_message("m1")];
+            state.transcript_replayed = true;
+        });
+        // A slow first open of "b" shows its loader…
+        state.update(cx, |state, cx| state.select_chat(Some("b".into()), cx));
+        cx.run_until_parked();
+        advance(cx, LOADER_DELAY);
+        assert!(transcript.read_with(cx, |this, _| this.loader_shown));
+        // …and returning to "a" drops it in the same frame.
+        state.update(cx, |state, cx| state.select_chat(Some("a".into()), cx));
+        cx.run_until_parked();
+        assert!(state.read_with(cx, |state, _| !state.transcript.is_empty()));
+        assert!(transcript.read_with(cx, |this, _| !this.loader_shown && this.loading.is_none()));
+        advance(cx, Duration::from_secs(5));
+        assert!(transcript.read_with(cx, |this, _| !this.loader_shown));
+    }
+
+    /// A subagent tab reads its own doc: the selected conversation's
+    /// opening never puts a loader over it.
+    #[gpui::test]
+    fn subagent_tab_never_shows_the_conversation_loader(cx: &mut gpui::TestAppContext) {
+        let runtime = test_runtime();
+        let _guard = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _engine) = remote_chats_state(cx, dir.path());
+        state.update(cx, |state, cx| state.select_chat(Some("a".into()), cx));
+        let subagent = cx.new(|cx| {
+            Transcript::for_doc(
+                state.clone(),
+                "a".into(),
+                "subagent-tool".into(),
+                "subagent-doc".into(),
+                true,
+                cx,
+            )
+        });
+        let primary = cx.new(|cx| Transcript::new(state.clone(), cx));
+        cx.run_until_parked();
+        advance(cx, Duration::from_secs(1));
+        assert!(primary.read_with(cx, |this, _| this.loader_shown));
+        assert!(subagent.read_with(cx, |this, _| !this.loader_shown && this.loading.is_none()));
+    }
+
+    /// A side chat tab is a transcript over its own state: a never-synced
+    /// remote side chat gets the same loader; an unsaved one has nothing to
+    /// load.
+    #[gpui::test]
+    fn side_chat_on_a_never_synced_remote_chat_shows_the_loader(cx: &mut gpui::TestAppContext) {
+        let runtime = test_runtime();
+        let _guard = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let (parent, _engine) = remote_chats_state(cx, dir.path());
+        let side_chat = |id: &str| -> zeron_proto::Chat {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "parentChatId": "a", "deviceId": "omarchy",
+                "archived": false, "createdAt": chrono::Utc::now(),
+            }))
+            .unwrap()
+        };
+        let side = cx.new(|cx| AppState::side_chat_state(&parent, side_chat("side"), false, cx));
+        let unsaved = cx.new(|cx| AppState::side_chat_state(&parent, side_chat("new"), true, cx));
+        let side_transcript = cx.new(|cx| Transcript::new(side.clone(), cx));
+        let unsaved_transcript = cx.new(|cx| Transcript::new(unsaved.clone(), cx));
+        cx.run_until_parked();
+        advance(cx, LOADER_DELAY);
+        assert_eq!(
+            side_transcript.read_with(cx, |this, _| this
+                .loader_shown
+                .then_some(this.loading)
+                .flatten()),
+            Some(crate::state::TranscriptLoading::Opening)
+        );
+        assert!(unsaved_transcript.read_with(cx, |this, _| !this.loader_shown));
     }
 }
 

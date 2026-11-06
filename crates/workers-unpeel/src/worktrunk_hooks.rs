@@ -1148,7 +1148,7 @@ pub(crate) fn spawn_post_hook(
         )));
     }
 
-    let mut post_start_control = None;
+    let mut post_start_control: Option<PostStartControl> = None;
     #[cfg(unix)]
     if hook.kind == HookKind::PostStart {
         let control =
@@ -1234,6 +1234,7 @@ pub(crate) fn spawn_post_hook(
                 },
             );
         drop(registry);
+        #[cfg(unix)]
         if let Some(control) = &post_start_control
             && let Err(error) = wait_for_post_start_ready(control, &mut child)
         {

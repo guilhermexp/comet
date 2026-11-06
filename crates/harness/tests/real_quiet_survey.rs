@@ -70,10 +70,13 @@ async fn probe_once(harness: Box<dyn Harness>) -> ProbeOutcome {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        access: Default::default(),
+        plan: false,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
         env: Default::default(),
+        extra_mcp: Vec::new(),
     };
     let mut stream = match harness.run(req, controls).await {
         Ok(s) => s,

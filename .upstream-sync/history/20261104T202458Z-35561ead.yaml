@@ -1,0 +1,981 @@
+schema_version: 1
+id: 20261104T202458Z-35561ead
+skill_version: brief-20261104
+started_at: '2026-11-04T20:24:58Z'
+started_at_note: Primeira medição preservada em merge-tree.txt; preparação começou antes desse checkpoint.
+finished_at: '2026-11-04T22:10:52Z'
+request: Executar integralmente o brief sync-upstream-20261104, sozinho; alvo fixo, customizações do fork sempre
+  prevalecem; branch sync/upstream-20261104 e PR draft para main, sem merge.
+workflow_source: .tmp/briefs/sync-upstream-20261104.md; ajustes não existiam nas releituras de fase; Cargo nativo,
+  sem no-mistakes/dev-demo/workflow dispatch.
+upstream:
+  repository: https://github.com/zeronsh/zeron.git
+  remote: upstream
+  requested_ref: 35561ead75bc754f8355634fafc1f63fe38fbb53
+  target_sha: 35561ead75bc754f8355634fafc1f63fe38fbb53
+  previous_integrated_sha: d5a0152265112c235d79b29df92b550c73a5ca1a
+  target_label: 'main fixada em 2026-11-03, merge #1198'
+fork:
+  repository: https://github.com/guilhermexp/comet.git
+  source_branch: sync/upstream-20261104
+  target_branch: sync/upstream-20261104
+  pr_base: main
+  initial_sha: 0f5c6a34b0b80bec083c4f9b5fb5d1aa143895d8
+  observed_target_sha: 0f5c6a34b0b80bec083c4f9b5fb5d1aa143895d8
+  result_sha: 7bdd0cf5efe432f875929217af71a6c7029a219b
+  result_sha_note: Revisão de código avaliada; registros/DOX/tarefas chegam em commits documentais posteriores.
+    Head final no relatório absoluto do brief.
+  initial_worktree: clean
+  version: 1.0.16
+strategy:
+  operation: merge
+  reason: Merge-base natural confirmada; fmt antes do merge; recusas resolvidas conservando o fork na ancestralidade
+    real, sem cherry-picks, force ou tags.
+  planning_sha: f247661ed7ed3fadb79582cc97e7d26e9a670ac8
+  format_sha: bf88cfb0849eff53e9bb2a10ef393ed983623155
+  merge_sha: 2a161f2c350594150045a0864ad8d1998d4d32eb
+  merge_parents:
+  - bf88cfb0849eff53e9bb2a10ef393ed983623155
+  - 35561ead75bc754f8355634fafc1f63fe38fbb53
+  repair_commits:
+  - 7bdd0cf5efe432f875929217af71a6c7029a219b
+changes:
+  incoming_range: d5a0152265112c235d79b29df92b550c73a5ca1a..35561ead75bc754f8355634fafc1f63fe38fbb53
+  incoming_count: 107
+  classification:
+    TAKE: 9
+    ADAPT: 85
+    SKIP: 13
+  summary: Loro 1.17, catching-up, imagens/annotations/Markdown/atalhos, Fx/access/plan/ACP registry, processos/output
+    e ChildKind; shell/Workers/Usage/grants/IPC/feed do fork preservados; zgx/plugins/templates/beta/edge adicional
+    dormentes.
+  imported:
+  - sha: 00cc2e0592b6b44b0f98148346533e6f564339e2
+    subject: 'Remote chats: show the sync, not an outage, while a room catches up (#1038)'
+    decision: ADAPT
+    reason: 'Engine/sync/UI: estado catching-up sobre outbox durável, sem apagar erros/contexto do fork.'
+  - sha: 5d2b91901b139640965f781d0f564d054e5daf34
+    subject: 'Agents can show local images in chat: show_image, and Markdown images in replies (#1036)'
+    decision: ADAPT
+    reason: 'Engine/MCP/UI: show_image e replies com imagens no transcript compacto; intake raster e grant raiz
+      preservados.'
+  - sha: e16cc3e994fce6e621e77bea31910ee3b07ad65a
+    subject: Provider sign-ins get past the preview room's device limit (#1060)
+    decision: TAKE
+    reason: 'Preview/edge: reserva de peers para login, mantém isolamento autenticado.'
+  - sha: bf6d71aaaf00cc1e6f97d8daf4ccb2bbd0b4414f
+    subject: 'Settings search: find any setting from the sidebar, with ⌘F (#1018)'
+    decision: ADAPT
+    reason: 'UI/Settings: busca também deve manter Projects/Accounts e writer central do fork (D3).'
+  - sha: eabad36a225afa7ff7ad4661e9c2e50227946e58
+    subject: 'Shortcuts on non-US Mac layouts: bound where macOS puts them (AZERTY ⌘1 is ⌘&) (#1013)'
+    decision: TAKE
+    reason: 'UI: atalhos por layout macOS; execução nativa pendente no Mac.'
+  - sha: b7942ee8bd34a55b55c3055da0677da9886441ab
+    subject: Browser element annotations (#814)
+    decision: ADAPT
+    reason: 'UI/proto/engine: anotações de browser com paths/intake/Appshots do fork.'
+  - sha: c31124aa91566b9ce142f72515a5704e4360b172
+    subject: 'Linux browser: WPE WebKit at the display''s rate, frames shared with GPUI as dma-bufs (#1039)'
+    decision: ADAPT
+    reason: 'UI/Linux: WPE/dma-buf exige API zui vendorizada com proveniência (D9).'
+  - sha: 3d2f1e64af3b40ec1354ca199fbe439c666f3681
+    subject: 'Smooth scrolling: mouse-wheel notches glide like Chrome''s, with a setting (#1005)'
+    decision: ADAPT
+    reason: 'UI: smooth scrolling mantendo política do transcript/terminal direito e persistência central.'
+  - sha: 46d4e42b34e49b0173ccd8f0018ba8eebd31d97d
+    subject: Render Markdown in user messages and the rail's preview card (#1067)
+    decision: ADAPT
+    reason: 'Markdown/UI: markdown no usuário/rail mantendo paths, seleção e geometria compacta.'
+  - sha: 31d26eeb6b9447cc6ef26e994f0dc62849014ab0
+    subject: Bump version to v0.2.127
+    decision: SKIP
+    reason: Versão própria 1.0.16; não adotar bumps nem canal beta do upstream.
+  - sha: 636b165169290329233a6799d54ff9e2776cf6ee
+    subject: Folded user bubbles fade out; long chats scroll smoothly again (#1089)
+    decision: ADAPT
+    reason: 'UI: fade/performance sobre fold compacto do fork; não restaura anel/rodapé.'
+  - sha: 1295d5773447685ba9a2ff236cda7413435ed6e9
+    subject: Access modes and plan mode for every agent; Muse answers every approval stage (#1088)
+    decision: ADAPT
+    reason: 'Harnesses/doc/proto/UI: access/plan modes; OMP/Kimi, execution lease e grant raiz preservados (D4).'
+  - sha: ab189159f10cf8e63c0502be75a59bbc487e0eaf
+    subject: Bump version to v0.2.128
+    decision: SKIP
+    reason: Versão própria 1.0.16; não adotar bumps nem canal beta do upstream.
+  - sha: 1aac985c48252177c6571882b90748669caac378
+    subject: Build signed Android App Bundles and automate Play testing uploads
+    decision: SKIP
+    reason: CI Android inerte no fork; workflows próprios preservados.
+  - sha: c56c1783f0ecff77e978e8dad826bc5e2a2e5c0e
+    subject: Document Android testing release setup and operation
+    decision: TAKE
+    reason: Documentação Android inerte, não habilita publicação.
+  - sha: 0f3d11e714700758b5b17a1022c1327b2e22944f
+    subject: Report Zeron as CLAUDE_CODE_ENTRYPOINT for every Claude it starts
+    decision: TAKE
+    reason: 'Harness/engine: CLAUDE_CODE_ENTRYPOINT sem alterar grants.'
+  - sha: 8b7afb306d25ecd3508200eaad66aeb8cf46e736
+    subject: Bump version to v0.2.129
+    decision: SKIP
+    reason: Versão própria 1.0.16; não adotar bumps nem canal beta do upstream.
+  - sha: fc7d1038e0360f64eb1e303bd0578e6658f68318
+    subject: 'Cursor usage: read Cursor''s own percentages, show Cursor / Grok / Other, ring follows the model'
+    decision: ADAPT
+    reason: 'Contas/Usage: percentuais Cursor aceitos; anel recusado; quotas device-local e medidores do fork (D3).'
+  - sha: a0468502a81a568c985faeec7df0e32a2fea6487
+    subject: 'Edge: record every WorkOS user from webhooks'
+    decision: ADAPT
+    reason: 'D2: diretório WorkOS/profile/badges/card-web conservado dormente; sem novos bindings ou rotas públicas
+      no fork. Edge: record every WorkOS user from webhooks'
+  - sha: b28c9953cd47c2825935b2853960d3281a905704
+    subject: Add fx as a native ACP provider (#1099)
+    decision: ADAPT
+    reason: 'Harness/proto/engine/UI/iOS: Fx com braços OMP/Kimi e leases; sem injeção MCP global (D4).'
+  - sha: 1bb6259cd1117bb2d4b5d883b681bfba7f9dd21d
+    subject: 'Edge: badges for users in the directory (#1105)'
+    decision: ADAPT
+    reason: 'D2: diretório WorkOS/profile/badges/card-web conservado dormente; sem novos bindings ou rotas públicas
+      no fork. Edge: badges for users in the directory (#1105)'
+  - sha: b1d4927f8466acdd1ef77d576148776c190436ba
+    subject: 'Direct links: let WebRTC packets fragment, so links over Tailscale carry data (#1106)'
+    decision: TAKE
+    reason: 'Preview: fragmentação RTC conserva autenticação e exclusão Cloud dos terminais.'
+  - sha: 369d42815190ea6c4865c92dc060c54d790f4dcd
+    subject: Bump version to v0.2.130
+    decision: SKIP
+    reason: Versão própria 1.0.16; não adotar bumps nem canal beta do upstream.
+  - sha: 6aa4d5af312fb6e7ce498d430dc029abd15517f7
+    subject: 'Background processes: see, read and stop what an agent left running (#1092)'
+    decision: ADAPT
+    reason: 'Harness/engine/UI/RPC/doc: processos em background no tray; IPC registry único, Workers e quiesce do
+      fork (D7).'
+  - sha: d643a2caf329d347700e976f949461df6479b3ea
+    subject: 'Edge: a stored user number for every user in the directory (#1107)'
+    decision: ADAPT
+    reason: 'D2: diretório WorkOS/profile/badges/card-web conservado dormente; sem novos bindings ou rotas públicas
+      no fork. Edge: a stored user number for every user in the directory (#1107)'
+  - sha: 55ffd4142d1572b26b5b7bca511050f4e7c0e1c1
+    subject: 'Edge: record every WorkOS organization and its members (#1113)'
+    decision: ADAPT
+    reason: 'D2: diretório WorkOS/profile/badges/card-web conservado dormente; sem novos bindings ou rotas públicas
+      no fork. Edge: record every WorkOS organization and its members (#1113)'
+  - sha: 1b3e335c36096b827f39d38922db39f38ea0f987
+    subject: 'Edge: profile routes (#1115)'
+    decision: ADAPT
+    reason: 'D2: diretório WorkOS/profile/badges/card-web conservado dormente; sem novos bindings ou rotas públicas
+      no fork. Edge: profile routes (#1115)'
+  - sha: eaa2d04e01865b835aacd3efe39c84e8bdcb227f
+    subject: 'Web: number format'
+    decision: ADAPT
+    reason: 'D2: diretório WorkOS/profile/badges/card-web conservado dormente; sem novos bindings ou rotas públicas
+      no fork. Web: number format'
+  - sha: 8e03ce46472596fd95fdb0f8edc3c0cf955bf3ed
+    subject: 'Web: page layout on narrow screens'
+    decision: TAKE
+    reason: Assets/layout card-web dormentes; sem wiring/deploy no fork.
+  - sha: 60a02b547a32c9cff3d0bc36326b3add114c8d7c
+    subject: 'Web: more page assets'
+    decision: ADAPT
+    reason: 'D2: diretório WorkOS/profile/badges/card-web conservado dormente; sem novos bindings ou rotas públicas
+      no fork. Web: more page assets'
+  - sha: 0a7d6b9b69814105a306373cf4a7d49105b610f8
+    subject: 'Edge: admin profile option'
+    decision: ADAPT
+    reason: 'D2: diretório WorkOS/profile/badges/card-web conservado dormente; sem novos bindings ou rotas públicas
+      no fork. Edge: admin profile option'
+  - sha: baedd5dc2108b063cd91b922184b63da53cfe2f6
+    subject: 'Web: page layout'
+    decision: TAKE
+    reason: Assets/layout card-web dormentes; sem wiring/deploy no fork.
+  - sha: ab7a195f387c7af302804f06fb2413b72040906b
+    subject: 'Web: page assets'
+    decision: ADAPT
+    reason: 'D2: diretório WorkOS/profile/badges/card-web conservado dormente; sem novos bindings ou rotas públicas
+      no fork. Web: page assets'
+  - sha: 3d20e2f46c2359f49665710ffd4f4ba4d79a4e51
+    subject: 'Edge: short profile path'
+    decision: ADAPT
+    reason: 'D2: diretório WorkOS/profile/badges/card-web conservado dormente; sem novos bindings ou rotas públicas
+      no fork. Edge: short profile path'
+  - sha: 4f55b0e1fe6d8287905e3851baeb80df16f3c71a
+    subject: 'Edge: org creation limit'
+    decision: ADAPT
+    reason: Auth org limit no cliente; routes/diretório edge novos permanecem dormentes (D2).
+  - sha: 6973500bc0f57ad183532ab11d6f6ace0a907d8b
+    subject: 'Sync: update loro to 1.17 so streaming chats stop leaking memory (#1116)'
+    decision: ADAPT
+    reason: 'Sync/doc/edge: Loro 1.17 em ambos lados e testes; conserva frontier, outbox e wrappers diretos.'
+  - sha: 0a153df5ad84a2036d327bd785281888689f4030
+    subject: Bump version to v0.2.131
+    decision: SKIP
+    reason: Versão própria 1.0.16; não adotar bumps nem canal beta do upstream.
+  - sha: 4853312b0ffd0e99d205b27720daa3548c8e23ad
+    subject: 'Change requests: stop PR watches running git in every project (#1128)'
+    decision: ADAPT
+    reason: 'Engine/UI PR: watches sob demanda mantendo autorização Worker/Space e runner limitado.'
+  - sha: 2500e8b34fe609ef57f424aae98bb20439459cf9
+    subject: 'CI: one entry workflow with admission, reuse, priority/locks and a fast pull request tier (#1077)'
+    decision: ADAPT
+    reason: CI recusado; hardening de testes/engine/harness/preview e scripts úteis aceitos. Workflows e seletores
+      do fork vencem.
+  - sha: a7947b72138e25f837273f539b642c9895775465
+    subject: Bump version to v0.2.132
+    decision: SKIP
+    reason: Versão própria 1.0.16; não adotar bumps nem canal beta do upstream.
+  - sha: 74c68888c2a11013bc6380cc53a9c8645a4ac888
+    subject: 'CI: keep signing and deploy credentials in environments only main and release tags can use'
+    decision: SKIP
+    reason: 'Infra/CI: workflows, ambientes e CODEOWNERS próprios do fork; sem mudanças administrativas.'
+  - sha: c2c117663ea33444c533060e632d28012534bbbd
+    subject: Bump version to v0.2.133
+    decision: SKIP
+    reason: Versão própria 1.0.16; não adotar bumps nem canal beta do upstream.
+  - sha: 6ab1a34bc195344a9fe375b37cd5f93e2c40ba05
+    subject: 'Release: retry R2 uploads, and let the publish job re-run on an immutable release (#1135)'
+    decision: SKIP
+    reason: Release R2 do upstream não substitui release macOS/GitHub do fork.
+  - sha: 9ef868762dcbcc9f749f86b9d5f019c8877d4cca
+    subject: Bump version to v0.2.134
+    decision: SKIP
+    reason: Versão própria 1.0.16; não adotar bumps nem canal beta do upstream.
+  - sha: 2d63bdb2abb34ac949f41afbc7b11715280693a7
+    subject: 'zgx: Zeron''s interface on zgx (app, design system, plugins, onboarding, Zeron Preview)'
+    decision: ADAPT
+    reason: 'D1/D2/D4/D5/D6: zgx dormente; partes compartilhadas aceitas preservando grants, linhagem, engine embutida
+      e edge do fork.'
+  - sha: b721a99423b9891f09ec67587ae1dcd0167121bf
+    subject: 'Fix Linux and Windows builds: Listener''s signing_in, Command::as_std on Windows'
+    decision: TAKE
+    reason: 'Harness/preview: correções de compilação multiplataforma; sem mudar política macOS do produto.'
+  - sha: a4520ca3bbf3f371b3f011d42a15d7f3dcbdb3e0
+    subject: 'Engine: plugin watchers ignore reads (inotify loop), per-component snapshot paths, Windows create-over-folder
+      is DestinationExists'
+    decision: ADAPT
+    reason: Engine plugin watcher hardened; código dormente sob D1.
+  - sha: 0cb5f2c40e2aa398382023a17e92c90cc95c2fbe
+    subject: 'Edge: badge earned by an early first claim (#1136)'
+    decision: ADAPT
+    reason: 'D2: diretório WorkOS/profile/badges/card-web conservado dormente; sem novos bindings ou rotas públicas
+      no fork. Edge: badge earned by an early first claim (#1136)'
+  - sha: 40183b9337a49312b0d09970fb14a310da905bc8
+    subject: zgx as a beta channel of Zeron.app; shared CLI, launch and notify crates; update channels
+    decision: ADAPT
+    reason: 'D1/D5/D8: CLI/launch/update-channel como fonte; binário, packaging e feed estável do fork vencem. Sem
+      beta ativo.'
+  - sha: b4b8cf043bf510bdff027fdf135dd7a4835ef7da
+    subject: 'zgx: registry agents'' sign-in state, methods and icons; PR badges isolated per session'
+    decision: ADAPT
+    reason: Registry ACP/sign-in compartilhado; skins e PR badges de zgx dormentes (D1/D4).
+  - sha: c00c9a28fbbaf129def8d50fc79a8419c8b2676d
+    subject: 'Harness: registry sign-in uses the crate''s Child (Windows build)'
+    decision: TAKE
+    reason: 'Harness registry: usa Child do crate, conservando gestão de processo.'
+  - sha: d898f936eda2ff291e1e39efa25d9cfa415521b8
+    subject: 'zgx: Zeron''s interface on zgx (app, design system, plugins, beta channel) (#1137)'
+    decision: ADAPT
+    reason: 'Consolidação #1137: mesmas D1/D2/D4/D5/D6/D8; mantém zgx dormente e portas tipadas compartilhadas.'
+  - sha: e4292b568f804c0e377396bd7b55ab9e599139b5
+    subject: Bump version to v0.2.135
+    decision: SKIP
+    reason: Versão própria 1.0.16; não adotar bumps nem canal beta do upstream.
+  - sha: 5325585f75421e107ec4eb24932c24c1c7dba920
+    subject: Bump version to v0.2.136
+    decision: SKIP
+    reason: Versão própria 1.0.16; não adotar bumps nem canal beta do upstream.
+  - sha: e9e57b3be18bea2339464e48569b38e17156106e
+    subject: 'Sidebar: a "+" on a project''s device rows starts a new chat on that device (#1151)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; Sidebar: a "+"
+      on a project''s device rows starts a new chat on that device (#1151)'
+  - sha: 6e959eb125c9fa3997a74e73f4f785ec5f9fec3a
+    subject: 'zgx sidebar: fold empty projects into one row, with a Show toggle (#1161)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx sidebar: fold
+      empty projects into one row, with a Show toggle (#1161)'
+  - sha: 8c8535b7c1143a4d40a69e89c80bcf25fb39e1eb
+    subject: 'Plugins and templates: consent bound to capabilities, engine-held decisions, hardened runtime (#1139)'
+    decision: ADAPT
+    reason: Plugins/consent/IPC scoped aceitos como código; runtime/plugin UI dormentes até decisão do dono; grant
+      do fork preservado (D1/D5).
+  - sha: 793074e47e01195f67fa4c1510628a4d676e720d
+    subject: 'Model picker: solid panel that opens out in one step; reasoning thumb follows the pointer (#1163)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; Model picker: solid
+      panel that opens out in one step; reasoning thumb follows the pointer (#1163)'
+  - sha: af78b43bf9c00a3f04a8c2902990ea0274c46107
+    subject: 'zgx: show web pages in the browser tab on Linux (#1145)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: show web pages
+      in the browser tab on Linux (#1145)'
+  - sha: 8e030a119723b480833056a6f7b2ce15aa29755d
+    subject: 'zgx: title bar actions clear the window''s own buttons at the right (#1140)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: title bar
+      actions clear the window''s own buttons at the right (#1140)'
+  - sha: b25efca2066823423843ba2b9e50d8f98fb20e12
+    subject: 'zgx: a composer made again cancels its glide, so it opens docked (#1141)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: a composer
+      made again cancels its glide, so it opens docked (#1141)'
+  - sha: 323c8e78963395d3a206bbf42dfb77e9b4824967
+    subject: 'zgx: the sidebar''s working pill counts side chats working (#1142)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: the sidebar''s
+      working pill counts side chats working (#1142)'
+  - sha: c0e593e1970dee2586855dfb3a049e213f9b0712
+    subject: 'zgx: the transcript''s scrollbar runs to the page''s end (#1143)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: the transcript''s
+      scrollbar runs to the page''s end (#1143)'
+  - sha: fea8a54cfc488e174ededad2510fb3c24cc768d3
+    subject: 'zgx: toasts no longer dim the window (#1152)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: toasts no
+      longer dim the window (#1152)'
+  - sha: 06cc739731cce8370f98348b22899a835701d822
+    subject: 'zgx chat: never leave "Drop to attach" stuck over the chat (#1156)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx chat: never
+      leave "Drop to attach" stuck over the chat (#1156)'
+  - sha: 18ffbd512157e9fba3f46e37ac4a800706d6e92d
+    subject: 'zgx: reopen on the chat viewed last, not the one most recently active (#1153)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: reopen on
+      the chat viewed last, not the one most recently active (#1153)'
+  - sha: 0d4a65ed493db598f7e0d1061fc8a2e23e488d72
+    subject: 'Composer trays: a running task''s name keeps its room beside a long command (#1146)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; Composer trays:
+      a running task''s name keeps its room beside a long command (#1146)'
+  - sha: 2e08d60cac1d28b3eae787726ccaff21a1f9b1a9
+    subject: 'Command palette: narrowing a search no longer sorts hits with no place in the list (#1158)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; Command palette:
+      narrowing a search no longer sorts hits with no place in the list (#1158)'
+  - sha: 2e3524f5533fc53caf25dac137228fb87ac11375
+    subject: 'zgx: I goes into the composer, Escape there gives the keyboard back (#1148)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: I goes into
+      the composer, Escape there gives the keyboard back (#1148)'
+  - sha: d2a8e8dab050157b148f2c1e8be417a08ba56764
+    subject: 'zgx: sent pictures preview in chats on another device; pictures over 1 MB load (#1144)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: sent pictures
+      preview in chats on another device; pictures over 1 MB load (#1144)'
+  - sha: 9479ce7d2fb167a3a2206bd38c4dab918dd1c478
+    subject: 'zgx: shortcuts shown as the platform writes them (#1147)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: shortcuts
+      shown as the platform writes them (#1147)'
+  - sha: 7a2a3f5f3b2afc8790cd227228e0dc3d6cc384cb
+    subject: 'zgx GitHub plugin: a session''s PR badge only from its own repository (#1166)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx GitHub plugin:
+      a session''s PR badge only from its own repository (#1166)'
+  - sha: 09a70882a82d7f8c081d84773a2dbe0f985321bf
+    subject: 'zgx: Running tray follows the background processes, not the turn, and stays folded (#1155)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: Running tray
+      follows the background processes, not the turn, and stays folded (#1155)'
+  - sha: c90481c688791439e1023eb7c4094637ccb70f43
+    subject: 'Engine: a child chat records whether it is a side chat or a subagent (#1170)'
+    decision: ADAPT
+    reason: Child kind aditivo; parent_chat_id/origin_chat_id independentes e ambos recusam netos/grant raiz (D6).
+  - sha: 3237d5409afe5d166fdc2a59604e89106ca1be4c
+    subject: 'zgx: a command''s output under its call, folded to ten lines (#1165)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: a command''s
+      output under its call, folded to ten lines (#1165)'
+  - sha: c83937d386ea98739e32f2509f7b60c8fb41b3f8
+    subject: 'zgx: Ports list settles, keeps closed ports a while, and names each process (#1167)'
+    decision: ADAPT
+    reason: Preview-label/process names compartilhados aceitos; Ports exclui servidores Worker; zgx dormente.
+  - sha: 4dcfbde9b9680fd045f6fb6d9fcd2533c92ccf9a
+    subject: 'zgx: Reload Zeron in the command palette relaunches the app (#1175)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: Reload Zeron
+      in the command palette relaunches the app (#1175)'
+  - sha: 82a4834a42fafde6815a3d232a1c77dc175cec4c
+    subject: 'zgx: bump zgx to d81d2c33 (theme switches keep text colours; drop the tray corners workaround) (#1178)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: bump zgx to
+      d81d2c33 (theme switches keep text colours; drop the tray corners workaround) (#1178)'
+  - sha: 77a96986be0c2b58a990eb8598e15b5c876853f5
+    subject: 'Edge: an operator can take back an earned badge for good (#1179)'
+    decision: ADAPT
+    reason: 'D2: diretório WorkOS/profile/badges/card-web conservado dormente; sem novos bindings ou rotas públicas
+      no fork. Edge: an operator can take back an earned badge for good (#1179)'
+  - sha: d4dc21c694f7642c1a40fd03035b7eaaec05bbb8
+    subject: 'zgx: themes apart from templates, a Themes page, and plain copy (#1177)'
+    decision: ADAPT
+    reason: Engine themes/templates com segurança de plugins; UI zgx permanece dormente (D1).
+  - sha: a2113ac886fe723c3270210b8ae682d9558e1e46
+    subject: A command's output keeps a short tail in the chat, with its exit code (#1168)
+    decision: ADAPT
+    reason: Tool output tail/exit code nos dados e transcript compacto; Write/Edit continuam sanitizados (D7).
+  - sha: 6eaa2927d2995cec8436740e5f84d61a30b5dd88
+    subject: 'zgx: the ASCII effect a little stronger: the picture between its strokes at 75% (#1181)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: the ASCII
+      effect a little stronger: the picture between its strokes at 75% (#1181)'
+  - sha: 7332522ccb524d767c438ca6a5f3afc126d29994
+    subject: 'zgx settings: Plugins, Themes and Templates under Customize, apart from Organization; Themes gets
+      a palette icon (#1183)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx settings: Plugins,
+      Themes and Templates under Customize, apart from Organization; Themes gets a palette icon (#1183)'
+  - sha: c694ac2283d6b43ae33ed50635a566ad50076fd2
+    subject: 'zgx files: a comment left in the editor shows your name and words, no "Pending" and no made-up time
+      (#1187)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx files: a comment
+      left in the editor shows your name and words, no "Pending" and no made-up time (#1187)'
+  - sha: eb6f8666f933b88e67addbd05c13ac38a0039805
+    subject: 'zgx: bump zgx to 99a50ad5 (Linux popups and glass blur) (#1189)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: bump zgx to
+      99a50ad5 (Linux popups and glass blur) (#1189)'
+  - sha: 0a6aef02795175db94c7dacb7f695304851b77b1
+    subject: 'Theme tools for agents: list, read, create, edit, delete and use themes (#1188)'
+    decision: ADAPT
+    reason: Theme tools compartilhadas; catálogo/imports do fork e grant raiz; UI zgx dormente (D1/D3).
+  - sha: f587409bf8b5af2ffc540caafe386f5a4254b4c6
+    subject: 'Cards: Maintainer first, as a dark pill (#1193)'
+    decision: ADAPT
+    reason: Cards/edge diretório dormentes (D2), sem bindings novos no Worker publicado.
+  - sha: e68be334501297b529eb97ca757ec5ce0c9d062e
+    subject: 'zgx shell: cursors show again (the sidebar edge''s resize, a row''s hand) (#1194)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx shell: cursors
+      show again (the sidebar edge''s resize, a row''s hand) (#1194)'
+  - sha: b7208a2de0b0ce2c6f92ac0eeab4dfbec82136e6
+    subject: 'zgx: Zeron v3: the Inset layout as the default, split chats and cards'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: Zeron v3:
+      the Inset layout as the default, split chats and cards'
+  - sha: a1975b0df873b715c8c87872c5d6c1b7ce89cef5
+    subject: 'zgx: Zeron v2, the single-page layout, as an official template'
+    decision: ADAPT
+    reason: Template oficial v2 é fonte dormente; não troca interface gpui do fork (D1).
+  - sha: 1725597023bacf039b3938dc14d3c9c99c98a7ea
+    subject: 'zgx: tests for split chats, Zeron v2, and the cards'' layout'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: tests for
+      split chats, Zeron v2, and the cards'' layout'
+  - sha: 2696803e721648ab111d63591bbe03f5b76c5cbd
+    subject: 'zgx: cursors under the title bar''s band; every v3 resize edge tested'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: cursors under
+      the title bar''s band; every v3 resize edge tested'
+  - sha: e3fe10c3266a2b317bd025a8aad9529490749ae8
+    subject: 'zgx: split panes are each their own chat''s, live as if focused'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: split panes
+      are each their own chat''s, live as if focused'
+  - sha: c9967c014f70c5c88a82dbf3eb333d79147c234f
+    subject: 'zgx panel: one focused tab group, and every tab opened lands in it'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx panel: one
+      focused tab group, and every tab opened lands in it'
+  - sha: 87b8387acc41689116b124cbf50d4dbfa8dfaded
+    subject: 'zgx: a panel toggle lays the chat out once, not at every frame'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: a panel toggle
+      lays the chat out once, not at every frame'
+  - sha: e649d8fe48f7d025d67139e36ce982da1b10269d
+    subject: 'zgx: in a split, the page''s empty content box lets the pointer through'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: in a split,
+      the page''s empty content box lets the pointer through'
+  - sha: c35901bc41d2f047d6c0eb08b9537321cf435c2e
+    subject: 'zgx: template and security notices as host toasts in the window''s corner (#1195)'
+    decision: ADAPT
+    reason: Notices de template/plugins dormentes; notificações Workers do fork preservadas (D1).
+  - sha: 6412a8150f3e5ec54b12336b568b3f0233916887
+    subject: 'zgx: a new chat''s card fades with the sidebar as its page goes flat'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: a new chat''s
+      card fades with the sidebar as its page goes flat'
+  - sha: e3d25752ea20bedae73e17a0aa74144410fc4cee
+    subject: 'zgx panel home: a part never scrolls on its own; the panel does (#1197)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx panel home:
+      a part never scrolls on its own; the panel does (#1197)'
+  - sha: 5e927a011c5ea331ed7534cab3a7a08837b6f951
+    subject: 'Engine: ReadToolOutput serves a command''s whole output from its host (#1190)'
+    decision: ADAPT
+    reason: ReadToolOutput via host autorizado; registry RPC único e Run Journal privado (D7).
+  - sha: 12432f61c01a8d1a16af6a0119b3308ccb84bb93
+    subject: 'zgx: a command''s output shows its last 10 lines, and all of them from its host (#1192)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: a command''s
+      output shows its last 10 lines, and all of them from its host (#1192)'
+  - sha: 4b5a1554be6755e3f8ac2a6aae97fd83cb437dda
+    subject: 'zgx transcript: a width changed in one step keeps the reading place'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx transcript:
+      a width changed in one step keeps the reading place'
+  - sha: 51fdd5e1a28c76e1b34465d11d4fc1eb23524dc8
+    subject: 'zgx: measure v2, Inset as uploaded and v3 side by side'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: measure v2,
+      Inset as uploaded and v3 side by side'
+  - sha: 280a0612ec61091560cac19b2ff28d4de91b3822
+    subject: 'zgx: Zeron v3 (Inset layout and split chats) as the default; Zeron v2 as a built-in template (#1199)'
+    decision: ADAPT
+    reason: v3/Inset/split e template v2 dormentes; shell/Details/Workers gpui preservados (D1).
+  - sha: c0caae278ff4da6bed89e7f8eac812df1f9858df
+    subject: 'zgx v3: dragging the sidebar or panel edge lays the page out once (#1200)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx v3: dragging
+      the sidebar or panel edge lays the page out once (#1200)'
+  - sha: 40aeca4304875280bb9524e3ed4534e85f609a4e
+    subject: 'zgx: shortcuts survive plugins loading and unloading (one menu bar for the app) (#1201)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: shortcuts
+      survive plugins loading and unloading (one menu bar for the app) (#1201)'
+  - sha: 205af5e863a439e1ec3ba62563ad46b3c730708b
+    subject: 'zgx: the send-glide tests read the glide a frame at a time (#1202)'
+    decision: ADAPT
+    reason: 'D1: fonte zgx conservada dormente, fora do workspace padrão e sem launch/packaging; zgx: the send-glide
+      tests read the glide a frame at a time (#1202)'
+conflicts:
+  count: 153
+  paths:
+  - .github/CODEOWNERS
+  - .github/actions/windows-ci-setup/action.yml
+  - .github/workflows/android.yml
+  - .github/workflows/deploy.yml
+  - .github/workflows/linux-installer.yml
+  - .github/workflows/macos.yml
+  - .github/workflows/preview-tests.yml
+  - .github/workflows/release.yml
+  - .github/workflows/testflight.yml
+  - .github/workflows/ui-tests.yml
+  - .github/workflows/voice-tests.yml
+  - .github/workflows/windows.yml
+  - .gitignore
+  - Cargo.lock
+  - Cargo.toml
+  - apps/zeron/Cargo.toml
+  - apps/zeron/src/bin/zeron-engine.rs
+  - apps/zeron/src/lib.rs
+  - apps/zeron/src/main.rs
+  - crates/client/src/client.rs
+  - crates/client/src/demo/fixtures.rs
+  - crates/client/src/demo/transcripts.rs
+  - crates/client/src/session/mod.rs
+  - crates/client/src/subagents.rs
+  - crates/client/tests/live.rs
+  - crates/doc/examples/gen_fixture.rs
+  - crates/doc/src/commands.rs
+  - crates/doc/src/parts.rs
+  - crates/doc/src/rebuild.rs
+  - crates/doc/src/registry.rs
+  - crates/doc/src/registry/tests.rs
+  - crates/doc/src/schema.rs
+  - crates/doc/src/workspace.rs
+  - crates/doc/tests/attachments_roundtrip.rs
+  - crates/engine/src/agent_accounts.rs
+  - crates/engine/src/chat_persistence.rs
+  - crates/engine/src/doc_host.rs
+  - crates/engine/src/harness_updates.rs
+  - crates/engine/src/lib.rs
+  - crates/engine/src/registry.rs
+  - crates/engine/src/rpc.rs
+  - crates/engine/src/run_journal.rs
+  - crates/engine/src/runner.rs
+  - crates/engine/src/sessions.rs
+  - crates/engine/src/titles.rs
+  - crates/engine/src/workspace_host.rs
+  - crates/engine/tests/acp_lifecycle.rs
+  - crates/engine/tests/born_chat2_race.rs
+  - crates/engine/tests/cloud_sleep_quiesce.rs
+  - crates/engine/tests/device_routing.rs
+  - crates/engine/tests/e2e.rs
+  - crates/engine/tests/m5_repos_diffs_terminals.rs
+  - crates/engine/tests/m5c_accounts_uploads_titles.rs
+  - crates/engine/tests/projectless.rs
+  - crates/engine/tests/queued_attachments.rs
+  - crates/engine/tests/relay_delivery.rs
+  - crates/engine/tests/restart_resume.rs
+  - crates/engine/tests/self_continued_quiesce.rs
+  - crates/engine/tests/session_publication.rs
+  - crates/engine/tests/side_chats.rs
+  - crates/engine/tests/steering_live.rs
+  - crates/engine/tests/subagent_idle_reap.rs
+  - crates/engine/tests/turn_quiesce.rs
+  - crates/engine/tests/unarchive_on_send.rs
+  - crates/engine/tests/workspace_files.rs
+  - crates/engine/tests/workspace_sync.rs
+  - crates/engine/tests/worktree_on_run.rs
+  - crates/harness/examples/grok_subagent_probe.rs
+  - crates/harness/examples/opencode_subagent_probe.rs
+  - crates/harness/src/acp/mod.rs
+  - crates/harness/src/acp/normalize.rs
+  - crates/harness/src/acp/subagent.rs
+  - crates/harness/src/acp/system_message.rs
+  - crates/harness/src/claude/mod.rs
+  - crates/harness/src/claude/normalize.rs
+  - crates/harness/src/claude/wire.rs
+  - crates/harness/src/codex/mod.rs
+  - crates/harness/src/codex/normalize.rs
+  - crates/harness/src/cursor/mod.rs
+  - crates/harness/src/install.rs
+  - crates/harness/src/lib.rs
+  - crates/harness/src/mock.rs
+  - crates/harness/src/muse/normalize.rs
+  - crates/harness/src/opencode/mod.rs
+  - crates/harness/src/pi/mcp.rs
+  - crates/harness/src/pi/mod.rs
+  - crates/harness/src/pi/normalize.rs
+  - crates/harness/src/skills.rs
+  - crates/harness/tests/acp.rs
+  - crates/harness/tests/acp_quiet.rs
+  - crates/harness/tests/acp_stall.rs
+  - crates/harness/tests/claude.rs
+  - crates/harness/tests/claude_refresh_lock.rs
+  - crates/harness/tests/codex.rs
+  - crates/harness/tests/cursor.rs
+  - crates/harness/tests/managed_install.rs
+  - crates/harness/tests/managed_install_failure.rs
+  - crates/harness/tests/misc/acp_hardening.rs
+  - crates/harness/tests/misc/run_env.rs
+  - crates/harness/tests/muse.rs
+  - crates/harness/tests/muse_account_live.rs
+  - crates/harness/tests/opencode.rs
+  - crates/harness/tests/pi_rpc.rs
+  - crates/harness/tests/real_quiet_survey.rs
+  - crates/markdown/src/lib.rs
+  - crates/mcp/src/jsonrpc.rs
+  - crates/mcp/src/tools.rs
+  - crates/mcp/src/transcript.rs
+  - crates/mcp/src/zeron.rs
+  - crates/mobile/src/layout/tests.rs
+  - crates/preview/src/lib.rs
+  - crates/preview/src/service.rs
+  - crates/proto/src/agent.rs
+  - crates/proto/src/entities.rs
+  - crates/proto/src/view.rs
+  - crates/rpc/src/client.rs
+  - crates/rpc/src/device_room.rs
+  - crates/rpc/src/lib.rs
+  - crates/rpc/src/server.rs
+  - crates/ui/Cargo.toml
+  - crates/ui/examples/subagent-fold-fixture.rs
+  - crates/ui/src/account_usage.rs
+  - crates/ui/src/app_update.rs
+  - crates/ui/src/composer.rs
+  - crates/ui/src/composer/chip.rs
+  - crates/ui/src/lib.rs
+  - crates/ui/src/pickers.rs
+  - crates/ui/src/rail.rs
+  - crates/ui/src/settings.rs
+  - crates/ui/src/settings/accounts.rs
+  - crates/ui/src/settings/cloud.rs
+  - crates/ui/src/settings/shortcuts.rs
+  - crates/ui/src/settings/thread_naming.rs
+  - crates/ui/src/settings/worktrees.rs
+  - crates/ui/src/shell.rs
+  - crates/ui/src/shell/session_lanes.rs
+  - crates/ui/src/state.rs
+  - crates/ui/src/todo_panel.rs
+  - crates/ui/src/transcript.rs
+  - crates/update/src/lib.rs
+  - edge/package-lock.json
+  - edge/src/env.ts
+  - edge/src/forward.ts
+  - edge/src/index.ts
+  - edge/src/preview-room.ts
+  - edge/src/preview-route.ts
+  - edge/test/workerd/env.d.ts
+  - edge/test/workerd/fixture.ts
+  - edge/vitest.workerd.config.ts
+  - edge/wrangler.jsonc
+  - scripts/ci/test-core.sh
+  - scripts/dev-demo.sh
+  - scripts/ios/build-core.sh
+  resolutions: openspec/changes/sync-upstream-20261104/conflicts.md; escolhas por bloco e originais em .tmp/reports/resolutions.log
+    e conflict-originals.json
+decisions:
+- id: D1
+  decision: zgx/Inset/split/plugins/templates dormentes; CURRENT não anuncia zgx-interface-v1; fixtures ativam serviços
+    explicitamente
+  owner_open: Ativação futura em outro change
+- id: D2
+  decision: edge mantém grafo/bindings publicados do fork; directory/profile/badges/card-web/onboarding/plugin-keys/Cloud/vault/runner
+    dormentes
+  owner_open: Eventual provisionamento/ativação desses serviços
+- id: D3
+  decision: shell gpui, Projects/Accounts, Usage, TurnSteps, QuickJS, chips/seleção/Appshots e painel direito do
+    fork; sinais PR usam metadata autenticada e runner limitado
+- id: D4
+  decision: Fx/ACP registry/access/plan aditivos com OMP/Kimi e leases; extra_mcp aceito por drivers diretos, sempre
+    limpo com mcp pela engine antes do retry/driver
+- id: D5
+  decision: registry único method.rs; Caller/relay; zeron mcp e controller preservam bearer completo do grant e
+    bind de device sem ampliar o allowlist agent-scoped ou vazar credenciais a Workers
+- id: D6
+  decision: childKind aditivo; origin e parent independentes, sem grants raiz/netos; default side/configured/inherit
+    do fork mantidos; subagent explícito
+- id: D7
+  decision: background tasks/output/tails/exit no host autorizado, com resumo/metadata do fork, sanitização e lifecycle
+    Stop/quiesce/Workers
+- id: D8
+  decision: 1.0.16, workflows, engine in-process, CLI/daemon e updater/feed/RestartGate do fork; cli/launch/beta
+    upstream dormentes
+  owner_open: Eventual beta/managed engine/CLI em change separado
+- id: D9
+  decision: zui 361ff20..b564a34 portado em fonte separada; snapshot exato incluindo symlinks e formatting; vidro/headless
+    e duas regras de pontuação preservados
+  source_merge: 20dcce769a682f3e6f0bd6acd1f2541ea2582a22
+  source_closeout: 5e5b7ec981a68cccde7ed74eacb77ec2cfa98fb0
+  vendored_tree: 72c343b6e8714aff0a51c1e8624dc076a7cee9ec
+- id: D10
+  decision: CreateWorkspaceEntry legado parentPath/name e reply WorkspaceEntryMutation preservado; novo request
+    guardado renomeado, dispatch por operationId, reply WorkspaceMutationOutcome; teste cobre ambos/stale/no-replace
+verification:
+- command: cargo check --workspace --all-targets
+  result: passed
+  exit: 0
+  observed: '    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 20s'
+  log: .tmp/reports/cargo-check-closeout.log
+- command: cargo fmt --all --check
+  result: passed
+  exit: 0
+  observed: pendente
+  log: .tmp/reports/fmt-check-closeout.log
+- command: openspec validate sync-upstream-20261104 --strict
+  result: passed
+  exit: 0
+  observed: Change 'sync-upstream-20261104' is valid
+  log: .tmp/reports/openspec-final.log
+- command: npm -C edge run typecheck
+  result: passed
+  exit: 0
+  observed: ''
+  log: .tmp/reports/edge-typecheck-final.log
+- command: npm -C edge run test
+  result: passed
+  exit: 0
+  observed: Test Files 14 passed (14); Tests 71 passed (71); Test Files 9 passed (9); Tests 35 passed (35)
+  log: .tmp/reports/edge-test-final.log
+- command: cargo test -p zeron-proto --lib
+  result: passed
+  exit: 0
+  observed: 'test result: ok. 150 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s'
+  log: .tmp/reports/rust-proto-confirm.log
+- command: cargo test -p zeron-proto -p zeron-mcp --lib --no-fail-fast (MCP 66/0; proto repetido após ajuste da
+    capability)
+  result: failed
+  exit: 101
+  observed: 'test result: ok. 66 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.43s; test
+    result: FAILED. 149 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s'
+  log: .tmp/reports/rust-proto-mcp-final.log
+- command: cargo test -p zeron-engine --test spawn_chat --test worker_wait_state --test runtime_survival --test
+    workspace_files_mutations --test workspace_files_hardening --test workspace_files --test session_publication
+    --test message_queue --test plugin_services --no-fail-fast
+  result: passed
+  exit: 0
+  observed: 'test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.10s; test
+    result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.77s; test result: ok.
+    18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.80s; test result: ok. 6 passed; 0
+    failed; 2 ignored; 0 measured; 0 filtered out; finished in 10.22s; test result: ok. 3 passed; 0 failed; 0 ignored;
+    0 measured; 0 filtered out; finished in 0.13s; test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0
+    filtered out; finished in 5.56s; test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;
+    finished in 0.29s; test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s;
+    test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s'
+  log: .tmp/reports/rust-engine-focused-final.log
+- command: 'cargo test -p zeron-engine --lib rpc::'
+  result: passed
+  exit: 0
+  observed: 'test result: ok. 37 passed; 0 failed; 1 ignored; 0 measured; 1000 filtered out; finished in 9.95s'
+  log: .tmp/reports/rust-engine-rpc.log
+- command: cargo test -p zeron-engine --lib source_control
+  result: passed
+  exit: 0
+  observed: 'test result: ok. 69 passed; 0 failed; 0 ignored; 0 measured; 969 filtered out; finished in 2.03s'
+  log: .tmp/reports/rust-engine-source-control-final.log
+- command: cargo test -p zeron-engine --lib tool_output
+  result: passed
+  exit: 0
+  observed: 'test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 1030 filtered out; finished in 20.25s'
+  log: .tmp/reports/rust-engine-tool-output.log
+- command: cargo test -p zeron-engine --lib fork_startup_keeps_plugin_rpc_dormant
+  result: passed
+  exit: 0
+  observed: 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1037 filtered out; finished in 0.02s'
+  log: .tmp/reports/rust-engine-dormant.log
+- command: cargo test -p zeron-engine --test e2e whole_output
+  result: passed
+  exit: 0
+  observed: 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 45 filtered out; finished in 0.06s'
+  log: .tmp/reports/rust-engine-e2e-output.log
+- command: cargo test -p zeron-engine --test e2e image
+  result: passed
+  exit: 0
+  observed: 'test result: ok. 3 passed; 0 failed; 2 ignored; 0 measured; 41 filtered out; finished in 3.05s'
+  log: .tmp/reports/rust-engine-e2e-images.log
+- command: cargo test -p zeron-engine --lib cursor_usage
+  result: passed
+  exit: 0
+  observed: 'test result: ok. 12 passed; 0 failed; 1 ignored; 0 measured; 1025 filtered out; finished in 0.03s'
+  log: .tmp/reports/rust-engine-cursor-usage.log
+- command: cargo test -p zeron-engine --lib agent_accounts
+  result: passed
+  exit: 0
+  observed: 'test result: ok. 94 passed; 0 failed; 3 ignored; 0 measured; 941 filtered out; finished in 5.54s'
+  log: .tmp/reports/rust-engine-accounts.log
+- command: cargo test -p zeron-harness --test omp_rpc --test acp_registry --test acp_tool_fixture --no-fail-fast
+  result: passed
+  exit: 0
+  observed: 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s; test
+    result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s; test result: ok. 60
+    passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 1.70s'
+  log: .tmp/reports/rust-harness-grants-final.log
+- command: cargo test -p zeron-workers-unpeel --test worker_initial_briefing --test controller_ipc_credentials --test
+    controller_mcp --no-fail-fast
+  result: passed
+  exit: 0
+  observed: 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s; test
+    result: ok. 60 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.67s; test result: ok.
+    13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s'
+  log: .tmp/reports/rust-workers-credentials.log
+- command: cargo test -p zeron-sync --lib
+  result: passed
+  exit: 0
+  observed: 'test result: ok. 82 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.63s'
+  log: .tmp/reports/rust-sync.log
+- command: cargo test -p zeron-sync --test registry_edge -- --ignored (edge local isolado, AUTH_MODE=dev)
+  result: passed
+  exit: 0
+  observed: 'test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.00s'
+  log: .tmp/reports/rust-sync-live-edge.log
+- command: cargo test -p zeron-preview --lib
+  result: passed
+  exit: 0
+  observed: 'test result: ok. 36 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 2.26s'
+  log: .tmp/reports/rust-preview.log
+- command: cargo test -p zeron-plugin-guard -p zeron-preview-label --lib --no-fail-fast
+  result: passed
+  exit: 0
+  observed: 'test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s; test
+    result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s'
+  log: .tmp/reports/rust-new-pure.log
+- command: CARGO_PROFILE_DEV_DEBUG=line-tables-only CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG=false cargo test --manifest-path
+    third_party/zui/Cargo.toml --locked -p gpui --lib closing_punctuation_attached
+  result: passed
+  exit: 0
+  observed: 'test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 227 filtered out; finished in 0.00s'
+  log: .tmp/reports/rust-gpui-punctuation-native.log
+- command: cargo test -p zeron-ui --lib transcript::tests (222 casos concluídos, rodada interrompida)
+  result: failed
+  exit: 101
+  observed: '  process didn''t exit successfully: `/home/agent/projects/comet-sync-upstream-20261104/target/debug/deps/zeron_ui-288e0a291a890eaa
+    ''transcript::tests''` (signal: 2, SIGINT: terminal interrupt signal)'
+  log: .tmp/reports/rust-ui-transcript.log
+- command: target/debug/deps/zeron_ui-288e0a291a890eaa --exact transcript::tests::user_fold_scroll::conversation_width_reflows_streaming_text_without_restarting_animations
+    --nocapture
+  result: passed
+  exit: 0
+  observed: 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2837 filtered out; finished in 0.25s'
+  log: .tmp/reports/ui-width-retry.log
+- command: target/debug/deps/zeron_ui-288e0a291a890eaa --exact transcript::tests::user_fold_scroll::runway_resizes_in_the_same_layout_without_a_provisional_gap
+    --nocapture
+  result: passed
+  exit: 0
+  observed: 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2837 filtered out; finished in 0.05s'
+  log: .tmp/reports/ui-resize-retry.log
+- command: cargo test -p zeron-ui --lib settings::search
+  result: passed
+  exit: 0
+  observed: 'test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 2815 filtered out; finished in 0.01s'
+  log: .tmp/reports/rust-ui-search.log
+- command: cargo test -p zeron-ui --lib rail::tests
+  result: passed
+  exit: 0
+  observed: 'test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 2821 filtered out; finished in 0.00s'
+  log: .tmp/reports/rust-ui-rail.log
+- command: target/debug/deps/zeron_ui-288e0a291a890eaa appshots::shortcut::tests --nocapture
+  result: passed
+  exit: 0
+  observed: 'test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 2835 filtered out; finished in 0.00s'
+  log: .tmp/reports/ui-appshot-shortcuts.log
+- command: target/debug/deps/zeron_ui-288e0a291a890eaa settings_section_persistence --nocapture
+  result: passed
+  exit: 0
+  observed: 'test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 2825 filtered out; finished in 0.08s'
+  log: .tmp/reports/ui-settings-sections.log
+- command: cargo build -p zeron-mobile --lib (host Linux, não link iOS)
+  result: passed
+  exit: 0
+  observed: '    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3m 44s'
+  log: .tmp/reports/rust-mobile-build.log
+- command: cargo run -p zeron-mobile --bin uniffi-bindgen --features bindgen -- generate --library target/debug/libzeron_mobile.so
+    --language swift --out-dir .tmp/mobile-bindgen
+  result: passed
+  exit: 0
+  observed: 'Warning: Unable to auto-format .tmp/mobile-bindgen/zeron_core.swift using swift-format. Please make
+    sure it is installed.'
+  log: .tmp/reports/rust-mobile-bindgen.log
+intermediate_failures:
+- check-1..7 e check8..10 retornaram 101 durante reconciliação; ver all-targets final.
+- 'Core inicial: expectativa upstream de apagar non-command output incompatível com resumo do fork; Fx usado como
+  desconhecido; default subagent incompatível com default side; todos adaptados e repetidos nos scopes afetados.'
+- 'Fila: SendError na fixture antes do subscriber seguinte; aguarda prompt real. Idle reaper pausado interrompido,
+  depois passou em avanço explícito de tempo.'
+- 'Files: TMPDIR dentro do worktree descobria o Git pai; GIT_CEILING_DIRECTORIES isolou a rodada final. Arquivos
+  vazios de teste criados na raiz foram removidos.'
+- 'SourceControl/ACP/OMP: cwd/viewer, extra_mcp direto e exit_code reconciliados nas rodadas finais.'
+- 'Edge inicial: 71 unit e 34/35 workerd, um timeout de drain; retry focado 4/4 e execução completa final 71+35.
+  Não rotulado preexistente.'
+- 'gpui pela raiz: 101 por pacote externo ao workspace; tentativa com manifesto próprio e provas de fonte registradas
+  separadamente.'
+- 'UI transcript: rodada interrompida após 222 passes, uma falha de gutter e fixture de duas janelas; os dois casos
+  afetados passaram em retries exatos após adaptação.'
+limits:
+- Suíte completa cargo test --workspace reservada ao CI automático da PR; não se presume sucesso por existir workflow.
+- macOS/AppKit/packaging/update instalado e Xcode/Simulator/UIKit não provados nesta box Linux; revisão do orquestrador
+  antes de retirar draft.
+- Não lançou app real/dev-demo nem provider autenticado ou pago. Casos live permanecem ignorados com motivos.
+- WPE WebKit 2.50+ indisponível; fallback WebKitGTK, sem prova nativa dma-buf/WPE.
+- zgx/cli/launch e serviços edge adicionais excluídos/dormentes; não compilados como produtos alternativos.
+- Geração host de bindings não prova link iOS; Swift/header/modulemap byte a byte iguais após normalização canônica;
+  swift-format ausente.
+- git diff --check integrado retorna 2 pelo whitespace canônico do header FFI gerado; reparo retorna 0, sem edição
+  manual de gerados.
+- trail/cache indisponíveis; contexto via DOX, Git e fontes exatas, sem refresh do grafo.
+- Target exclusivo preservado para limpeza pelo orquestrador; sem configurações pessoais alteradas.
+references:
+- .tmp/briefs/sync-upstream-20261104.md
+- .tmp/reports/sync-upstream-20261104.md
+- openspec/changes/sync-upstream-20261104/
+- docs/upstream-sync.md
+outcome: integrated_draft
+pending:
+- Aceite/revisão macOS/iOS/visual pelo orquestrador
+- Decisões futuras do dono D1/D2/D8; nada ativado nesta PR
+- CI completo conforme jobs realmente executados; OpenSpec não arquivada
+delivery:
+  integration: draft_pr
+  target_branch: sync/upstream-20261104
+  base: main
+  pr: https://github.com/guilhermexp/comet/pull/26
+  draft: true
+  publication_note: Snapshot do primeiro push e da PR conferidos; o próprio fechamento documental segue em push
+    normal. Head final e refs atualizados no relatório absoluto e publication.json locais.
+  publication:
+    verified_at: '2026-11-04T22:10:28+00:00'
+    command: git push origin sync/upstream-20261104
+    exit: 0
+    head: c67646bbd96b14f0f123d2d9cfc2124d733880d3
+    remote_refs:
+      refs/heads/main: 0f5c6a34b0b80bec083c4f9b5fb5d1aa143895d8
+      refs/heads/sync/upstream-20261104: c67646bbd96b14f0f123d2d9cfc2124d733880d3
+    upstream_push: DISABLED-never-push-upstream
+    pr: https://github.com/guilhermexp/comet/pull/26
+    is_draft: true
+  record_pushed: true
+  merge: proibido; não executado
+  release_deploy_workflow_dispatch: não executados

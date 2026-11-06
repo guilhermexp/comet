@@ -212,6 +212,8 @@ fn request(cwd: &Path, prompt: &str, resume: Option<&str>) -> RunRequest {
         cwd: cwd.display().to_string(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: false,
+        access: Default::default(),
+        plan: false,
         attachments: Vec::new(),
         worktree: None,
         resume: resume.map(str::to_owned),
@@ -219,6 +221,7 @@ fn request(cwd: &Path, prompt: &str, resume: Option<&str>) -> RunRequest {
         workers_parent_chat_id: None,
         sessions: None,
         env: Default::default(),
+        extra_mcp: Vec::new(),
     }
 }
 

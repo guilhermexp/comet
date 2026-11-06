@@ -1,6 +1,6 @@
 repository = "https://github.com/zeronsh/zui"
-base_revision = "361ff20b919fdfb80199ee6d9aed725300cb7d54"
-vendored_tree = "1bb62f8c1c84db914c44e106f17e031f80475911"
+base_revision = "b564a34413bb7ef1da04121c4a287758f94993d9"
+vendored_tree = "72c343b6e8714aff0a51c1e8624dc076a7cee9ec"
 vendored_from = "working-tree"
 license = "Apache-2.0"
 
@@ -77,3 +77,14 @@ license = "Apache-2.0"
 # layout assertions while retaining Rust ABI checks. Source patch commit:
 # 55ccec6c9cc913665f67035cd57d358a4aa66623.
 # Fork-toolchain formatting in the separate source checkout: bb83f55a94c13794686019b322253b1988543c77.
+
+# Sync 2026-11-04: reconstructed prior snapshot in .tmp/zui-source,
+# merged 361ff20..b564a34 (0dc69aa, 5526f55, 5392ee1, b564a34).
+# Source merge: 20dcce769a682f3e6f0bd6acd1f2541ea2582a22. No conflicts.
+# In-place pixel/dma-buf atlas updates, inactive-window frame callbacks,
+# Wayland frame recovery and consistent drag threshold. Fork macOS glass,
+# headless keyboard guard and both closing-punctuation rules preserved.
+
+# Source closeout: formatting commit da49cfd96d63e793271ee1a1289513f3cfa22128.
+# Reconstructed source license symlinks restored in 5e5b7ec981a68cccde7ed74eacb77ec2cfa98fb0.
+# The final source tree equals the vendored Git tree, including symlink modes.

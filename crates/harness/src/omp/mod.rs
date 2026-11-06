@@ -338,6 +338,8 @@ impl Harness for OmpHarness {
             && crate::same_model_options(&live.model_options, &next.model_options)
             && live.cwd == next.cwd
             && crate::same_worker_mcp_config(live, next)
+            && live.access == next.access
+            && live.plan == next.plan
     }
 
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
@@ -537,6 +539,8 @@ impl Harness for OmpHarness {
             session_id,
             prompt,
             self.prompt_timeout,
+            #[cfg(test)]
+            None,
         ));
 
         Ok(
@@ -759,32 +763,15 @@ fn user_steering_text(frame: &Value) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-fn dispatch_steer(
-    process: OmpProcess,
-    event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
-    prompt: String,
-    attachments: Vec<String>,
-    failed: mpsc::UnboundedSender<String>,
-) {
-    tokio::spawn(async move {
-        let result = async {
-            let images = load_images(&attachments, &prompt, "steer").await?;
-            let mut request = json!({ "type": "steer", "message": prompt });
-            if !images.is_empty() {
-                request["images"] = Value::Array(images);
-            }
-            process.request(request).await.map(|_| ())
+fn dispatch_steer(process: OmpProcess, prompt: String, attachments: Vec<String>) -> PromptFuture {
+    Box::pin(async move {
+        let images = load_images(&attachments, &prompt, "steer").await?;
+        let mut request = json!({ "type": "steer", "message": prompt });
+        if !images.is_empty() {
+            request["images"] = Value::Array(images);
         }
-        .await;
-        match result {
-            Ok(_) => {}
-            Err(error) => {
-                let _ = failed.send(prompt);
-                let message = protocol::sanitize_diagnostic(&error.to_string());
-                let _ = emit(&event_tx, AgentEvent::Error { message }).await;
-            }
-        }
-    });
+        process.request(request).await
+    })
 }
 
 type PromptFuture =
@@ -811,8 +798,16 @@ fn begin_prompt(
     message: String,
     attachments: Vec<String>,
     timeout: Duration,
+    #[cfg(test)] gate: Option<Arc<tests::PromptGate>>,
 ) -> PromptFuture {
     Box::pin(async move {
+        #[cfg(test)]
+        if let Some(gate) = gate
+            && attachments.contains(&gate.path)
+        {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
         let images = load_images(&attachments, &message, "prompt").await?;
         let mut prompt = json!({ "type": "prompt", "message": message });
         if !images.is_empty() {
@@ -837,6 +832,7 @@ async fn run_session(
     mut session_id: String,
     prompt: Value,
     prompt_timeout: Duration,
+    #[cfg(test)] gate: Option<Arc<tests::PromptGate>>,
 ) {
     let RunControls {
         realtime: _,
@@ -874,7 +870,9 @@ async fn run_session(
     let mut interrupted_waits: HashMap<String, bool> = HashMap::new();
     let mut answered: HashSet<String> = HashSet::new();
     let (tool_tx, mut tool_rx) = mpsc::unbounded_channel::<(String, Option<Value>)>();
-    let (steer_failed_tx, mut steer_failed_rx) = mpsc::unbounded_channel::<String>();
+    let mut steer_fut: PromptFuture = Box::pin(std::future::pending());
+    let mut steer_pending = false;
+    let mut active_steer: Option<(String, Option<String>)> = None;
 
     let mut prompt_fut: PromptFuture = {
         let process = process.clone();
@@ -901,12 +899,18 @@ async fn run_session(
                             workers.cancel_call(tool_id);
                         }
                     }
-                    if !steering_open {
-                        finished = true;
-                    }
                 }
             }
         };
+    }
+    macro_rules! enqueue_steer {
+        ($steer:expr) => {{
+            queued_steers.push_back($steer);
+            #[cfg(test)]
+            if let Some(gate) = &gate {
+                let _ = gate.queued.send(());
+            }
+        }};
     }
     // One user message. Inside a turn it is a steer; with no turn running it
     // is the next `prompt` (same preflight and timeout as the first one).
@@ -919,19 +923,23 @@ async fn run_session(
                 ..
             } = $steer;
             if turn_active {
-                in_flight_steers.push((prompt.clone(), message_id));
-                dispatch_steer(
-                    process.clone(),
-                    event_tx.clone(),
-                    prompt,
-                    attachments,
-                    steer_failed_tx.clone(),
-                );
+                let identity = (prompt.clone(), message_id);
+                in_flight_steers.push(identity.clone());
+                active_steer = Some(identity);
+                steer_fut = dispatch_steer(process.clone(), prompt, attachments);
+                steer_pending = true;
             } else {
                 turn_active = true;
                 compacting = is_compact_prompt(&prompt);
                 compaction_deadline = tokio::time::Instant::now() + prompt_timeout;
-                prompt_fut = begin_prompt(process.clone(), prompt, attachments, prompt_timeout);
+                prompt_fut = begin_prompt(
+                    process.clone(),
+                    prompt,
+                    attachments,
+                    prompt_timeout,
+                    #[cfg(test)]
+                    gate.clone(),
+                );
                 prompt_pending = true;
                 // The engine's boundary for a message it routed into a parked
                 // runtime: it un-parks and retires the routed-steer entry.
@@ -953,6 +961,19 @@ async fn run_session(
     let context_unsupported = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut context_tasks = tokio::task::JoinSet::new();
     while !finished {
+        // One delivery at a time: image preflight cannot reorder adjacent
+        // messages, and nothing overtakes the opening prompt's ACK or a
+        // pending host-tool result. Keep the complete message until dispatch.
+        if !prompt_pending && !steer_pending && delivering.is_empty() {
+            if let Some(queued) = queued_steers.pop_front() {
+                deliver_message!(queued);
+            } else if !turn_active && !steering_open {
+                finished = true;
+            }
+        }
+        if finished {
+            break;
+        }
         tokio::select! {
             request = context_requests.recv() => {
                 if let Some(request) = request {
@@ -1086,9 +1107,7 @@ async fn run_session(
                 match steer {
                     Some(steer) => {
                         let prompt = steer.prompt.clone();
-                        if !turn_active || delivering.is_empty() {
-                            deliver_message!(steer);
-                        } else {
+                        if turn_active && !delivering.is_empty() {
                             let is_worker_notice = prompt.starts_with("[worker-task-notification]");
                             for tool_id in &pending_wait_for_status {
                                 if let Some(notice) = interrupted_waits.get_mut(tool_id) {
@@ -1100,25 +1119,21 @@ async fn run_session(
                                     workers.cancel_call(tool_id);
                                 }
                             }
-                            queued_steers.push_back(steer);
                         }
+                        enqueue_steer!(steer);
                     }
-                    None => {
-                        steering_open = false;
-                        // Nobody can send another message: an idle runtime
-                        // has nothing left to wait for.
-                        if !turn_active {
-                            finished = true;
-                        }
-                    }
+                    None => steering_open = false,
                 }
             }
-            Some(failed_prompt) = steer_failed_rx.recv() => {
-                if let Some(index) = in_flight_steers
-                    .iter()
-                    .position(|(prompt, _)| prompt == &failed_prompt)
-                {
-                    in_flight_steers.remove(index);
+            steer_res = &mut steer_fut, if steer_pending => {
+                steer_pending = false;
+                let identity = active_steer.take().expect("a pending steer has its identity");
+                if let Err(error) = steer_res {
+                    if let Some(index) = in_flight_steers.iter().position(|entry| entry == &identity) {
+                        in_flight_steers.remove(index);
+                    }
+                    let message = protocol::sanitize_diagnostic(&error.to_string());
+                    let _ = emit(&event_tx, AgentEvent::Error { message }).await;
                 }
             }
             Some((tool_id, outcome)) = tool_rx.recv() => {
@@ -1126,11 +1141,6 @@ async fn run_session(
                 let interrupted_wait = interrupted_waits.remove(&tool_id);
                 if answered.contains(&tool_id) {
                     delivering.remove(&tool_id);
-                    if delivering.is_empty() {
-                        while let Some(queued) = queued_steers.pop_front() {
-                            deliver_message!(queued);
-                        }
-                    }
                     continue;
                 }
                 answered.insert(tool_id.clone());
@@ -1177,11 +1187,6 @@ async fn run_session(
                     }
                 }
                 delivering.remove(&tool_id);
-                if delivering.is_empty() {
-                    while let Some(queued) = queued_steers.pop_front() {
-                        deliver_message!(queued);
-                    }
-                }
             }
             frame = events.recv() => {
                 let Some(frame) = frame else {
@@ -1942,6 +1947,190 @@ fn truncate_text(value: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(super) struct PromptGate {
+        pub(super) path: String,
+        pub(super) entered: tokio::sync::Notify,
+        pub(super) release: tokio::sync::Notify,
+        pub(super) queued: mpsc::UnboundedSender<()>,
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warm_prompt_preflight_and_ack_precede_ordered_steers() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("attachment.png");
+        std::fs::write(&image, b"\x89PNG\r\n\x1a\nfixture").unwrap();
+        let log = dir.path().join("frames");
+        let (queued_tx, mut queued_rx) = mpsc::unbounded_channel();
+        let gate = Arc::new(PromptGate {
+            path: image.to_string_lossy().into_owned(),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            queued: queued_tx,
+        });
+        let process = OmpProcess::start(process::OmpLaunch {
+            executable: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/fake-omp-rpc.sh"),
+            cwd: dir.path().to_owned(),
+            ephemeral: true,
+            system_prompt_append: None,
+            env: Some(HashMap::from([
+                ("FAKE_OMP_SCENARIO".into(), "prompt-order".into()),
+                ("FAKE_OMP_LOG".into(), log.to_string_lossy().into_owned()),
+            ])),
+            handshake_timeout: Duration::from_secs(1),
+            request_timeout: Duration::from_secs(1),
+        })
+        .await
+        .unwrap();
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let (steer_tx, steer_rx) = mpsc::channel(8);
+        let interrupt = tokio_util::sync::CancellationToken::new();
+        let controls = RunControls {
+            realtime: None,
+            execution_lease: None,
+            request_input: Box::new(|_| {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = tx.send(Vec::new());
+                rx
+            }),
+            steering: steer_rx,
+            interrupt: interrupt.clone(),
+            chat_id: "ordered-fixture".into(),
+            turn: Default::default(),
+        };
+        let actor = tokio::spawn(run_session(
+            process.clone(),
+            process.take_events().unwrap(),
+            event_tx,
+            controls,
+            None,
+            None,
+            None,
+            dir.path().to_string_lossy().into_owned(),
+            "fixture".into(),
+            "session".into(),
+            json!({"type":"prompt","message":"first"}),
+            Duration::from_secs(1),
+            Some(gate.clone()),
+        ));
+        let mut seen = Vec::new();
+        // The deadline only bounds a broken fixture. Every transition below
+        // waits for a positive actor/child event; no scheduling delay is used.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let event = event_rx.recv().await.unwrap().unwrap();
+                let done = matches!(event, AgentEvent::Done { .. });
+                seen.push(event);
+                if done { break; }
+            }
+            steer_tx.send(SteerMessage {
+                prompt: "opening".into(), message_id: Some("opening-id".into()),
+                attachments: vec![gate.path.clone()], config: None,
+            }).await.unwrap();
+            gate.entered.notified().await;
+            for (prompt, id) in [("one", "id-one"), ("two", "id-two")] {
+                steer_tx.send(SteerMessage { prompt: prompt.into(), message_id: Some(id.into()),
+                    attachments: Vec::new(), config: None }).await.unwrap();
+            }
+            let mut held = 0;
+            while held < 2 {
+                tokio::select! {
+                    Some(()) = queued_rx.recv() => held += 1,
+                    Some(event) = event_rx.recv() => {
+                        let event = event.unwrap();
+                        let overtook = matches!(&event, AgentEvent::TextDelta { text } if text == "wire-steer");
+                        seen.push(event);
+                        if overtook { break; } // RED releases the gate too, then checks actual frames.
+                    }
+                }
+            }
+            gate.release.notify_one();
+            loop {
+                let event = event_rx.recv().await.unwrap().unwrap();
+                let opening = matches!(&event, AgentEvent::TextDelta { text } if text == "wire-prompt");
+                seen.push(event);
+                if opening { break; }
+            }
+            // The child has the prompt frame but deliberately withholds its ACK.
+            steer_tx.send(SteerMessage { prompt: "three".into(), message_id: Some("id-three".into()),
+                attachments: Vec::new(), config: None }).await.unwrap();
+            loop {
+                tokio::select! {
+                    Some(()) = queued_rx.recv() => break,
+                    Some(event) = event_rx.recv() => {
+                        let event = event.unwrap();
+                        let overtook = matches!(&event, AgentEvent::TextDelta { text } if text == "wire-steer");
+                        seen.push(event);
+                        if overtook { break; }
+                    }
+                }
+            }
+            process.request(json!({"type":"release_prompt_ack"})).await.unwrap();
+            while seen.iter().filter(|event| matches!(event, AgentEvent::Steered { assistant_message_id: Some(id), .. } if id.starts_with("id-"))).count() < 3 {
+                seen.push(event_rx.recv().await.unwrap().unwrap());
+            }
+        }).await.expect("actor and child must complete the controlled preflight/ACK sequence");
+        interrupt.cancel();
+        actor.await.unwrap();
+        let frames: Vec<Value> = std::fs::read_to_string(log.with_extension("raw"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let messages: Vec<_> = frames
+            .iter()
+            .filter(|frame| matches!(frame["type"].as_str(), Some("prompt" | "steer")))
+            .map(|frame| {
+                (
+                    frame["type"].as_str().unwrap(),
+                    frame["message"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                ("prompt", "first"),
+                ("prompt", "opening"),
+                ("steer", "one"),
+                ("steer", "two"),
+                ("steer", "three")
+            ],
+            "child's actual wire frames: {frames:?}"
+        );
+        let ack_release = frames
+            .iter()
+            .position(|frame| frame["type"] == "release_prompt_ack")
+            .unwrap();
+        assert!(
+            frames
+                .iter()
+                .enumerate()
+                .filter(|(_, frame)| frame["type"] == "steer")
+                .all(|(index, _)| index > ack_release),
+            "a steer overtook the prompt ACK: {frames:?}"
+        );
+        let ids: Vec<_> = seen
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Steered {
+                    assistant_message_id: Some(id),
+                    ..
+                } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, ["opening-id", "id-one", "id-two", "id-three"]);
+        assert_eq!(
+            frames
+                .iter()
+                .find(|frame| frame["message"] == "opening")
+                .unwrap()["images"][0]["data"],
+            base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nfixture")
+        );
+    }
 
     /// O updater (`engine/src/harness_updates.rs`) acha o binario via
     /// `Harness::executable_path()`; sem o override o OMP aparecia instalado

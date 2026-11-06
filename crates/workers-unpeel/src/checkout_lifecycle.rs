@@ -257,8 +257,19 @@ fn has_hidden_local_edits(checkout: &Path) -> Result<bool, String> {
             _ => None,
         })
         .any(|path| {
-            use std::os::unix::ffi::OsStrExt;
-            std::fs::symlink_metadata(checkout.join(std::ffi::OsStr::from_bytes(path))).is_ok()
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                std::fs::symlink_metadata(checkout.join(std::ffi::OsStr::from_bytes(path))).is_ok()
+            }
+            #[cfg(windows)]
+            {
+                // Git for Windows emits UTF-8. An undecodable index path
+                // cannot prove a clean checkout, so keep removal blocked.
+                std::str::from_utf8(path)
+                    .map(|path| std::fs::symlink_metadata(checkout.join(path)).is_ok())
+                    .unwrap_or(true)
+            }
         }))
 }
 
@@ -297,15 +308,7 @@ fn lock_checkout_actions_at(
     path: &Path,
     wait: std::time::Duration,
 ) -> Result<Option<CheckoutActionLock>, String> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| e.to_string())?;
+    let file = unpeel_core::platform::open_lock_file(path, false).map_err(|e| e.to_string())?;
     if !flock_exclusive(&file, wait)? {
         return Ok(None);
     }
@@ -316,11 +319,7 @@ impl CheckoutActionLock {
     /// Run long, repository-supplied work without blocking unrelated checkout
     /// actions. Callers must revalidate everything after this returns.
     fn released<T>(&mut self, work: impl FnOnce() -> T) -> Result<T, String> {
-        use std::os::fd::AsRawFd;
-        // SAFETY: this guard still owns the valid descriptor.
-        unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-        }
+        unpeel_core::platform::unlock(&self.0).map_err(|error| error.to_string())?;
         let result = work();
         if !flock_exclusive(&self.0, CHECKOUT_ACTION_LOCK_WAIT)? {
             return Err(format!(
@@ -334,17 +333,10 @@ impl CheckoutActionLock {
 
 /// `false` when the lock is still held by another action after `wait`.
 fn flock_exclusive(file: &std::fs::File, wait: std::time::Duration) -> Result<bool, String> {
-    use std::os::fd::AsRawFd;
     let deadline = std::time::Instant::now() + wait;
     loop {
-        // SAFETY: the descriptor is owned and stays open for the guard's lifetime.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        if unpeel_core::platform::try_lock_exclusive(file).map_err(|error| error.to_string())? {
             break;
-        }
-        let error = std::io::Error::last_os_error();
-        if !matches!(error.raw_os_error(), Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN)
-        {
-            return Err(error.to_string());
         }
         if std::time::Instant::now() >= deadline {
             return Ok(false);
@@ -632,11 +624,7 @@ pub(crate) fn prune_missing_checkout_under_lock(
 
 impl Drop for CheckoutActionLock {
     fn drop(&mut self) {
-        use std::os::fd::AsRawFd;
-        // SAFETY: this guard still owns the valid descriptor.
-        unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-        }
+        let _ = unpeel_core::platform::unlock(&self.0);
     }
 }
 

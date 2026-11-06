@@ -930,6 +930,7 @@ OMP telemetry tests resolve Session roots through `omp_sessions_root_in`/`read_i
 | `session_host::read_retained_output_chunk` — bounded passive recovery, aged cursors and retained floors | integration | Comet downstream: `cargo test -p zeron-workers-unpeel --test terminal_history` |
 | `runtimes/setup_conformance_tests.rs`: ten executable shell reporters and shared transport | integration | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core --lib setup_conformance` |
 | OMP/Pi/Amp/OpenCode adapter and callback contracts; Prime native ownership, framing, cancellation and resume | unit | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core --lib` |
+| `browser_mcp` process retirement and `platform` termination errors | unit — Linux absent-PID filesystem regressions; portable denied-error preservation; Windows library compile | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core` · Windows GNU core library check |
 | Prime native lifecycle through Comet Host/journal, same-PTY resume and private daemon teardown | integration | Manual official 0.10 CLI probe with private HOME/provider/XDG, hook root distinct from state, managed and external saved history, real Host input/resume/stop APIs and loopback model; record actual generations/provider UUID, never a hosted-model/production-profile substitute |
 | `crates/unpeel-tui/src/activity.rs`: accepted durable seeds and live-event precedence | unit | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-tui --bin unpeel activity` |
 
@@ -990,7 +991,7 @@ contracts above; it is not an upstream runtime API guarantee.
 - Executable regressions cover all ten shell reporters (online/offline,
   synchronous/asynchronous admission), OMP/Pi/Amp/OpenCode callback contracts,
   native Prime ownership/resume/lifetime, Comet activity/journal admission and
-  compacted parent attention. Run local Cargo through `scripts/cargo-verify.py`;
+  compacted parent attention. Run local Cargo natively with the Comet root contract (task/checkout-specific target, jobs=2 and sccache);
   vendor suites use `--manifest-path third_party/unpeel/crates/Cargo.toml`,
   downstream bridge suites use the root workspace. Provider-native probes need
   isolated HOME/provider/XDG directories and loopback models; never restart
@@ -1037,3 +1038,17 @@ Comet's `crates/ui/src/workers/terminal.rs`, not the Host reader.
 - Peer `sessions` schema and `send_keys` help advertise named keys, printable characters and `text:<literal>`, using `session_control::MAX_KEYS_PER_CALL` and `MAX_TEXT_KEY_BYTES` (16 KiB UTF-8 per literal). Metadata changes do not constrain the intentional raw-key vocabulary, encoding or authority. Verify this metadata through disposable isolated `zeron __mcp__` initialize/tools-list/help exchanges, not permanent wording tests.
 
 - GL3/4: terminal cleanup consumes CRLF once and complete ESC intermediate/final designations; bare CR retains each adapter’s documented profile, with raw replay untouched. Downstream `controller_mcp::terminal_text_consumers_normalize_crlf_and_designation_escapes` checks both consumers. GL8 advertisement assertions explicitly select no caller manifest and the effective mask; real call denial and thread-local embedding isolation stay intact. Public video guidance names `browser` action `screenshot`, never the retired alias.
+
+- CI 2026-11-05: the peer sessions schema keeps the existing <4 KiB per-domain and <11 KiB total budgets. Its introduction is terse; full action semantics remain in help. Do not enlarge budgets or reduce the key vocabulary to fit metadata.
+
+- CI R5: executable hook/wrapper assets are written to unique same-directory staging files, chmodded, closed and atomically renamed. Never truncate the published executable. The Unix-only retained-reader regression `executable_script_replacement_preserves_the_published_inode` also checks POSIX permissions and staging cleanup, so the entire test is gated with `cfg(unix)`; the Grok wrapper conformance tests execute the published scripts. Keep platform-neutral tests enabled on other targets.
+
+- CI R6: `unpeel-core::platform` is the shared native primitive seam for the core and Comet embedder. Unix keeps flock and 0600; Windows uses owned handles, LockFileEx, process-token SID/DACLs, GetComputerNameW, creation times and write-through rename. Unknown liveness never authorizes cleanup. Published-file, lock-exclusion/release and liveness regressions run without sleeps or retries. The pinned 1.88 MSRV is preserved (no newer std file-lock API). Hook adapters and local PTY/socket/FIFO transport remain Unix-only with explicit errors where unsupported; no Windows Host capability is invented.
+
+Round2 CI: app_paths default-hook fixture runs in a private child with COMET_WORKERS_HOOKS_DIR removed, then independently verifies the explicit trimmed override. Kimi conformance counts nine parsed managed commands pointing to the resolved hook root, retaining the original theme/user-hook/event/matcher checks. No fixture assumes the caller omitted a supported isolation override.
+
+Session lifecycle socket I/O imports and SOCKET_IO_TIMEOUT share the Unix gate with socket_command; non-Unix builds must not retain its unused std::io imports or timeout constant.
+
+Browser cleanup must finish when an identity-checked positive PID disappears before termination. The platform seam reports definitive absence as NotFound; browser retirement accepts only that error as already stopped. Permission/other errors preserve artifacts and return through the caller's trace path. local_urls::stop_server_for_url keeps its strict error policy. Keep the existing identity checks and daemon grace/escalation budget; cleanup tests never signal an allocatable PID.
+
+The missing-process normalization is ESRCH on Unix and ERROR_INVALID_PARAMETER from Windows OpenProcess only; invalid nonpositive PIDs and all other errors retain their policy. Once absence is definitive, browser retirement skips liveness waits/escalation and removes owned artifacts. A successful signal retains the existing grace/escalation behavior. TerminateProcess/access-denied failures are not silently reclassified as absence.

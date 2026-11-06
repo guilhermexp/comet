@@ -1,12 +1,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use crate::process::{Child, Command, Stdio};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt as _, BufReader};
-use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 

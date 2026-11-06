@@ -177,6 +177,10 @@ mod tests {
                 .into_iter()
                 .enumerate()
                 .map(|(idx, call)| MessagePart::Tool {
+                    exit_code: Default::default(),
+                    output_truncated: Default::default(),
+                    output_lines: Default::default(),
+
                     id: format!("tool-{idx}"),
                     call,
                     diff: None,
@@ -211,6 +215,10 @@ mod tests {
                 .into_iter()
                 .enumerate()
                 .map(|(idx, call)| MessagePart::Tool {
+                    exit_code: Default::default(),
+                    output_truncated: Default::default(),
+                    output_lines: Default::default(),
+
                     id: format!("tool-u-{idx}"),
                     call,
                     diff: None,

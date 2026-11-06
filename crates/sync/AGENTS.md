@@ -12,6 +12,8 @@ Como o estado **viaja e persiste**: cliente de room sobre `loro-protocol` (join,
 
 ## Local Contracts
 
+- Sync `35561ead` atualiza Loro para 1.17 (edge 1.17.1) sem trocar nomes de containers/protocolo. `catching-up` informa replay em curso sem descartar outbox/recibos duráveis, erros ou contexto do fork. A convergência continua coberta pelos testes de registry/edge.
+
 - O par de crates `loro` / `loro-protocol` é o twin Rust do pacote npm que o edge fala — frames byte-idênticos. Bump de versão exige revalidar a convergência contra o edge, não só compilar.
 - Join é **supervisionado**: falha de sync não pode ficar silenciosa. Retry, probe e escalonamento existem porque o modo de falha real era "trava sem dizer nada".
 - **Orçamento compartilhado** (`src/budget.rs`, upstream #544): sockets vivos, dials (handshake WS) e requests HTTP têm permits de processo separados; o fallback HTTP de fundo usa uma fatia menor para não matar o chat em foco. Não reintroduzir um semáforo próprio por cima: o antigo `MAX_CONCURRENT_DIALS` era segurado pelo sync HTTP durante o download inteiro do checkpoint e travava joins vivos em `ACTIVE_SYNC_CAP − 8`. Trabalho durável de sync (`src/sync_jobs.rs`) retoma sem abrir todos os chats no boot.

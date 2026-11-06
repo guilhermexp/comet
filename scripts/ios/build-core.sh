@@ -9,7 +9,10 @@
 #   libzeron_mobile.a            linked via LIBRARY_SEARCH_PATHS
 #   include/module.modulemap     `import zeron_coreFFI` (SWIFT_INCLUDE_PATHS)
 # and refreshes apps/ios/Zeron/Core/Generated/zeron_core.swift — committed so
-# Xcode's synchronized folder always sees it; CI fails if it drifts.
+# Xcode's synchronized folder always sees it — and apps/ios/CoreFFI/ (the C
+# header and module map, committed so CI's simulator tests need no bindings
+# build; outside the synchronized folders, so Xcode compiles nothing from it).
+# CI fails if any of them drifts.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -80,3 +83,6 @@ mkdir -p "$(dirname "$SWIFT_OUT")"
 # generated output before comparison so the committed binding stays lint-clean.
 sed 's/[[:blank:]]*$//' "$GEN/zeron_core.swift" >"$GEN/zeron_core.normalized.swift"
 cmp -s "$GEN/zeron_core.normalized.swift" "$SWIFT_OUT" || cp "$GEN/zeron_core.normalized.swift" "$SWIFT_OUT"
+refresh() { mkdir -p "$(dirname "$2")"; cmp -s "$1" "$2" || cp "$1" "$2"; }
+refresh "$GEN/zeron_coreFFI.h" "$ROOT/apps/ios/CoreFFI/zeron_coreFFI.h"
+refresh "$GEN/zeron_coreFFI.modulemap" "$ROOT/apps/ios/CoreFFI/module.modulemap"

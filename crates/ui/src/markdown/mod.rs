@@ -26,7 +26,9 @@ pub mod render;
 pub mod selection;
 pub mod veil;
 
-pub use parser::{Block, BlockTree, IncrementalParser, InlineRun, InlineStyle, parse_full};
+pub use parser::{
+    Block, BlockTree, IncrementalParser, InlineRun, InlineStyle, parse_full, parse_message,
+};
 
 pub mod mermaid;
 // Upstream #760 chat Mermaid cache. The fork draws chat Mermaid with its own

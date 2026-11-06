@@ -259,10 +259,13 @@ async fn turn(core: &EngineCore, cwd: &std::path::Path, live: bool, second: bool
                 enable_workers_mcp: false,
                 workers_parent_chat_id: None,
                 sessions: None,
+                access: Default::default(),
+                plan: false,
                 attachments: vec![],
                 worktree: None,
                 resume: None,
                 env: Default::default(),
+                extra_mcp: Vec::new(),
             },
             Some(if second { "second-user" } else { "first-user" }.into()),
         )

@@ -589,11 +589,17 @@ impl SessionCore {
         self.update_state(|st| st.transfer_progress = progress);
     }
 
-    fn last_entry_id(&self) -> Option<String> {
-        self.snapshot()
+    fn last_assistant_entry_id(&self) -> Option<String> {
+        let snapshot = self.snapshot();
+        snapshot
             .entries
-            .get(..self.snapshot().transcript_len)
-            .and_then(|e| e.last())
+            .get(..snapshot.transcript_len)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .rev()
+                    .find(|e| e.message.role == MessageRole::Assistant)
+            })
             .map(|e| e.id.clone())
     }
 
@@ -604,10 +610,12 @@ impl SessionCore {
             payload,
             issued_by: device_id.to_owned(),
             issued_at: now,
-            based_on: self.last_entry_id().map(|turn_id| CommandBasedOn {
-                turn_id: Some(turn_id),
-                frontier: None,
-            }),
+            based_on: self
+                .last_assistant_entry_id()
+                .map(|turn_id| CommandBasedOn {
+                    turn_id: Some(turn_id),
+                    frontier: None,
+                }),
             expires_at: Some(now + zeron_doc::COMMAND_DEFAULT_TTL_MS),
             status: SessionCommandStatus::Pending,
             resolution: None,
@@ -930,6 +938,9 @@ fn refresh_setup_placeholder(st: &mut CoreState, cloud_booting: bool) -> bool {
                     subagent_end: None,
                     execution: None,
                     file_preview: None,
+                    exit_code: None,
+                    output_truncated: false,
+                    output_lines: None,
                 }],
                 created_at: created_at + 1,
                 device_id: String::new(),
@@ -1178,7 +1189,9 @@ impl SessionHandle {
                     model_options: config.map(|c| c.model_options.clone()).unwrap_or_default(),
                     cwd: chat.cwd.clone().unwrap_or_else(|| "~".into()),
                     sandbox: config.map_or(SandboxLevel::WorkspaceWrite, |c| c.sandbox),
-                    auto_approve: true,
+                    auto_approve: false,
+                    access: config.map(|c| c.access).unwrap_or_default(),
+                    plan: config.is_some_and(|c| c.plan),
                     resume: None,
                     attachments: refs.clone(),
                     worktree: request.worktree.clone(),
@@ -1187,6 +1200,7 @@ impl SessionHandle {
                     sessions: None,
                     mcp: None,
                     env: Default::default(),
+                    extra_mcp: Vec::new(),
                 };
                 self.core.queue_command(
                     &device_id,

@@ -7,18 +7,70 @@ use std::{
 };
 use zeron_preview::{PreviewService, Scope};
 use zeron_proto::{ORIGIN_ENV, chat_origin, terminal_origin};
-/// Every service binds the fixed proxy port, so tests in this binary must
-/// not run concurrently: one test freeing 7331 for its own proxy to reclaim
-/// would otherwise race another test's service for it.
+/// Every service binds the proxy port (7331, else one the system picks), so
+/// tests in this binary must not run concurrently: one test holding 7331 to
+/// see its proxy move elsewhere would otherwise race another test's service.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 struct Child(std::process::Child);
+impl Child {
+    fn spawn(command: &mut std::process::Command) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        Self(command.spawn().unwrap())
+    }
+}
 impl Drop for Child {
     fn drop(&mut self) {
+        // A shell can leave its server alive after killing only the launcher.
+        // Every guard owns a fresh group, never the test runner's group.
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+        }
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
 }
 const HTTP_SERVER: &str = "import http.server,socketserver; socketserver.TCPServer(('127.0.0.1',0),http.server.SimpleHTTPRequestHandler).serve_forever()";
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dropping_a_launcher_closes_its_servers_output_pipe() {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let dir = tempfile::tempdir().unwrap();
+    let script = "import os,http.server,socketserver; server=socketserver.TCPServer(('127.0.0.1',0),http.server.SimpleHTTPRequestHandler); print(os.getpid(),flush=True); server.serve_forever()";
+    let mut launcher = Child::spawn(
+        std::process::Command::new("sh")
+            .args(["-c", "python3 -c \"$1\"; true", "fixture-shell", script])
+            .current_dir(dir.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped()),
+    );
+    let stdout = tokio::process::ChildStdout::from_std(launcher.0.stdout.take().unwrap()).unwrap();
+    let mut reader = tokio::io::BufReader::new(stdout);
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    let server: i32 = line.trim().parse().unwrap();
+    drop(launcher);
+    let closed =
+        tokio::time::timeout(Duration::from_secs(1), reader.read_to_end(&mut Vec::new())).await;
+    if closed.is_err() {
+        // Clean up only this regression's known server before reporting RED.
+        unsafe {
+            libc::kill(server, libc::SIGKILL);
+        }
+    }
+    assert!(
+        closed.is_ok(),
+        "dropping the launcher left its server and output pipe alive"
+    );
+}
 fn scope(chats: &[(&str, &Path)]) -> Scope {
     Scope {
         chats: chats
@@ -53,13 +105,11 @@ fn launch_from(cwd: &Path, http: bool, origin: Option<String>) -> Child {
     } else {
         command.args(["-c", "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); time.sleep(30)"]);
     }
-    Child(
+    Child::spawn(
         command
             .current_dir(cwd)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .unwrap(),
+            .stderr(std::process::Stdio::inherit()),
     )
 }
 async fn wait(service: &PreviewService, expected_pid: Option<u32>) {
@@ -110,16 +160,26 @@ async fn only_agent_started_http_processes_are_exposed_and_removals_are_live() {
         .start(Arc::new(move || projects.lock().unwrap().clone()), None)
         .await;
     wait(&service, Some(local.0.id())).await;
-    if let Some(listener) = occupied {
-        assert!(service.catalog().snapshot().error.is_some());
-        drop(listener);
+    // (7331 is taken either way: held here, or by another engine already.)
+    {
+        // Its usual port taken (another engine on this computer has it): the
+        // proxy listens on another, with nothing wrong to say, and every
+        // preview's address is built on that one.
         tokio::time::timeout(Duration::from_secs(6), async {
-            while service.catalog().snapshot().error.is_some() {
+            while service.catalog().snapshot().proxy_port == 7331 {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
         .await
-        .expect("proxy did not retry the freed port");
+        .expect("the proxy never moved off its taken port");
+        let snapshot = service.catalog().snapshot();
+        assert_eq!(snapshot.error, None);
+        assert_ne!(snapshot.proxy_port, 7331);
+        assert!(
+            snapshot.services[0]
+                .url(snapshot.proxy_port)
+                .ends_with(&format!(":{}", snapshot.proxy_port))
+        );
     }
     // Several cycles pass and the user's server never joins it.
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -133,11 +193,14 @@ async fn only_agent_started_http_processes_are_exposed_and_removals_are_live() {
     wait(&service, Some(other.0.id())).await;
     drop(other);
     wait(&service, None).await;
+    drop(occupied);
+    // Shutdown fully releases the proxy's port (whichever it got) before a
+    // profile boots.
+    let held = service.catalog().snapshot().proxy_port;
     service.shutdown().await;
-    // Shutdown fully releases the fixed proxy port before a profile boots.
     if service.catalog().snapshot().error.is_none() {
         assert!(
-            tokio::net::TcpListener::bind("127.0.0.1:7331")
+            tokio::net::TcpListener::bind(("127.0.0.1", held))
                 .await
                 .is_ok()
         );
@@ -165,15 +228,13 @@ async fn a_discovered_server_is_probed_once_not_every_cycle() {
          socketserver.TCPServer(('127.0.0.1',0),H).serve_forever()\n",
         log = log.display().to_string()
     );
-    let server = Child(
+    let server = Child::spawn(
         std::process::Command::new("python3")
             .args(["-c", &script])
             .env(ORIGIN_ENV, chat_origin(&chat))
             .current_dir(&app)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .unwrap(),
+            .stderr(std::process::Stdio::inherit()),
     );
     let service = PreviewService::new(
         temp.path().join("names.json"),
@@ -239,7 +300,7 @@ c.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK'
         ready = ready.display().to_string(),
         connections = connections.display().to_string(),
     );
-    let mut callback = Child(
+    let mut callback = Child::spawn(
         std::process::Command::new("python3")
             .args([
                 "-c",
@@ -251,9 +312,7 @@ c.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK'
             .env(ORIGIN_ENV, chat_origin(&chat))
             .current_dir(&app)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .unwrap(),
+            .stderr(std::process::Stdio::inherit()),
     );
     let port: u16 = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -375,14 +434,12 @@ async fn backgrounded_scrubbed_terminal_and_out_of_tree_servers_stay_attributed(
     }
     let _daemon = Kill(daemon);
     // A marked shell that stays alive around a server with no environment.
-    let _scrubbed = Child(
+    let _scrubbed = Child::spawn(
         std::process::Command::new("sh")
             .args(["-c", &format!("env -i {python} -c \"{HTTP_SERVER}\"; true")])
             .env(ORIGIN_ENV, chat_origin(&chat))
             .current_dir(&app)
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(std::process::Stdio::null()),
     );
     let outside = launch(&elsewhere, true, Some(chat.as_str()));
     // From a terminal (or the project action running in one), which may
@@ -408,7 +465,16 @@ async fn backgrounded_scrubbed_terminal_and_out_of_tree_servers_stay_attributed(
         }
     })
     .await
-    .expect("discovery did not find every agent server");
+    .unwrap_or_else(|_| {
+        let found: Vec<_> = service
+            .catalog()
+            .snapshot()
+            .services
+            .iter()
+            .map(|s| (s.pid, s.port, s.name.clone(), s.chat_id.clone()))
+            .collect();
+        panic!("discovery did not find every agent server: found {found:?}")
+    });
     assert!(services.iter().any(|s| s.pid == daemon));
     assert!(services.iter().any(|s| s.pid == outside.0.id()));
     assert!(services.iter().any(|s| s.pid == from_terminal.0.id()));

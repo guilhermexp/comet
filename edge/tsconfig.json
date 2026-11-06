@@ -24,6 +24,18 @@
   // the tree but dormant — outside index.ts's graph and outside typecheck
   // (they need Env bindings/auth kinds the fork's runtime does not have).
   "exclude": [
+    "src/card*",
+    "src/earned-badges*",
+    "src/user-*",
+    "src/username*",
+    "src/onboarding-*",
+    "src/plugin-keys*",
+    "src/device-link*",
+    "src/step-up*",
+    "src/image-check*",
+    "src/names*",
+    "src/png*",
+
     "src/cloud/**",
     "src/runner-*.ts",
     "src/registry-runner.ts",

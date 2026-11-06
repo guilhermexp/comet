@@ -209,6 +209,9 @@ fn rig() -> Rig {
 
 fn request(prompt: &str) -> RunRequest {
     RunRequest {
+        access: Default::default(),
+        extra_mcp: Default::default(),
+        plan: Default::default(),
         mcp: None,
         enable_workers_mcp: true,
         workers_parent_chat_id: Some(CHAT.into()),

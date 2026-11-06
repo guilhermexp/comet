@@ -395,16 +395,46 @@ pub async fn connect_ipc(
     port: u16,
     data_dir: Option<&std::path::Path>,
 ) -> Result<RpcClient, RpcError> {
-    connect_ipc_url(&format!("ws://127.0.0.1:{port}"), data_dir).await
+    connect_ipc_with(port, data_dir, crate::ipc_auth::client_tokens(data_dir)).await
 }
 
-/// [`connect_ipc`] for a full engine IPC URL (the fork's Workers and chat
-/// MCP servers receive the endpoint, not the port).
+/// [`connect_ipc`] for an agent's `zeron mcp` server: with the agent-scoped
+/// token only — `$ZERON_IPC_TOKEN_FILE` (what the engine hands it), else
+/// `{data_dir}/ipc-token-agent` (a `zeron mcp` someone configured by hand).
+/// Never the app's full token, so whatever runs the server reaches only
+/// what its tools need ([`crate::agent_allowed`]).
+pub async fn connect_ipc_as_agent(
+    port: u16,
+    data_dir: Option<&std::path::Path>,
+) -> Result<RpcClient, RpcError> {
+    connect_ipc_with(
+        port,
+        data_dir,
+        crate::ipc_auth::agent_client_tokens(data_dir),
+    )
+    .await
+}
+
+async fn connect_ipc_with(
+    port: u16,
+    data_dir: Option<&std::path::Path>,
+    tokens: Vec<String>,
+) -> Result<RpcClient, RpcError> {
+    connect_ipc_tokens(&format!("ws://127.0.0.1:{port}"), data_dir, tokens).await
+}
+
 pub async fn connect_ipc_url(
     url: &str,
     data_dir: Option<&std::path::Path>,
 ) -> Result<RpcClient, RpcError> {
-    let tokens = crate::ipc_auth::client_tokens(data_dir);
+    connect_ipc_tokens(url, data_dir, crate::ipc_auth::client_tokens(data_dir)).await
+}
+
+async fn connect_ipc_tokens(
+    url: &str,
+    data_dir: Option<&std::path::Path>,
+    tokens: Vec<String>,
+) -> Result<RpcClient, RpcError> {
     if tokens.is_empty() {
         return connect_ws(url, None).await;
     }
@@ -457,6 +487,17 @@ async fn dial(url: &str, token: Option<&str>) -> Result<RpcClient, DialError> {
         let value =
             HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| DialError::Malformed)?;
         request.headers_mut().insert(header::AUTHORIZATION, value);
+    }
+    // An agent's MCP server says which chat it serves, for the engine's
+    // record of who asked (claimed, never an authority).
+    if let Some(chat) = std::env::var("ZERON_CHAT_ID")
+        .ok()
+        .filter(|c| !c.is_empty())
+        && let Ok(value) = HeaderValue::from_str(&chat)
+    {
+        request
+            .headers_mut()
+            .insert(crate::ipc_auth::CHAT_HEADER, value);
     }
     let (ws, _) = tokio::time::timeout(
         CONNECT_TIMEOUT,

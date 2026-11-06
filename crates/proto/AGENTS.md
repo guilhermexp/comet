@@ -14,6 +14,11 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 
 - `context_breakdown` defines optional ephemeral `GetChatContextBreakdown` metadata, explicit availability and native provenance. Nested category attribution and deferred tools never add active budget; missing cells/lists are not zero. `TurnMetrics.model_timing_incomplete` is defaulted for old peers and invalidates partial native model-time sums, independently of auxiliary cache/cost metrics. Detailed inspection never enters synced documents. Native metadata preserves complete identity/lifecycle, nullable local-change evidence, signed BPE residual and separate historical provider/transcript indices; unknown is never inferred false/zero.
 
+- `ZGX_INTERFACE_V1` é constante de compatibilidade, mas fica fora de `capabilities::CURRENT` no fork: a engine D1a serve plugins/templates sem prometer a interface zgx ausente; esses clientes chamam RPC diretamente e não há capability independente. `BACKGROUND_TASKS_V1` continua anunciado.
+
+- Sync `35561ead`: `AccessMode`/`ChatConfig.access`/`plan`, `RunRequest.extra_mcp`, `Chat.childKind`, `Session.backgroundTasks` e tail/exit code de tool são aditivos com defaults. `childKind` não reparenta: `originChatId` e `parentChatId` continuam fatos independentes. `HarnessId::ALL` conserva OMP/Kimi e acrescenta Fx; identidades ACP registry mantêm validação estrita.
+- Dois contratos de criação coexistem: `CreateWorkspaceEntryRequest` é o legado do fork (`parentPath/name`); `CreateWorkspaceEntryMutationRequest` nomeia o contrato `operationId/path/expectedCheckoutId` do upstream. Ambos usam o mesmo nome RPC, discriminados por `operationId`.
+
 - `ListDevServersParams.chatId` e `DevServer.previewEligible` são opcionais/default None; dados antigos não prometem elegibilidade. `preview_visible_to_chat` é o predicado compartilhado de device/ownership e Chat-origem OU project cwd exato, usado no watch e na elegibilidade host-side. Não altera autorização de proxy nem persistência Loro.
 - `Chat.workedProjects` é opcional: ausência é desconhecida, não uma lista vazia confirmada. `ChatWorkedProjects` contém IDs de Space em ordem, `complete` e `historyVersion` opcional opaca (`Vec<u8>`); proto não interpreta Loro. `EnsureChatWorkedProjects` recebe `chatIds` para o host, sem abrir streams por row.
 

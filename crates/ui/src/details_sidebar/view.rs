@@ -4278,6 +4278,10 @@ mod tests {
             id: "m1".to_string(),
             role: MessageRole::Assistant,
             parts: vec![MessagePart::Tool {
+                exit_code: Default::default(),
+                output_truncated: Default::default(),
+                output_lines: Default::default(),
+
                 id: "t1".to_string(),
                 call: ToolCall::ReadFile {
                     path: "/tmp/proj1/file.rs".to_string(),
@@ -4369,6 +4373,10 @@ mod tests {
             panic!("fixture must start with a tool part");
         };
         streaming[0].parts.push(MessagePart::Tool {
+            exit_code: Default::default(),
+            output_truncated: Default::default(),
+            output_lines: Default::default(),
+
             id: "t2".to_string(),
             call: ToolCall::ReadFile {
                 path: "/tmp/proj2/other.rs".to_string(),

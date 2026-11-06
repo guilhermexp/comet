@@ -34,6 +34,10 @@ fn todo(done: bool) -> SessionMessageEntry {
         id: "fixture-message".into(),
         role: MessageRole::Assistant,
         parts: vec![MessagePart::Tool {
+            exit_code: Default::default(),
+            output_truncated: Default::default(),
+            output_lines: Default::default(),
+
             id: "fixture-todo".into(),
             call: ToolCall::Todo {
                 items: vec![

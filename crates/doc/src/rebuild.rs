@@ -198,6 +198,9 @@ mod tests {
                     subagent_status: None,
                     subagent_tail: None,
                     subagent_end: None,
+                    exit_code: None,
+                    output_truncated: false,
+                    output_lines: None,
                 },
             ],
             created_at: 5,
@@ -307,6 +310,10 @@ mod tests {
         let source = SessionDoc::init("chat-file").unwrap();
         let mut entry = fat_entry("m-file");
         entry.parts = vec![MessagePart::Tool {
+            exit_code: Default::default(),
+            output_lines: Default::default(),
+            output_truncated: Default::default(),
+
             id: "edit-1".into(),
             call: ToolCall::EditFile {
                 path: "src/main.rs".into(),

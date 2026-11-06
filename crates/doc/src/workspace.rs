@@ -306,6 +306,11 @@ impl WorkspaceDoc {
         set_opt_ms(&row, "lastSeenAt", chat.last_seen_at)?;
         set_opt_str(&row, "parentChatId", chat.parent_chat_id.as_deref())?;
         set_opt_str(&row, "originChatId", chat.origin_chat_id.as_deref())?;
+        set_opt_str(
+            &row,
+            "childKind",
+            chat.child_kind.map(zeron_proto::ChildKind::as_str),
+        )?;
         self.doc.commit();
         Ok(())
     }
@@ -730,13 +735,21 @@ pub(crate) struct RawSpace {
     #[serde(default)]
     repository_id: Option<String>,
     github_repo: Option<String>,
+    /// (Read leniently: a malformed icon is no icon, never a lost row.)
+    #[serde(default)]
+    icon: Option<serde_json::Value>,
     #[serde(default)]
     created_at: i64,
 }
 
 impl From<RawSpace> for Space {
     fn from(raw: RawSpace) -> Self {
+        let icon = raw
+            .icon
+            .and_then(|v| serde_json::from_value::<zeron_proto::SpaceIcon>(v).ok())
+            .and_then(|icon| icon.normalized().ok().flatten());
         Space {
+            icon,
             id: raw.id,
             device_id: raw.device_id,
             path: raw.path,
@@ -799,6 +812,9 @@ pub(crate) struct RawChat {
     #[serde(default)]
     parent_chat_id: Option<String>,
     origin_chat_id: Option<String>,
+    /// LENIENT, as `config`: a kind from a newer peer reads as none.
+    #[serde(default, deserialize_with = "zeron_proto::lenient_child_kind")]
+    child_kind: Option<zeron_proto::ChildKind>,
 }
 
 // Optional derived metadata must not hide the Chat, and malformed evidence
@@ -888,6 +904,7 @@ impl From<RawChat> for Chat {
             room_gen: raw.room_gen,
             parent_chat_id: raw.parent_chat_id,
             origin_chat_id: raw.origin_chat_id,
+            child_kind: raw.child_kind,
         }
     }
 }
@@ -914,6 +931,8 @@ pub(crate) struct RawSession {
     context_window: Option<i64>,
     #[serde(default)]
     running_subagents: u32,
+    #[serde(default)]
+    background_tasks: Vec<zeron_proto::BackgroundTask>,
 }
 
 impl From<RawSession> for Session {
@@ -942,6 +961,7 @@ impl From<RawSession> for Session {
             last_turn_outcome: raw.last_turn_outcome,
             terminal_activity: raw.terminal_activity,
             running_subagents: raw.running_subagents,
+            background_tasks: raw.background_tasks,
         }
     }
 }
@@ -1014,6 +1034,8 @@ mod tests {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
+                access: Default::default(),
+                plan: false,
             }),
             last_message_preview: None,
             last_message_at: None,
@@ -1022,6 +1044,7 @@ mod tests {
             harness_session_cwd: None,
             harness_session_harness: None,
             parent_chat_id: Some("parent-chat".into()),
+            child_kind: None,
             space_id: None,
             last_seen_at: None,
             room_gen: None,
@@ -1117,6 +1140,7 @@ mod tests {
             checkout_id: None,
             repository_id: None,
             github_repo: None,
+            icon: None,
             created_at: ts(1_500),
         }
     }
@@ -1135,6 +1159,7 @@ mod tests {
             last_turn_outcome: None,
             terminal_activity: None,
             running_subagents: 0,
+            background_tasks: Vec::new(),
         }
     }
 
@@ -1179,6 +1204,8 @@ mod tests {
             reasoning: Some(zeron_proto::ReasoningLevel::XHigh),
             model_options: options,
             sandbox: SandboxLevel::WorkspaceWrite,
+            access: Default::default(),
+            plan: false,
         };
         assert!(ws.set_chat_config("chat-1", &config).unwrap());
         let row = ws.chat("chat-1").unwrap().expect("row exists");
@@ -1222,6 +1249,19 @@ mod tests {
             .delete("lastCompletedTurn")
             .unwrap();
         assert_eq!(ws.read_sessions().unwrap()[0].last_completed_turn, None);
+    }
+
+    #[test]
+    fn a_child_kind_round_trips() {
+        let ws = WorkspaceDoc::new();
+        let mut sub = chat("chat-1", "dev-a");
+        sub.child_kind = Some(zeron_proto::ChildKind::Subagent);
+        ws.upsert_chat(&sub).unwrap();
+        assert_eq!(ws.chat("chat-1").unwrap(), Some(sub.clone()));
+        // Cleared by a full-row upsert without one.
+        sub.child_kind = None;
+        ws.upsert_chat(&sub).unwrap();
+        assert_eq!(ws.chat("chat-1").unwrap().unwrap().child_kind, None);
     }
 
     #[test]
@@ -1552,6 +1592,8 @@ mod partial_context_tests {
         ] {
             let doc = WorkspaceDoc::new();
             let mut row = Session {
+                background_tasks: Default::default(),
+
                 chat_id: "chat".into(),
                 device_id: "device".into(),
                 status: SessionStatus::Idle,

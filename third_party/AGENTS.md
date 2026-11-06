@@ -23,6 +23,8 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
 
 ## Local Contracts
 
+- Sync `35561ead` porta zui `361ff20..b564a34` em `.tmp/zui-source` e importa o snapshot com proveniência em `zui-upstream.toml`. As APIs de dma-buf/pixel atlas e frame callbacks entram sem perder vidro macOS, headless ou as duas regras de pontuação. Formatar na fonte separada e preservar symlinks de licença; `vendored_tree` deve coincidir com a árvore Git final, incluindo modos.
+
 - **`unpeel/` não é submódulo.** `.gitmodules` e o gitlink foram removidos no
   commit `216b61e8`; clone, worktree e CI recebem os arquivos diretamente. Não
   executar `git submodule` para este path.
@@ -135,11 +137,11 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
   projeção de descriptors/ícones para o catálogo Swift gerado; não roda Cargo.
   `bun run validate:runtimes` acrescenta
   `cargo test --manifest-path crates/Cargo.toml -p unpeel-core runtime_catalog`,
-  então a validação combinada local roda dentro de
-  `scripts/cargo-verify.py -- bun run --cwd third_party/unpeel validate:runtimes`.
+  então a validação combinada local usa
+  `bun run --cwd third_party/unpeel validate:runtimes`, com target exclusivo, jobs=2
+  e sccache conforme o AGENTS.md raiz.
   Mudanças Rust-only em adapters não alteram o catálogo Swift nem exigem
-  geração: rode apenas filtros Rust focados através de uma única invocação do
-  wrapper. Se `check:runtimes` encontrar drift, compare a projeção esperada com
+  geração: rode apenas filtros Rust focados com Cargo nativo. Se `check:runtimes` encontrar drift, compare a projeção esperada com
   os descriptors/ícones canônicos; atualize o Swift rastreado somente quando
   ele estiver realmente desatualizado. Em 2026-10-08, foi corrigido um drift
   preexistente no catálogo Swift (reliability de atenção de Pi/OMP/Prime e
@@ -205,22 +207,21 @@ Código externo fixado dentro do repositório e referências locais de pesquisa.
 | Camada / path | Tier exigido | Como rodar |
 |---|---|---|
 | `third_party/unpeel/scripts/generate-runtime-client-catalog.mjs` + `third_party/unpeel/apps/shared/UnpeelShared/Sources/UnpeelShared/GeneratedRuntimeCatalog.swift` | unit — projeção determinística de descriptors/ícones; sem Cargo | `bun run --cwd "$PWD/third_party/unpeel" check:runtimes` |
-| `third_party/unpeel/runtimes/**` + `crates/unpeel-core/src/session_telemetry.rs` | unit + integration downstream — parser/provider fixtures, trusted path e Host wire | `scripts/cargo-verify.py -- bash -c 'cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core && cargo test -p zeron-workers-unpeel'` |
-| `third_party/unpeel/crates/unpeel-core/src/{session_host,session_ops}.rs` + `crates/unpeel-host/tests/agent_restart_process.rs` (15) | integration — protocolo real do Host, incluindo invalidação de hibernação por input/output, janela de quietude e o caminho aceito | `scripts/cargo-verify.py -- cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-host --test agent_restart_process` |
+| `third_party/unpeel/runtimes/**` + `crates/unpeel-core/src/session_telemetry.rs` | unit + integration downstream — parser/provider fixtures, trusted path e Host wire | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core` · `cargo test -p zeron-workers-unpeel` |
+| `third_party/unpeel/crates/unpeel-core/src/{session_host,session_ops}.rs` + `crates/unpeel-host/tests/agent_restart_process.rs` (15) | integration — protocolo real do Host, incluindo invalidação de hibernação por input/output, janela de quietude e o caminho aceito | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-host --test agent_restart_process` |
+| `third_party/unpeel/crates/unpeel-core/src/platform.rs` + consumidores de lock/atividade em `crates/workers-unpeel` | unit Linux + compile Windows; execução nativa Windows exige runner próprio | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core --lib platform::tests` · `cargo test -p zeron-workers-unpeel` · `cargo check --locked --target x86_64-pc-windows-gnu -p zeron-harness -p zeron-engine` |
+| `third_party/unpeel/crates/unpeel-core/src/browser_mcp.rs` (limpeza após PID desaparecer; erro de permissão preserva artefatos) | unit Linux + política portátil; UI/engine Browser nativa é prova separada | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core` |
 | `third_party/cmux` | none — referência local untracked | — |
 | `third_party/rust/*` | integration — compatibilidade transitiva do build macOS | `cargo check -p zeron-ui --message-format short` |
 | `third_party/zui` | unit no vendor (API de blur e ambas as regras de pontuação) + compile downstream da API de glifo transformado | `cargo test --manifest-path third_party/zui/Cargo.toml -p gpui_macos --features runtime_shaders --lib window_blur_` · `cargo test --manifest-path third_party/zui/Cargo.toml -p gpui --features gpui_platform/runtime_shaders --lib closing_punctuation_attached` · `cargo build -p zeron` |
 | `third_party/zui/crates/gpui_macos/tests/window_glass_backing.rs` | integration — setters reais, configuração/ordem nativa, reutilização, resize e limpeza; main thread AppKit | `cargo test --manifest-path third_party/zui/Cargo.toml -p gpui_macos --features runtime_shaders --test window_glass_backing` (macOS com sessão gráfica; no CI `ui-tests.yml`, build `--no-run` e execução em bundle isolado com timeout, exit zero e marcador PASS obrigatório) |
 | Estabilidade óptica do vidro durante repaint | none — asserções AppKit não comprovam desaparecimento das ondas; comparação headed no mesmo desktop é evidência separada | Captura/comparação do vidro real sem trocar wallpaper ou preferências do usuário |
 
-### Limitação de plataforma observada (CI 2026-10-19)
+### Compatibilidade de plataforma (CI 2026-11-05)
 
-`native-platform-check (windows-latest)` no run39189505816/HEAD9e1a6b74 falhou
-em `unpeel-core` com51 diagnósticos de APIs Unix (fd/flock/mode/attach_ready_path
-entre outros). `third_party/unpeel` tem a mesma árvore Git `a59bca0a6931665574af47e635d5af09a7a47630`
-na baseline e750f810 e nesse HEAD; a incompatibilidade é preexistente e está fora
-do escopo da integração. Não desabilitar o check nem portar o vendor como parte
-desse closeout. Log/hash e limites de comprovação: `.tmp/reports/ci-20261019.md`.
+A limitação registrada em 2026-10-19 (`.tmp/reports/ci-20261019.md`) é histórica; o brief round2 autorizou a portabilidade real. `unpeel-core::platform` preserva flock/0600 no Unix e implementa LockFileEx, DACL por SID, rename durável e handles de processo no Windows; os consumidores Comet usam o mesmo seam. Adapters de hooks, socket/FIFO e Host PTY Unix conservam cfg e recusa explícita onde não há transporte Windows. O cross-check deve selecionar exatamente `zeron-harness` e `zeron-engine`, como native-platform-check; compilar preview sozinho não basta. Cross-check não prova execução/GUI no Windows.
+
+Compilar a biblioteca não prova `unpeel-core --tests` no Windows: fixtures de Host/socket/hooks e helpers de transcript ainda referenciam símbolos Unix indisponíveis nessa configuração. A regressão nova de substituição do inode executável é `cfg(unix)` por verificar permissões POSIX; não desabilitar testes neutros nem o módulo inteiro para ocultar os demais erros. A revisão OpenQodex da rodada 2 registra o teste Linux, o check Windows com `--tests` e a lista de diagnósticos remanescentes no relatório.
 
 ## Child DOX Index
 

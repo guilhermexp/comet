@@ -2211,9 +2211,16 @@ timeout = 5
         assert!(updated.contains("command = \"prettier\""));
         assert!(!updated.contains("kimi-hook.sh\\\" old"));
         assert_eq!(updated.matches("[[hooks]]").count(), 10);
+        let script = crate::app_paths::app_hooks_root().join("kimi-hook.sh");
         assert_eq!(
-            updated
-                .matches("/.zeron/workers/hooks/kimi-hook.sh")
+            parsed["hooks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|hook| hook
+                    .get("command")
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(|command| command.contains(script.to_string_lossy().as_ref())))
                 .count(),
             9
         );
@@ -2428,6 +2435,37 @@ timeout = 5
         assert!(super::GROK_COMMAND_WRAPPER_SCRIPT.contains("GROK_CLAUDE_HOOKS_ENABLED=false"));
         assert!(super::GROK_COMMAND_WRAPPER_SCRIPT.contains("GROK_CURSOR_HOOKS_ENABLED=false"));
         assert!(super::GROK_COMMAND_WRAPPER_SCRIPT.contains("disable_compat_vendor_hooks"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_script_replacement_preserves_the_published_inode() {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("wrapper");
+        let original = "#!/bin/sh\nprintf old\n";
+        let replacement = "#!/bin/sh\nprintf new\n";
+        super::write_executable_script(&path, original, "original wrapper").unwrap();
+        let mut executing = fs::File::open(&path).unwrap();
+        super::write_executable_script(&path, replacement, "replacement wrapper").unwrap();
+        let mut retained = String::new();
+        executing.read_to_string(&mut retained).unwrap();
+        assert_eq!(
+            retained, original,
+            "published scripts must never be truncated in place"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), replacement);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::read_dir(root.path()).unwrap().count(),
+            1,
+            "no staging file leaks"
+        );
     }
 
     #[test]

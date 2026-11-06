@@ -422,19 +422,32 @@ pub(crate) fn write_executable_script(
         fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create {} dir {}: {e}", label, parent.display()))?;
     }
-    fs::write(path, contents).map_err(|e| format!("Failed to write {label}: {e}"))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(path)
-            .map_err(|e| format!("Failed to stat {label}: {e}"))?
-            .permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(path, perms).map_err(|e| format!("Failed to chmod {label}: {e}"))?;
+    // Never open the published executable for writing: another Host may
+    // execute it while assets are refreshed. Publish only a complete, closed
+    // inode; UUID staging names also keep concurrent writers independent.
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let temporary = path.with_file_name(format!(".{name}.unpeel-tmp.{}", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|e| format!("Failed to stage {label}: {e}"))?;
+        file.write_all(contents.as_bytes())
+            .map_err(|e| format!("Failed to write {label}: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("Failed to chmod {label}: {e}"))?;
+        }
+        drop(file);
+        fs::rename(&temporary, path).map_err(|e| format!("Failed to publish {label}: {e}"))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
-
-    Ok(())
+    result
 }
 
 pub(crate) fn ensure_project_exclude_entry(cwd: &str, entry: &str) {
@@ -467,6 +480,7 @@ pub(crate) fn notify_hook_script_path() -> PathBuf {
 // adapter, but these functions were already part of `unpeel_core::hook_assets`.
 // Keep their paths stable for downstream callers while new integrations call
 // the package-local setup modules directly.
+#[cfg(unix)]
 pub use crate::integrations::{
     amp::setup::{install_amp_plugin, prepare_amp_project_plugin},
     claude::setup::{claude_mcp_config_path, claude_unpeel_mcp_config_path, install_claude_hooks},
@@ -485,7 +499,7 @@ pub use crate::integrations::{
     opencode::setup::{install_opencode_plugin, opencode_config_dir},
 };
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use crate::integrations::{
     claude::setup::{
         build_hook_entry, claude_hook_script_path, is_stale_unpeel_claude_hook,

@@ -61,10 +61,13 @@ fn run_request(prompt: &str) -> RunRequest {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        access: Default::default(),
+        plan: false,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
         env: Default::default(),
+        extra_mcp: Vec::new(),
     }
 }
 
@@ -457,6 +460,7 @@ async fn open_tool_call_never_quiesces() {
             output: None,
             diff: None,
             execution: None,
+            exit_code: None,
         })
         .unwrap();
     rig.feed.send(text("Build done.")).unwrap();
@@ -498,6 +502,7 @@ async fn stale_tool_echo_stays_parked() {
             output: None,
             diff: None,
             execution: None,
+            exit_code: None,
         })
         .unwrap();
     rig.feed

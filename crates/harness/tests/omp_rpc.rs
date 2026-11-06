@@ -60,6 +60,10 @@ fn fake_harness(scenario: &str) -> OmpHarness {
 
 fn request(prompt: &str) -> RunRequest {
     RunRequest {
+        access: Default::default(),
+        extra_mcp: Default::default(),
+        plan: Default::default(),
+
         prompt: prompt.to_owned(),
         harness: Some(HarnessId::Omp),
         model: None,
@@ -458,6 +462,37 @@ async fn commands_are_discovered_from_the_rpc_runtime() {
 }
 
 #[test]
+fn omp_runtime_identity_preserves_access_boundary() {
+    let harness = fake_harness("normal");
+    let live = request("hello");
+    assert_eq!(
+        harness.access_modes(),
+        &[zeron_proto::AccessMode::FullAccess]
+    );
+    assert!(!harness.supports_plan());
+    assert!(harness.same_runtime(&live, &request("next prompt")));
+
+    let mut access_changed = live.clone();
+    access_changed.access = zeron_proto::AccessMode::Supervised;
+    assert!(
+        !harness.same_runtime(&live, &access_changed),
+        "access changes must retire the old runtime"
+    );
+}
+
+#[test]
+fn omp_runtime_identity_preserves_plan_boundary() {
+    let harness = fake_harness("normal");
+    let live = request("hello");
+    let mut plan_changed = live.clone();
+    plan_changed.plan = true;
+    assert!(
+        !harness.same_runtime(&live, &plan_changed),
+        "plan changes must retire the old runtime"
+    );
+}
+
+#[test]
 fn omp_runtime_identity_tracks_host_tool_grants_but_ignores_codex_mcp() {
     let harness = fake_harness("normal");
     let live = request("hello");
@@ -532,6 +567,8 @@ fn normalizer_maps_text_reasoning_and_tools() {
             "isError": false
         })),
         vec![AgentEvent::ToolResult {
+            exit_code: Some(0),
+
             id: "tool-1".into(),
             is_error: false,
             output: Some("ok".into()),
@@ -560,6 +597,7 @@ fn normalizer_maps_text_reasoning_and_tools() {
             output,
             diff,
             execution,
+            ..
         },
     ] = &edited[..]
     else {

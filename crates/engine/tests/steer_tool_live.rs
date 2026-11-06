@@ -117,6 +117,8 @@ async fn steering_never_aborts_a_running_tool() {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::DangerFullAccess,
+                access: Default::default(),
+                plan: false,
             },
         )
         .unwrap();
@@ -153,6 +155,8 @@ async fn steering_never_aborts_a_running_tool() {
                     cwd: cwd.clone(),
                     sandbox: SandboxLevel::DangerFullAccess,
                     auto_approve: true,
+                    access: Default::default(),
+                    plan: false,
                     attachments: vec![],
                     worktree: None,
                     resume: None,
@@ -160,6 +164,7 @@ async fn steering_never_aborts_a_running_tool() {
                     workers_parent_chat_id: None,
                     sessions: None,
                     env: Default::default(),
+                    extra_mcp: Vec::new(),
                 },
             },
         )

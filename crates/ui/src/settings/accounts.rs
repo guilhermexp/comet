@@ -1116,6 +1116,11 @@ impl AccountsPage {
         cx.notify();
     }
 
+    /// Whether a dialog [`Self::dismiss_on_escape`] would close is open.
+    pub(crate) fn has_escape_surface(&self) -> bool {
+        self.api_key.is_some() || self.login.is_some()
+    }
+
     /// Escape that reached Settings unclaimed cancels an open login first,
     /// so it never closes Settings under the dialog. Returns whether it did.
     pub(crate) fn dismiss_on_escape(&mut self, cx: &mut Context<Self>) -> bool {
@@ -1421,7 +1426,6 @@ impl AccountsPage {
                     account
                         .usage_windows
                         .iter()
-                        .take(2)
                         .map(|window| render_usage_meter(window, theme)),
                 )
                 .into_any_element()
@@ -2485,6 +2489,8 @@ pub fn accessibility_fixture(embedded: bool, cx: &mut Context<AccountsPage>) -> 
         AccountsPage::new(state, cx)
     };
     let account = |id: &str, harness, provider: Option<&str>| AgentAccount {
+        codex_reset_credits: Default::default(),
+
         id: id.into(),
         harness,
         email: Some(format!("{id}@example.invalid")),
@@ -2744,6 +2750,7 @@ mod tests {
             switchable: true,
             saved_at: None,
             provider: provider.map(str::to_string),
+            codex_reset_credits: None,
         };
         let mut snapshot = AgentAccountsSnapshot {
             accounts: vec![
@@ -2792,6 +2799,7 @@ mod tests {
 
     fn poll(status: AgentLoginStatus, message: Option<&str>, url: Option<&str>) -> AgentLoginPoll {
         AgentLoginPoll {
+            code: None,
             status,
             message: message.map(str::to_string),
             url: url.map(str::to_string),
@@ -2897,6 +2905,7 @@ mod tests {
             switchable,
             saved_at: None,
             provider: Some("openai".into()),
+            codex_reset_credits: None,
         };
         window
             .update(cx, |page, _, cx| {
@@ -2972,6 +2981,7 @@ mod tests {
                         saved_at: None,
                         provider: None,
                         usage_lines: Vec::new(),
+                        codex_reset_credits: None,
                     }],
                     warnings: vec![],
                 });
@@ -3047,6 +3057,7 @@ mod tests {
             active,
             usage_windows: vec![],
             usage_lines: vec![],
+            codex_reset_credits: None,
             usage_fetched_at: None,
             usage_error: None,
             display_name: None,

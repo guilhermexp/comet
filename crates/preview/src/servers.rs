@@ -410,6 +410,8 @@ pub fn stop(pid: u32, started_at: u64, root: &str) -> anyhow::Result<Vec<u32>> {
     let root = roots
         .first()
         .ok_or_else(|| anyhow::anyhow!("no project root"))?;
+    #[cfg(windows)]
+    let mut captured = HashMap::from([(pid, capture_windows_process(pid))]);
     anyhow::ensure!(
         discovery::same_process(pid, started_at),
         "that server already exited"
@@ -434,6 +436,10 @@ pub fn stop(pid: u32, started_at: u64, root: &str) -> anyhow::Result<Vec<u32>> {
         if parent <= 1 || parent == me {
             break;
         }
+        #[cfg(windows)]
+        captured
+            .entry(parent)
+            .or_insert_with(|| capture_windows_process(parent));
         let Some((_, command)) = process_info(parent) else {
             break;
         };
@@ -444,21 +450,580 @@ pub fn stop(pid: u32, started_at: u64, root: &str) -> anyhow::Result<Vec<u32>> {
         current = parent;
     }
     // Launchers first, so none of them restarts the listener in between.
+    #[cfg(unix)]
     for target in targets.iter().rev() {
         unsafe {
             libc::kill(*target as libc::pid_t, libc::SIGTERM);
         }
     }
+    #[cfg(windows)]
+    terminate_windows_tree(&targets, captured)?;
     Ok(targets)
+}
+
+/// Handles are captured before stop revalidates each target's metadata. Reading
+/// creation from this same retained handle cannot switch to a recycled PID.
+#[cfg(windows)]
+struct WindowsProcess {
+    handle: std::os::windows::io::OwnedHandle,
+    created: u64,
+}
+
+#[cfg(windows)]
+fn capture_windows_process(pid: u32) -> std::io::Result<Option<WindowsProcess>> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+            0,
+            pid,
+        )
+    };
+    if handle.is_null() {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    // SAFETY: OpenProcess returned a valid, uniquely owned handle.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    let (mut start, mut exit, mut kernel, mut user) = (
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+    );
+    if unsafe {
+        GetProcessTimes(
+            handle.as_raw_handle(),
+            &mut start,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(Some(WindowsProcess {
+        handle,
+        created: (u64::from(start.dwHighDateTime) << 32) | u64::from(start.dwLowDateTime),
+    }))
+}
+
+/// Stop only the validated launchers and listener's own descendants. Existing
+/// servers were not spawned in our jobs; ToolHelp supplies candidate edges,
+/// while retained handles and parent/child creation checks authorize children.
+#[cfg(windows)]
+fn terminate_windows_tree(
+    targets: &[u32],
+    mut captured: HashMap<u32, std::io::Result<Option<WindowsProcess>>>,
+) -> std::io::Result<()> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE, STILL_ACTIVE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, TerminateProcess};
+
+    let snapshot = (|| {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the snapshot is valid and closed exactly once by OwnedHandle.
+        let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut next = unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) };
+        while next != 0 {
+            children
+                .entry(entry.th32ParentProcessID)
+                .or_default()
+                .push(entry.th32ProcessID);
+            next = unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) };
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
+            return Err(error);
+        }
+        Ok(children)
+    })();
+    terminate_selected_tree(
+        targets,
+        snapshot,
+        |pid| {
+            // Explicit targets must use the handles captured during validation.
+            // A failed capture must not reopen a possibly recycled PID.
+            if targets.contains(&pid) {
+                captured
+                    .remove(&pid)
+                    .expect("validated target was captured")
+            } else {
+                capture_windows_process(pid)
+            }
+        },
+        |process| Ok(process.created),
+        |process| {
+            if unsafe { TerminateProcess(process.handle.as_raw_handle(), 1) } == 0 {
+                let error = std::io::Error::last_os_error();
+                let mut exit = 0;
+                if unsafe { GetExitCodeProcess(process.handle.as_raw_handle(), &mut exit) } == 0
+                    || exit == STILL_ACTIVE as u32
+                {
+                    return Err(error);
+                }
+            }
+            Ok(())
+        },
+    )
+}
+
+/// Share selection and termination with portable fake-handle tests. `targets`
+/// is listener-first; only that listener's subtree is expanded. `open` accepts
+/// PIDs, but creation and termination always use the same retained handles.
+#[cfg(any(windows, test))]
+fn terminate_selected_tree<H>(
+    targets: &[u32],
+    children: std::io::Result<HashMap<u32, Vec<u32>>>,
+    mut open: impl FnMut(u32) -> std::io::Result<Option<H>>,
+    mut created: impl FnMut(&H) -> std::io::Result<u64>,
+    mut terminate: impl FnMut(&H) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut first_error = None;
+    let mut record_error = |pid, operation, error: std::io::Error| {
+        tracing::warn!(pid, operation, %error, "failed to stop part of a server process tree");
+        first_error.get_or_insert(error);
+    };
+    let mut tree = Vec::new();
+    let mut launchers = Vec::new();
+    let mut last_child_start = None;
+    let mut seen = std::collections::HashSet::new();
+    for (index, &pid) in targets.iter().enumerate() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        let handle = match open(pid) {
+            Ok(Some(handle)) => handle,
+            Ok(None) => continue,
+            Err(error) => {
+                record_error(pid, "open", error);
+                continue;
+            }
+        };
+        let start = match created(&handle) {
+            Ok(start) => start,
+            Err(error) => {
+                record_error(pid, "read creation", error);
+                continue;
+            }
+        };
+        // A newer launcher cannot be the captured child's original parent.
+        if index > 0 && last_child_start.is_some_and(|child| start > child) {
+            record_error(
+                pid,
+                "validate creation",
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "launcher is newer than its captured child",
+                ),
+            );
+            continue;
+        }
+        last_child_start = Some(start);
+        if index == 0 {
+            tree.push((pid, start, handle));
+        } else {
+            launchers.push((pid, start, handle));
+        }
+    }
+    let children = match children {
+        Ok(children) => children,
+        Err(error) => {
+            record_error(
+                targets.first().copied().unwrap_or_default(),
+                "snapshot",
+                error,
+            );
+            HashMap::new()
+        }
+    };
+    let mut index = 0;
+    while index < tree.len() {
+        let (parent, start, _) = &tree[index];
+        let (parent, start) = (*parent, *start);
+        for &child in children.get(&parent).into_iter().flatten() {
+            if !seen.insert(child) {
+                continue;
+            }
+            let handle = match open(child) {
+                Ok(Some(handle)) => handle,
+                Ok(None) => continue,
+                Err(error) => {
+                    record_error(child, "open", error);
+                    continue;
+                }
+            };
+            let child_start = match created(&handle) {
+                Ok(start) => start,
+                Err(error) => {
+                    record_error(child, "read creation", error);
+                    continue;
+                }
+            };
+            if child_start >= start {
+                tree.push((child, child_start, handle));
+            }
+        }
+        index += 1;
+    }
+    // Launchers first without expanding their other branches; then the
+    // listener and its descendants, parent-first. Never terminate by bare PID.
+    for (pid, _, process) in launchers.into_iter().rev().chain(tree) {
+        if let Err(error) = terminate(&process) {
+            record_error(pid, "terminate", error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    struct CapturedProcess {
+        pid: u32,
+        created: u64,
+        identity: u64,
+    }
+
+    #[derive(Default)]
+    struct FakeProcessTree {
+        missing: std::collections::HashSet<u32>,
+        open_errors: HashMap<u32, std::io::ErrorKind>,
+        creation_errors: HashMap<u32, std::io::ErrorKind>,
+        termination_errors: HashMap<u32, std::io::ErrorKind>,
+        opened: Vec<u32>,
+        terminated: Vec<u32>,
+    }
+
+    impl FakeProcessTree {
+        fn process(pid: u32) -> CapturedProcess {
+            CapturedProcess {
+                pid,
+                created: u64::from(pid),
+                identity: 1000 + u64::from(pid),
+            }
+        }
+
+        fn stop(&mut self, children: &[(u32, Vec<u32>)]) -> std::io::Result<()> {
+            self.stop_targets(&[10], children)
+        }
+
+        fn stop_targets(
+            &mut self,
+            targets: &[u32],
+            children: &[(u32, Vec<u32>)],
+        ) -> std::io::Result<()> {
+            let state = RefCell::new(self);
+            terminate_selected_tree(
+                targets,
+                Ok(children.iter().cloned().collect()),
+                |pid| {
+                    let mut state = state.borrow_mut();
+                    if !targets.contains(&pid) {
+                        state.opened.push(pid);
+                    }
+                    if state.missing.contains(&pid) {
+                        return Ok(None);
+                    }
+                    if let Some(&kind) = state.open_errors.get(&pid) {
+                        return Err(std::io::Error::new(kind, format!("open {pid}")));
+                    }
+                    Ok(Some(Self::process(pid)))
+                },
+                |handle| {
+                    if let Some(&kind) = state.borrow().creation_errors.get(&handle.pid) {
+                        return Err(std::io::Error::new(
+                            kind,
+                            format!("creation {}", handle.pid),
+                        ));
+                    }
+                    Ok(handle.created)
+                },
+                |handle| {
+                    // A PID alone is not an identity: the captured token must survive.
+                    assert_eq!(handle.identity, 1000 + u64::from(handle.pid));
+                    let mut state = state.borrow_mut();
+                    state.terminated.push(handle.pid);
+                    if let Some(&kind) = state.termination_errors.get(&handle.pid) {
+                        return Err(std::io::Error::new(
+                            kind,
+                            format!("terminate {}", handle.pid),
+                        ));
+                    }
+                    Ok(())
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn selected_tree_stop_preserves_siblings_of_the_listener_and_its_launchers() {
+        for (children, expected) in [
+            (
+                vec![
+                    (10, vec![20, 80]),
+                    (20, vec![30, 50]),
+                    (30, vec![40]),
+                    (50, vec![60]),
+                    (80, vec![90]),
+                ],
+                vec![10, 20, 30, 40],
+            ),
+            (
+                vec![(10, vec![20]), (20, vec![30, 50]), (50, vec![60])],
+                vec![10, 20, 30],
+            ),
+        ] {
+            let mut tree = FakeProcessTree::default();
+            tree.stop_targets(&[30, 20, 10], &children).unwrap();
+            assert_eq!(
+                tree.terminated, expected,
+                "siblings must survive; validated launchers go first"
+            );
+            assert!(
+                tree.opened.iter().all(|pid| *pid == 40),
+                "do not even open siblings or their descendants: {:?}",
+                tree.opened
+            );
+        }
+    }
+
+    #[test]
+    fn selected_tree_stop_attempts_other_targets_after_capture_or_termination_errors() {
+        for operation in ["open", "creation", "terminate"] {
+            let mut tree = FakeProcessTree::default();
+            let errors = match operation {
+                "open" => &mut tree.open_errors,
+                "creation" => &mut tree.creation_errors,
+                _ => &mut tree.termination_errors,
+            };
+            errors.insert(20, std::io::ErrorKind::PermissionDenied);
+            let error = tree
+                .stop_targets(
+                    &[30, 20, 10],
+                    &[(10, vec![20, 80]), (20, vec![30, 50]), (30, vec![40])],
+                )
+                .unwrap_err();
+            let expected = if operation == "terminate" {
+                vec![10, 20, 30, 40]
+            } else {
+                vec![10, 30, 40]
+            };
+            assert_eq!(
+                tree.terminated, expected,
+                "{operation}: accessible targets and listener descendants must still stop"
+            );
+            assert_eq!(error.to_string(), format!("{operation} 20"));
+            assert_eq!(
+                tree.opened,
+                [40],
+                "never open siblings even on a partial failure"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_tree_stop_rejects_a_recycled_launcher() {
+        let mut tree = FakeProcessTree::default();
+        let error = tree
+            .stop_targets(&[10, 20], &[(20, vec![10, 30])])
+            .unwrap_err();
+        assert_eq!(
+            tree.terminated,
+            [10],
+            "a parent created after its child is not the validated launcher"
+        );
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(tree.opened.is_empty());
+    }
+
+    #[test]
+    fn selected_tree_stop_still_attempts_targets_after_snapshot_failure() {
+        let mut terminated = Vec::new();
+        let error = terminate_selected_tree(
+            &[30, 20, 10],
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "snapshot",
+            )),
+            |pid| Ok(Some(FakeProcessTree::process(pid))),
+            |handle| Ok(handle.created),
+            |handle| {
+                terminated.push(handle.pid);
+                Err(std::io::Error::other("later termination error"))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(terminated, [10, 20, 30]);
+        assert_eq!(error.to_string(), "snapshot");
+    }
+
+    #[test]
+    fn tree_stop_continues_after_descendant_open_failure() {
+        let mut tree = FakeProcessTree {
+            open_errors: [(20, std::io::ErrorKind::PermissionDenied)].into(),
+            ..Default::default()
+        };
+        let error = tree
+            .stop(&[(10, vec![20, 30]), (20, vec![40]), (30, vec![50])])
+            .unwrap_err();
+        assert_eq!(
+            tree.terminated,
+            [10, 30, 50],
+            "the root and accessible branch must stop before returning the open error"
+        );
+        assert_eq!(
+            tree.opened,
+            [20, 30, 50],
+            "an unvalidated parent cannot authorize its child"
+        );
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "open 20");
+    }
+
+    #[test]
+    fn tree_stop_continues_after_descendant_creation_failure() {
+        let mut tree = FakeProcessTree {
+            creation_errors: [(20, std::io::ErrorKind::PermissionDenied)].into(),
+            ..Default::default()
+        };
+        let error = tree
+            .stop(&[(10, vec![20, 30]), (20, vec![40]), (30, vec![50])])
+            .unwrap_err();
+        assert_eq!(
+            tree.terminated,
+            [10, 30, 50],
+            "a creation-read error must not retain the root and accessible branch"
+        );
+        assert_eq!(tree.opened, [20, 30, 50]);
+        assert_eq!(error.to_string(), "creation 20");
+    }
+
+    #[test]
+    fn tree_stop_continues_after_termination_failure() {
+        let mut tree = FakeProcessTree {
+            termination_errors: [
+                (10, std::io::ErrorKind::PermissionDenied),
+                (20, std::io::ErrorKind::Other),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let error = tree
+            .stop(&[(10, vec![20, 30]), (20, vec![40])])
+            .unwrap_err();
+        assert_eq!(
+            tree.terminated,
+            [10, 20, 30, 40],
+            "every retained handle must be attempted despite earlier termination errors"
+        );
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "terminate 10");
+    }
+
+    #[test]
+    fn tree_stop_returns_first_error_after_all_accessible_handles() {
+        let mut tree = FakeProcessTree {
+            open_errors: [(20, std::io::ErrorKind::PermissionDenied)].into(),
+            creation_errors: [(30, std::io::ErrorKind::Other)].into(),
+            termination_errors: [(10, std::io::ErrorKind::Other)].into(),
+            ..Default::default()
+        };
+        let error = tree
+            .stop(&[(10, vec![20, 30, 40]), (40, vec![50])])
+            .unwrap_err();
+        assert_eq!(tree.terminated, [10, 40, 50]);
+        assert_eq!(tree.opened, [20, 30, 40, 50]);
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.to_string(),
+            "open 20",
+            "later errors must not hide the first failure"
+        );
+    }
+
+    #[test]
+    fn tree_stop_rejects_root_when_its_creation_cannot_be_read() {
+        let mut tree = FakeProcessTree {
+            creation_errors: [(10, std::io::ErrorKind::PermissionDenied)].into(),
+            ..Default::default()
+        };
+        let error = tree.stop(&[(10, vec![20, 30])]).unwrap_err();
+        assert!(
+            tree.terminated.is_empty(),
+            "each explicit target must pass its creation check before termination"
+        );
+        assert!(
+            tree.opened.is_empty(),
+            "children cannot be validated without their parent's creation time"
+        );
+        assert_eq!(error.to_string(), "creation 10");
+    }
+
+    #[test]
+    fn tree_stop_does_not_treat_other_not_found_errors_as_missing() {
+        let mut tree = FakeProcessTree {
+            open_errors: [(20, std::io::ErrorKind::NotFound)].into(),
+            ..Default::default()
+        };
+        let result = tree.stop(&[(10, vec![20, 30])]);
+        assert_eq!(tree.terminated, [10, 30]);
+        let error = result.expect_err("only an explicit missing-process result may be ignored");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(error.to_string(), "open 20");
+    }
+
+    #[test]
+    fn tree_stop_rejects_older_children_and_deduplicates_handles() {
+        let mut tree = FakeProcessTree {
+            missing: [20].into(),
+            ..Default::default()
+        };
+        tree.stop(&[
+            (10, vec![5, 20, 30, 30]),
+            (5, vec![40]),
+            (20, vec![50]),
+            (30, vec![25, 30, 60]),
+            (60, vec![10]),
+        ])
+        .unwrap();
+        assert_eq!(tree.opened, [5, 20, 30, 25, 60]);
+        assert_eq!(
+            tree.terminated,
+            [10, 30, 60],
+            "reject children older than their captured parent, including at deeper levels"
+        );
+    }
 
     fn listener(pid: u32, cwd: &str, port: u16, args: &[&str], v6: bool) -> Listener {
         Listener {
+            signing_in: Default::default(),
+
             pid,
             parent: 1,
             cwd: PathBuf::from(cwd),

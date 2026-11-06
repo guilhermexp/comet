@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "525110c5b873a71c1e39ba64e7a748dfaf1c2c80"
+vendored_tree = "b9a4a25440b79a165a59259b77601c030e8b6534"
 vendored_from = "working-tree"
 local_modifications_count = 32
 local_deletions = ["apps/website"]
@@ -259,3 +259,59 @@ base_revision_resolves_upstream = false
 # 2026-11-02 — headless controller session actions preserve the actual restart
 # or in-place resume ID in the optional sessionID response. Native Swift keeps
 # its separate asynchronous fallback. Consumer proof: worker_restart_identity.
+
+# 2026-11-05 — CI R4 (local metadata patch): shorten the sessions introduction
+# in mcp_host.rs; preserve action/argument schemas, key limits and full help.
+# Existing context-budget regression remains <4 KiB/domain and <11 KiB total.
+
+# 2026-11-05 — CI R5 RED: retained-reader regression for executable script
+# replacement, before making publication atomic; no production change yet.
+
+# 2026-11-05 — CI R5 GREEN: hook_assets::write_executable_script publishes a
+# closed, chmodded UUID staging inode with same-directory rename; it never
+# truncates the published executable. Retained-reader regression and 30
+# consecutive Grok wrapper invocations (120 tests) pass without retries/sleep.
+
+# 2026-11-05 — CI R6 (local portability patch, not an upstream import):
+# - native platform primitives shared with Comet: Windows LockFileEx, private
+#   SID/DACL files, durable rename, hostname and owned process handles/times;
+#   Unix flock/0600/signals retained, MSRV 1.88 unchanged.
+# - gate POSIX-only hook facades, attach readiness and socket transport;
+#   unsupported local PTY/remote raw attach returns an explicit error.
+# - core app-state/license/Host identity and browser/server process operations
+#   consume real primitives; downstream checkout/activity/registry do likewise.
+# Windows GNU check uses the exact native-platform-check package pair.
+# local_modifications_count remains the unrecomputed historical value.
+
+# 2026-11-05 — round2 full-workspace fixture isolation: verify default and
+# explicit COMET_WORKERS_HOOKS_DIR roots in private subprocesses, and check
+# Kimi managed commands against the resolved root rather than a default-only
+# path substring. Runtime hooks/grants/configuration behavior unchanged.
+
+# 2026-11-05 — OpenQodex round2 review (test portability only): gate
+# executable_script_replacement_preserves_the_published_inode with cfg(unix)
+# because it asserts POSIX permissions through PermissionsExt. Keep all its
+# assertions and platform-neutral tests intact. Audit the round2 test additions
+# for Unix/libc references; other new uses are already gated. The Linux test
+# passes; Windows core --lib checks, while --tests still reports unrelated
+# Host/socket/hook/transcript fixture portability errors (recorded separately).
+# No runtime source, upstream base or historical modification count changed.
+
+# 2026-11-05 — review2 finding 4: cfg(unix) on session_ops socket-only
+# std::io imports and SOCKET_IO_TIMEOUT, matching socket_command. No behavior,
+# base revision, license or historical modification-count change.
+
+# 2026-11-05 — review3 RED: expose browser singleton/socket/PID artifacts
+# retained when an identity-checked process vanishes before termination.
+# Extract existing retirement steps for direct filesystem regressions; keep
+# the existing grace/escalation logic and error behavior until GREEN. Tests
+# use an unallocatable positive PID on Linux and preserve files on denial.
+# Base/MIT/historical modification count unchanged.
+
+# 2026-11-05 — review3 GREEN: normalize ESRCH and Windows OpenProcess
+# ERROR_INVALID_PARAMETER as NotFound, without changing other failures or
+# invalid nonpositive PIDs. Browser retirement alone accepts already-gone
+# processes, cleans artifacts and skips wait/escalation after disappearance.
+# Permission errors retain artifacts and return through trace; local_urls
+# keeps returning an error, including NotFound. Live-process budgets, argv/
+# ownership checks, base/MIT and historical modification count unchanged.

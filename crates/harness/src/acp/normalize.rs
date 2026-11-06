@@ -201,7 +201,7 @@ fn qualified_mcp_tool(title: &str) -> Option<(&str, &str)> {
 /// in how much structure they put in `rawInput`, so every arm has a fallback.
 /// Title is only used when it looks like a real arg — never a placeholder
 /// label or markdown-escaped summary.
-fn typed_call(update: &Value) -> ToolCall {
+pub(super) fn typed_call(update: &Value) -> ToolCall {
     let kind = update
         .get("kind")
         .and_then(Value::as_str)
@@ -623,6 +623,7 @@ fn map_update_frame(update: &Value) -> Vec<AgentEvent> {
                     output: None,
                     diff: None,
                     execution: None,
+                    exit_code: None,
                 },
             ]
         }
@@ -668,6 +669,7 @@ fn resolved_result(update: &Value, id: String) -> Option<AgentEvent> {
         output: tool_output(update),
         diff: tool_diff(update),
         execution: execution_meta(update),
+        exit_code: None,
     })
 }
 
@@ -787,6 +789,7 @@ mod tests {
                     output: Some("total 0".into()),
                     diff: None,
                     execution: None,
+                    exit_code: None,
                 },
             ]
         );
@@ -831,6 +834,7 @@ mod tests {
                     new_text: "fn new() {}".into(),
                 }),
                 execution: None,
+                exit_code: None,
             }
         );
     }
@@ -931,6 +935,8 @@ mod tests {
                     },
                 },
                 AgentEvent::ToolResult {
+                    exit_code: Default::default(),
+
                     id: "write-growing".into(),
                     is_error: false,
                     output: None,
@@ -990,6 +996,8 @@ mod tests {
                     },
                 },
                 AgentEvent::ToolResult {
+                    exit_code: Default::default(),
+
                     id: "edit-growing".into(),
                     is_error: true,
                     output: None,
@@ -1027,6 +1035,8 @@ mod tests {
                 "status": "completed"
             })),
             vec![AgentEvent::ToolResult {
+                exit_code: Default::default(),
+
                 id: "turn-local-write".into(),
                 is_error: false,
                 output: None,
@@ -1051,6 +1061,7 @@ mod tests {
                 output: None,
                 diff: None,
                 execution: None,
+                exit_code: None,
             }]
         );
     }

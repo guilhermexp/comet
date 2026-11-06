@@ -1040,11 +1040,9 @@ fn computer_tool_definition() -> Value {
 fn sessions_tool_definition() -> Value {
     json!({
         "name": SESSIONS_TOOL,
-        "description": "Inspect and control the user's other Unpeel terminal sessions. Flow: \
-    action 'list' to pick a target, 'inspect' for a compact look, then small reads; after \
-    send_text/send_keys use wait_for_status or wait_for_text. Reads are open; writes inside \
-    your sidebar group are free and writes to other groups ask for approval. \
-    {\"action\":\"help\"} returns full \
+        "description": "Inspect/control other Unpeel sessions: list, inspect, then small reads. \
+    After send_text/send_keys, wait_for_status or wait_for_text. Reads are open; \
+    same-group writes are free; other groups ask approval. Use action 'help' for \
     per-action docs and required params.",
         "inputSchema": {
             "type": "object",

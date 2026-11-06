@@ -585,7 +585,7 @@ impl WorkersModel {
 
     /// A model that never talks to the machine's Workers daemon: no poll, no
     /// initial refresh. Shell unit tests use it so they stay hermetic.
-    #[cfg(any(test, feature = "appshots-fixture"))]
+    #[cfg(any(test, feature = "appshots-fixture", feature = "browser-fixture"))]
     pub(crate) fn detached(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         Self::build(state, false, cx)
     }

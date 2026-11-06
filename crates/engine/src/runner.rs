@@ -465,6 +465,9 @@ fn setup_parts(
                 subagent_end: None,
                 execution: None,
                 file_preview: None,
+                exit_code: None,
+                output_truncated: false,
+                output_lines: None,
             }
         })
         .collect()

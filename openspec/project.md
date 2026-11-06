@@ -14,8 +14,8 @@ local OAuth credential through snapshots or sync.
 ## Tech Stack
 
 - **Rust** edition 2024, workspace `crates/{proto,doc,sync,harness,engine,rpc,syntax,theme,ui,update,workers-unpeel,preview}` + `apps/zeron`.
-- **UI**: gpui, extração `zeronsh/zui` pinada por rev. Sem as crates GPL do Zed.
-- **Sync**: `loro` 1.13 + `loro-protocol` 0.3.
+- **UI**: gpui, snapshot `zeronsh/zui` vendorizado com proveniência. Sem as crates GPL do Zed.
+- **Sync**: `loro` 1.17 + `loro-protocol` 0.3.
 - **Edge**: TypeScript no Cloudflare Workers — Worker + SessionRoom DO + DeviceRoom DO + R2 + auth WorkOS.
 - **Terminal**: `alacritty_terminal` + `portable-pty`. **MCP**: `rmcp` 3.x sobre stdio.
 - **iOS**: `apps/ios`, projeto Xcode fora do workspace Cargo.
@@ -50,9 +50,9 @@ local OAuth credential through snapshots or sync.
 
 ### Git Workflow
 
-- Branch `main`; `origin` = fork `guilhermexp/comet`; `upstream` = `zeronsh/comet`.
+- Branch `main`; `origin` = fork `guilhermexp/comet`; `upstream` = `zeronsh/zeron` (renomeado de comet).
 - **Nunca pushar pro upstream.** `gh` precisa de `-R guilhermexp/comet` (o default resolve pro upstream).
-- Mudanças pequenas/localizadas podem ir direto à `main`, conforme `CLAUDE.md`; `no-mistakes` fica para mudanças grandes ou pedido explícito. Status do gate é consultado no checkout principal.
+- Mudanças pequenas/localizadas podem ir direto à `main`, conforme `CLAUDE.md`; `no-mistakes` só é executado por pedido explícito, conforme AGENTS.md raiz.
 - Tag `v*` dispara a release macOS do fork (GitHub Release + `manifest.json`), de onde o app instalado se atualiza; push na `main` tocando `edge/` dispara deploy do Worker (herdado do upstream). Não disparar sem intenção.
 
 ## Domain Context

@@ -146,6 +146,7 @@ impl Normalizer {
                     output: output.map(|s| cap(&s, 16384)),
                     diff,
                     execution: None,
+                    exit_code: None,
                 });
             }
             "compaction_end" => {

@@ -11,6 +11,7 @@ alacritty_terminal.workspace = true
 zeron-preview.workspace = true
 zeron-workers-unpeel.workspace = true
 zeron-proto.workspace = true
+zeron-theme.workspace = true
 zeron-doc.workspace = true
 zeron-sync.workspace = true
 zeron-harness.workspace = true
@@ -19,6 +20,9 @@ zeron-rpc.workspace = true
 zeron-update.workspace = true
 zeron-notify.workspace = true
 zeron-visual.workspace = true
+# Plugin services (plugins/service): a headless Luau VM per plugin, the
+# same mlua and Luau zeron-visual already links (no new crate).
+mlua = { version = "0.12", features = ["luau"] }
 loro.workspace = true
 tokio.workspace = true
 futures.workspace = true
@@ -43,11 +47,16 @@ gethostname.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }
 sha2.workspace = true
 reqwest.workspace = true
+# The rules plugins are held to (paths, programs, network), shared with apps/zgx.
+zeron-plugin-guard.workspace = true
 ignore.workspace = true
 fff-search.workspace = true
 
 same-file = "1"
 tempfile.workspace = true
+# `show_image` reads a shown image's size from its header (already in the
+# tree with these decoders via zeron-ui).
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
 [target.'cfg(windows)'.dependencies]
 dunce.workspace = true
@@ -61,5 +70,8 @@ zeron-harness = { workspace = true, features = ["installer-fixture"] }
 tokio = { workspace = true, features = ["test-util"] }
 zip.workspace = true
 tokio-tungstenite.workspace = true
+# A registry build of the fake ACP agent (tests/acp_registry_rpc.rs).
+tar = "0.4"
+flate2 = "1"
 # In-process registry server for the two-engine workspace integration tests.
 zeron-sync = { workspace = true, features = ["mock-server"] }

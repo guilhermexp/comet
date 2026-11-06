@@ -734,6 +734,10 @@ mod tests {
 
     fn spawn_part(id: &str, status: SubagentStatus, tail: &str) -> MessagePart {
         MessagePart::Tool {
+            exit_code: Default::default(),
+            output_truncated: Default::default(),
+            output_lines: Default::default(),
+
             id: id.into(),
             call: ToolCall::Unknown {
                 name: "Agent: reviewer".into(),
@@ -950,6 +954,10 @@ mod tests {
             parts: vec![
                 spawn_part("spawn-1", SubagentStatus::Done, "Reviewed parser"),
                 MessagePart::Tool {
+                    exit_code: Default::default(),
+                    output_truncated: Default::default(),
+                    output_lines: Default::default(),
+
                     id: "bash-1".into(),
                     call: ToolCall::Exec {
                         command: "cargo test".into(),
@@ -1057,6 +1065,10 @@ mod tests {
             id: "entry-1".into(),
             role: MessageRole::Assistant,
             parts: vec![MessagePart::Tool {
+                exit_code: Default::default(),
+                output_truncated: Default::default(),
+                output_lines: Default::default(),
+
                 id: "spawn-opaque-7f91".into(),
                 call: ToolCall::Unknown {
                     name: "Agent: review parser".into(),

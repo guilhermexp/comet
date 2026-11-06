@@ -59,9 +59,6 @@ pub fn ensure_host_id() -> Result<String, String> {
 }
 
 fn ensure_host_id_at(path: &std::path::Path) -> Result<String, String> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
     let read_existing = || -> Result<Option<String>, String> {
         let existing = match std::fs::read_to_string(path) {
             Ok(value) => value.trim().to_string(),
@@ -71,7 +68,7 @@ fn ensure_host_id_at(path: &std::path::Path) -> Result<String, String> {
         if existing.is_empty() {
             return Ok(None);
         }
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        crate::platform::secure_private_file(path)
             .map_err(|error| format!("could not secure Host identity: {error}"))?;
         Ok(Some(existing))
     };
@@ -84,20 +81,18 @@ fn ensure_host_id_at(path: &std::path::Path) -> Result<String, String> {
         .ok_or("Host identity has no parent directory")?;
     std::fs::create_dir_all(dir)
         .map_err(|error| format!("could not create Host identity directory: {error}"))?;
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .mode(0o600)
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options
         .open(path.with_extension("lock"))
         .map_err(|error| format!("could not open Host identity lock: {error}"))?;
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(format!(
-            "could not acquire Host identity lock: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
+    crate::platform::lock_exclusive(&lock)
+        .map_err(|error| format!("could not acquire Host identity lock: {error}"))?;
 
     let result = (|| {
         use std::io::Write;
@@ -107,11 +102,7 @@ fn ensure_host_id_at(path: &std::path::Path) -> Result<String, String> {
         }
         let id = uuid::Uuid::new_v4().to_string().to_lowercase();
         let temporary = dir.join(format!(".mac-id.{}.tmp", uuid::Uuid::new_v4()));
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&temporary)
+        let mut file = crate::platform::create_private_file(&temporary)
             .map_err(|error| format!("could not create Host identity: {error}"))?;
         if let Err(error) = file.write_all(format!("{id}\n").as_bytes()) {
             drop(file);
@@ -125,12 +116,10 @@ fn ensure_host_id_at(path: &std::path::Path) -> Result<String, String> {
         }
         Ok(id)
     })();
-    let unlock = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
-    if unlock != 0 && result.is_ok() {
-        return Err(format!(
-            "could not release Host identity lock: {}",
-            std::io::Error::last_os_error()
-        ));
+    if let Err(error) = crate::platform::unlock(&lock) {
+        if result.is_ok() {
+            return Err(format!("could not release Host identity lock: {error}"));
+        }
     }
     result
 }

@@ -49,10 +49,13 @@ fn run_request(prompt: &str, cwd: &str) -> RunRequest {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        access: Default::default(),
+        plan: false,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
         env: Default::default(),
+        extra_mcp: Vec::new(),
     }
 }
 
@@ -364,6 +367,10 @@ async fn kill_crash_recovers_resume_from_journal_and_stamps_aborted() {
                 // it, its card keeps spinning under a transcript that already
                 // says the run was interrupted.
                 MessagePart::Tool {
+                    exit_code: Default::default(),
+                    output_truncated: Default::default(),
+                    output_lines: Default::default(),
+
                     id: "tool-0".into(),
                     call: ToolCall::Exec {
                         command: "sleep 600".into(),
@@ -1290,10 +1297,13 @@ async fn real_claude_remembers_codeword_across_engine_restart() {
         enable_workers_mcp: false,
         workers_parent_chat_id: None,
         sessions: None,
+        access: Default::default(),
+        plan: false,
         attachments: Vec::new(),
         worktree: None,
         resume: None,
         env: Default::default(),
+        extra_mcp: Vec::new(),
     };
     let assemble_real = || {
         EngineCore::assemble(
@@ -1533,6 +1543,10 @@ async fn recovery_settles_subagent_docs_in_step_with_their_chips() {
     std::fs::write(dir.join("device-id"), "dev-crash").unwrap();
     let sub_doc = |id: &str| format!("{CHAT}--sub--{id}");
     let chip = |id: &str| MessagePart::Tool {
+        exit_code: Default::default(),
+        output_truncated: Default::default(),
+        output_lines: Default::default(),
+
         id: id.into(),
         call: ToolCall::Unknown {
             name: "Agent: scan".into(),

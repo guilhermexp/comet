@@ -268,6 +268,7 @@ mod tests {
                 output: None,
                 diff: None,
                 execution: None,
+                exit_code: None,
             },
         ];
         for reasoning in [false, true] {

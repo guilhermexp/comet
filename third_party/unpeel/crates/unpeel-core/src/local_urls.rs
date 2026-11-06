@@ -205,12 +205,11 @@ pub fn stop_server_for_url(url: &str) -> Result<LocalSiteServer, String> {
             server.command, server.pid
         ));
     }
-    let rc = unsafe { libc::kill(server.pid as i32, libc::SIGTERM) };
-    if rc == 0 {
-        Ok(server)
-    } else {
-        Err(format!("failed to signal pid {}", server.pid))
-    }
+    // Keep this API strict, including NotFound after the ownership lookup.
+    // Browser artifact cleanup has a separate already-stopped policy.
+    crate::platform::terminate_process(server.pid as i32, false)
+        .map_err(|error| format!("failed to signal pid {}: {error}", server.pid))?;
+    Ok(server)
 }
 
 fn listening_pid(port: u16) -> Option<u32> {

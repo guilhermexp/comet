@@ -403,6 +403,7 @@ fn entry_events(entry: &Value) -> Vec<AgentEvent> {
                     output,
                     diff: None,
                     execution: None,
+                    exit_code: None,
                 });
             }
         }

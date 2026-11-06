@@ -1,9 +1,29 @@
 #!/bin/sh
 # Fake zeron cursor shim for zeron-harness tests: speaks the shim's JSONL
-# protocol (see crates/harness/src/cursor/shim.mjs) without node or the SDK.
+# protocol (see crates/harness/src/cursor/shim.mjs) without the SDK.
 # Driven by crates/harness/tests/cursor.rs.
 
 emit() { printf '%s\n' "$1"; }
+
+# JSON object key order can change when the workspace enables preserve_order.
+# Validate the same image fields and cardinality under either serialization.
+image_message() {
+  node -e '
+    let text = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", chunk => text += chunk);
+    process.stdin.on("end", () => {
+      const images = JSON.parse(text).images;
+      const image = images?.[0];
+      const expected = process.argv[1];
+      const valid = Array.isArray(images) && images.length === 1 && image &&
+        Object.keys(image).length === 3 && image.type === "image" &&
+        image.mimeType === "image/png" && typeof image.data === "string" &&
+        image.data.length > 0 && (!expected || image.data === expected);
+      process.exit(valid ? 0 : 1);
+    });
+  ' "${1:-}"
+}
 
 # Models mode (argv, no stdin protocol): one catalog frame, real 1.0.28
 # shapes — parameterized Auto + its bare `default` alias twin (skipped by the
@@ -137,27 +157,27 @@ case "$first" in
   ;;
 
 *scenario:images*)
-  case "$first" in
-    *'"images":[{"data":"'*'"mimeType":"image/png","type":"image"}]'*) ;;
-    *) emit '{"ev":"fatal","message":"images missing"}'; exit 1 ;;
-  esac
+  if ! printf '%s\n' "$first" | image_message; then
+    emit '{"ev":"fatal","message":"images missing"}'; exit 1
+  fi
   emit '{"ev":"ready","agentId":"agent-img","model":"auto"}'
   emit '{"ev":"turn","status":"finished"}'
   read -r next || exit 0
-  case "$next" in
-    *'"images":[{"data":"'*) emit '{"ev":"steered"}'; emit '{"ev":"text","text":"steer image"}' ;;
-    *) emit '{"ev":"steered"}'; emit '{"ev":"text","text":"steer image missing"}' ;;
-  esac
+  emit '{"ev":"steered"}'
+  if printf '%s\n' "$next" | image_message; then
+    emit '{"ev":"text","text":"steer image"}'
+  else
+    emit '{"ev":"text","text":"steer image missing"}'
+  fi
   emit '{"ev":"turn","status":"finished"}'
   read -r next || exit 0
   ;;
 
 *scenario:image-cap*)
   # Only the small attachment is inlined; the large one rides as a path ref.
-  case "$first" in
-    *'"images":[{"data":"iVBORw0KGgpzbWFsbA==","mimeType":"image/png","type":"image"}]'*) ;;
-    *) emit '{"ev":"fatal","message":"image caps not applied"}'; exit 1 ;;
-  esac
+  if ! printf '%s\n' "$first" | image_message 'iVBORw0KGgpzbWFsbA=='; then
+    emit '{"ev":"fatal","message":"image caps not applied"}'; exit 1
+  fi
   emit '{"ev":"ready","agentId":"agent-img","model":"auto"}'
   emit '{"ev":"turn","status":"finished"}'
   read -r next || exit 0

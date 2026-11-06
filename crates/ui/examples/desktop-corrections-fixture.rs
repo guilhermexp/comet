@@ -612,6 +612,10 @@ fn todo_entry() -> zeron_doc::SessionMessageEntry {
         id: "a1".into(),
         role: zeron_doc::MessageRole::Assistant,
         parts: vec![zeron_doc::MessagePart::Tool {
+            exit_code: Default::default(),
+            output_truncated: Default::default(),
+            output_lines: Default::default(),
+
             id: "todo".into(),
             call: zeron_proto::ToolCall::Todo {
                 items: (0..16)

@@ -31,7 +31,6 @@ use serde_json::{Map, Value};
 pub(crate) struct FileLock(#[allow(dead_code)] std::fs::File);
 
 pub(crate) fn lock_exclusive(target: &std::path::Path) -> Result<FileLock, String> {
-    use std::os::fd::AsRawFd;
     let lock_path = target.with_extension("lock");
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -41,13 +40,8 @@ pub(crate) fn lock_exclusive(target: &std::path::Path) -> Result<FileLock, Strin
         .map_err(|e| format!("open {}: {e}", lock_path.display()))?;
     // Blocking acquire: edits are tiny (read + write of a small JSON file),
     // so waiting beats failing.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(format!(
-            "lock {}: {}",
-            lock_path.display(),
-            std::io::Error::last_os_error()
-        ));
-    }
+    crate::platform::lock_exclusive(&file)
+        .map_err(|error| format!("lock {}: {error}", lock_path.display()))?;
     Ok(FileLock(file))
 }
 
