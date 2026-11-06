@@ -2586,13 +2586,10 @@ mod wait_core_tests {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
-    /// The bearer the fake engines serve; the controller presents it through
-    /// `$ZERON_IPC_TOKEN` (one fixed value, so tests never race on it).
+    /// The fake engines and their isolated test process receive the same
+    /// bearer before any server or probe thread starts.
     fn test_ipc_token() -> String {
         const TOKEN: &str = "comet-workers-test-ipc-token";
-        static SET: std::sync::Once = std::sync::Once::new();
-        // SAFETY: set once, to the same value, before any test dials.
-        SET.call_once(|| unsafe { std::env::set_var(zeron_rpc::ipc_auth::TOKEN_ENV, TOKEN) });
         TOKEN.to_owned()
     }
 
@@ -2732,6 +2729,8 @@ mod wait_core_tests {
                 .arg("controller_mcp::wait_core_tests::wait_for_status_dispatch_with_parent_and_endpoint_releases_promptly_on_pending_message")
                 .arg("--nocapture")
                 .env("__COMET_ISOLATED_TEST__", "1")
+                .env(zeron_rpc::ipc_auth::TOKEN_ENV, test_ipc_token())
+                .env_remove(zeron_rpc::ipc_auth::TOKEN_FILE_ENV)
                 .status()
                 .expect("spawn isolated child test process");
             assert!(
@@ -2911,6 +2910,25 @@ mod wait_core_tests {
 
     #[test]
     fn probe_rejects_malformed_reply() {
+        if std::env::var("__COMET_ISOLATED_TEST__").is_err() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "controller_mcp::wait_core_tests::probe_rejects_malformed_reply",
+                    "--nocapture",
+                ])
+                .env("__COMET_ISOLATED_TEST__", "1")
+                .env(zeron_rpc::ipc_auth::TOKEN_ENV, test_ipc_token())
+                .env_remove(zeron_rpc::ipc_auth::TOKEN_FILE_ENV)
+                .status()
+                .expect("spawn isolated malformed-reply fixture");
+            assert!(
+                status.success(),
+                "isolated malformed-reply fixture failed: {status:?}"
+            );
+            return;
+        }
+
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

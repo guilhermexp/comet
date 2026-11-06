@@ -724,6 +724,8 @@ apps/zeron (host-mode dispatch at startup).
 
 Durable-seed fixtures that represent different hook events set distinct file mtimes explicitly. Back-to-back writes may share one filesystem timestamp/version and must not make the admission/recovery assertions depend on scheduling. This changes test inputs, never the runtime dedup policy.
 
+The authenticated `controller_mcp::wait_core_tests` fixtures pass their bearer through the isolated child process environment before starting the fake server or probe. Never install the client token inside the server thread: the probe can otherwise capture an empty credential first and produce 401 before the intended malformed-reply assertion. Keep the malformed-reply check strict; production bearer enforcement stays unchanged.
+
 Run all: `cargo test -p zeron-workers-unpeel` (part of the publish gate).
 Lost hook delivery: `cargo test -p zeron-workers-unpeel --lib activity_bridge` covers the real activity derivation, durable Stop recovery on the next poll, unchanged/stale seeds, generation isolation and registry register/unregister with seventeen live listeners. The bridge recovers a new durable event even after hooks latch; the five-minute sweep remains a fallback. A consumed disk version is never replayed over a live event or Codex output rearm. The shared registry has no age-based entry cap: only its owner unregisters a port.
 Regressão de saída: `cargo test -p zeron-workers-unpeel --test controller_mcp worker_output_preserves_answer_when_repaints_depend_on_terminal_width` preserva a resposta literal após repinturas que dependem da largura real.
