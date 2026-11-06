@@ -623,10 +623,14 @@ async fn context_rpc_rejects_late_model_and_runtime_results_without_caching_them
         let report: ContextBreakdown = serde_json::from_value(reply.unwrap()).unwrap();
         outcomes.push((setting, report.availability, report.used_tokens, inspected));
     }
-    assert_eq!(outcomes, vec![
-        ("access", ContextAvailability::NotApplicable, None, false),
-        ("plan", ContextAvailability::NotApplicable, None, false),
-    ], "access/plan-only changes must not inspect or cache the old warm runtime");
+    assert_eq!(
+        outcomes,
+        vec![
+            ("access", ContextAvailability::NotApplicable, None, false),
+            ("plan", ContextAvailability::NotApplicable, None, false),
+        ],
+        "access/plan-only changes must not inspect or cache the old warm runtime"
+    );
     core.workspace
         .set_chat_config("chat", &config("old"))
         .unwrap();

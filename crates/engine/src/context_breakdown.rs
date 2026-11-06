@@ -104,6 +104,8 @@ impl SessionsEngine {
                 request.reasoning = selected.reasoning;
                 request.model_options = selected.model_options.clone();
                 request.sandbox = selected.sandbox;
+                request.access = selected.access;
+                request.plan = selected.plan;
                 runtime.can_route(selected.harness, &request)
             })
         };
