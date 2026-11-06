@@ -11,12 +11,16 @@ The integration SHALL hold complete steering messages until the prompt opening t
 
 ### Requirement: Windows server termination continues after individual process failures
 
-The integration SHALL attempt termination of every safely captured process handle, including the validated launchers, before returning the first relevant error. It SHALL terminate only the validated listener and launcher chain plus safely captured descendants of that listener; siblings under any launcher SHALL remain untouched. Launcher handles SHALL be attempted first, and each explicit target SHALL have its creation/identity checked using a handle retained during validation. A descendant that cannot be opened or whose creation cannot be read SHALL be logged and skipped together with descendants that cannot be validated through it. Termination SHALL never use a bare PID, and a captured child SHALL NOT predate its captured parent.
+The integration SHALL attempt every safely captured handle before returning the first relevant error. Open/creation failures SHALL be logged and skip only processes that cannot be validated. Termination SHALL use retained handles with checked creation, never bare PIDs; a captured child SHALL NOT predate its parent. A snapshot failure SHALL NOT prevent attempts on validated explicit targets.
 
 #### Scenario: One descendant is inaccessible or one termination fails
 - **Test:** unit
 - **WHEN** a descendant cannot be opened, its creation time cannot be read, or termination of one captured handle fails
 - **THEN** the other validated handles, including the root, are still attempted in parent-first order and the first relevant error is returned only after those attempts
+
+### Requirement: Windows server stop preserves sibling processes
+
+Windows stop SHALL select only the validated listener and launcher chain plus safely captured descendants of that listener. Siblings under any launcher SHALL remain untouched. Launcher handles SHALL be attempted first. Each explicit target SHALL use its identity and creation captured by a handle retained during metadata validation, without reopening its PID.
 
 #### Scenario: Multiple servers share a validated launcher
 - **Test:** unit

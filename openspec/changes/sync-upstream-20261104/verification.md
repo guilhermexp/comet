@@ -316,3 +316,25 @@ Provas focadas: novo caso 1 passed; harness --lib omp:: 36 passed; omp_rpc 73 pa
 | `openspec validate sync-upstream-20261104 --strict` | 0 | review6-openspec-final.log |
 
 Todos os recibos exigidos saíram 0 no código final, após o refinamento do dreno. Core: 2670 passed/27 skips anteriores, incluindo o novo caso e 2 leaky PASS anteriores. Workspace completo executou todos os alvos e doc-tests sem falha; o novo caso de frames, F3, access/plan, grants/limpeza de MCP e a regressão de credencial do controller passaram. Check GNU prova compilação, sem execução nativa Windows. Logs e .exit em review6-final-gates.json; o workspace interrompido em 98f062ccd não é usado para aceite. test-core.sh, workflows, cli/launch excluídos, notify no workspace, F3/drive_run e vendor permanecem sem alteração nesta rodada. A pendência histórica 6.7 de CI permanece distinta. Sem push, merge, tags, PR, dispatch ou archive da change sync.
+
+## Revisão rodada 7 — paridade de alvos Windows e captura limpa (2026-11-05)
+
+RED seleção: cargo test --locked -p zeron-preview --lib selected_tree_stop_preserves_siblings -- --nocapture saiu 101 na asserção dos handles terminados: [10,20,80,30,50,90,40,60] versus [10,20,30,40]. review7-preview-red.log e .exit preservados. GREEN focado: cargo test --locked -p zeron-preview --lib servers -- --nocapture saiu 0 (18 testes), incluindo irmãos preservados, erros de captura/término sem abortar outros alvos, launcher com criação posterior ao filho recusado e snapshot falho com término dos alvos explícitos. Uma tentativa inicial do GREEN tinha inferência ambígua de [] no assert; review7-preview-initial-compile.log preserva esse ajuste de compilação, sem ser usado como RED.
+
+RED live: cargo test --locked -p zeron-harness --test omp_live_cache preparing_live_capture -- --nocapture saiu 101 com boundaries [900,900] versus [1], em review7-capture-red.log. O mesmo caso GREEN saiu 0 em review7-capture-green.log; usa temporários locais, sem provider, e exige a remoção do rr antigo e a preservação do namespace vizinho. live() chama esse helper antes de construir a harness ou iniciar qualquer processo.
+
+Código final dos gates: 9141d78ed069307da2879511c7c4aedf9146bbfa. Todos os logs/recibos em .tmp/reports/comet-sync-ci-round2-20261105-logs/.
+
+| Comando no código final 9141d78ed | Exit | Log |
+|---|---:|---|
+| `cargo test --locked -p zeron-preview --no-fail-fast` | 0 | review7-preview-final.log |
+| `cargo test --locked -p zeron-harness --lib omp::` | 0 | review7-harness-lib-final.log |
+| `cargo test --locked -p zeron-harness --test omp_rpc --test omp_live_cache --no-fail-fast` | 0 | review7-harness-integration-final.log |
+| `cargo test --locked -p zeron-engine --test omp_warm_runtime --test runtime_survival --no-fail-fast` | 0 | review7-engine-omp-final.log |
+| `cargo check --locked --target x86_64-pc-windows-gnu -p zeron-preview -p zeron-harness -p zeron-engine` | 0 | review7-windows-final.log |
+| `scripts/ci/test-core.sh` | 0 | review7-core-final.log |
+| `cargo check --workspace --all-targets --locked` | 0 | review7-check-final.log |
+| `cargo fmt --all -- --check` | 0 | review7-fmt-final.log |
+| `openspec validate sync-upstream-20261104 --strict` | 0 | review7-openspec-final.log |
+
+Todos os gates finais saíram 0. Preview: 47 unit + 9 integration passed, 3 ignores anteriores no pacote; harness OMP lib: 36 passed; RPC: 73 passed/2 ignores anteriores; engine warm/runtime: 5 + 18 passed; core: 2675 passed (2 leaky), 27 skips anteriores. A regressão offline de captura passou junto das duas funções live sem opt-in, que retornam sem chamar provider; não equivale a prova de cache Anthropic. O core também aprovou novamente a ordem prompt/ACK/steers da rodada 6. Recibos consolidados em review7-final-gates.json. OpenSpec strict inicialmente saiu 1 por um requisito >500 caracteres; os contratos de seleção e erro foram divididos em requisitos próprios, sem remover restrições, e a validação final saiu 0. O log inicial está preservado em review7-openspec-initial-length.log; os gates Rust já aprovados não foram repetidos por essa alteração somente documental. A pendência histórica 6.7 de CI nativo permanece distinta. GNU prova compilação, sem execução Win32 nem descoberta Windows; a seleção e as políticas de erro são provadas pelo mesmo seam com handles fake em Linux. Provider live não executado. Nenhum novo skip/ignore/retry/sleep ou aumento de orçamento foi introduzido.

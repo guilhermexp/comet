@@ -217,3 +217,15 @@ GREEN 39bf6e7b0 guarda SteerMessage completo numa fila FIFO e só inicia a próx
 
 
 Aceite local da rodada 6 concluído sobre 08373c8bc: harness OMP 36 + RPC 73, engine warm/runtime 23, core 2670, workspace integral, all-targets check, fmt, GNU e OpenSpec strict saíram 0. Os ignores/skips existentes foram preservados; nenhum novo skip/ignore/retry ou prazo maior foi introduzido para contornar os achados. O workspace inicial interrompido antes do refinamento tem recibo 143 e não participa do aceite; relatório round2 recebe o apêndice e a trilha de logs. Sem provider live, push, merge, tags, PR ou archive da change sync.
+
+## Revisão rodada 7 — escopo de stop Windows e evidência live (2026-11-05)
+
+OpenQodex procedente nos dois pontos. Stop expandia a árvore a partir de targets.last(), que autorizava irmãos do listener e de seus launchers, além do escopo Unix. RED c243f0adf registra a seleção incorreta 10,20,80,30,50,90,40,60 em vez de 10,20,30,40. O seam de seleção/terminação é o mesmo chamado no caminho Windows; a tabela fake roda no Linux sem dependência de Win32.
+
+b7e0df9d6 retém os handles e a criação dos alvos antes da revalidação de metadata; a seleção tenta os launchers explícitos na ordem inversa e depois só o listener e seus descendentes validados. Não percorre os outros ramos de launcher. Leitura da criação é obrigatória para cada alvo; a exceção anterior para a raiz sem criação foi substituída pelo contrato mais estrito desta rodada. Snapshot, open/creation e terminate falhos não interrompem as demais tentativas seguras; o primeiro erro relevante retorna no fim. f44ab5730 distingue OpenProcess com ERROR_INVALID_PARAMETER (ausente) de um GetProcessTimes que falha com o mesmo código (erro relevante). PID nunca é usado para terminar, nem para reabrir um alvo cujo handle foi capturado na validação.
+
+O helper de captura live foi extraído sem mudança no RED ab9ff93cc: boundaries antigos 900 voltavam como [900,900] após uma captura nova. 9141d78ed remove e recria somente a pasta capture do namespace do teste antes do launch, deixando o namespace vizinho intacto; a regressão offline exige boundaries [1] e ausência do rr antigo. Opt-in/provider e asserções live originais ficam preservados.
+
+O terceiro achado continua refutado por decisão do dono: test-core.sh, workflows, exclusões cli/launch e cobertura notify não foram alterados. Gates finais em verification.md e apêndice do relatório round2; sem push, merge, tags, PR, dispatch ou archive.
+
+Aceite local da rodada 7 sobre 9141d78ed: preview completo, OMP harness/engine, GNU preview/harness/engine, core (2675 passed), all-targets e fmt saíram 0. OpenSpec strict também saiu 0 após dividir o requisito longo de seleção/erros, preservando todas as restrições; o primeiro resultado documental 1 foi mantido no log. Nenhuma suíte Rust aprovada foi repetida após essa correção só de especificação. Tarefas 12.1–12.4 completas; a pendência histórica 6.7 de CI permanece distinta. Sem novos skips/ignores/retries/sleeps, provider live ou execução nativa Windows.
