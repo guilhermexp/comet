@@ -45,7 +45,27 @@ fn prune_caches(
     caches: &Mutex<HashMap<String, Arc<ContextCache>>>,
     mut is_local: impl FnMut(&str) -> bool,
 ) {
-    lock(caches).retain(|id, _| is_local(id));
+    let candidates = lock(caches)
+        .iter()
+        .map(|(id, cache)| (id.clone(), Arc::downgrade(cache)))
+        .collect::<Vec<_>>();
+    // Registry/storage reads must never run under the cache-map mutex.
+    let invalid = candidates
+        .into_iter()
+        .filter(|(id, _)| !is_local(id))
+        .collect::<Vec<_>>();
+    let mut caches = lock(caches);
+    for (id, original) in invalid {
+        let removable = caches.get(&id).is_some_and(|current| {
+            // A replacement was not the entry whose ownership was checked.
+            std::sync::Weak::ptr_eq(&original, &Arc::downgrade(current))
+                // As in cache_for, active/queued readers own another Arc.
+                && Arc::strong_count(current) == 1
+        });
+        if removable {
+            caches.remove(&id);
+        }
+    }
 }
 
 impl SessionsEngine {
@@ -64,15 +84,23 @@ impl SessionsEngine {
             report
         };
         let cache = {
-            let workspace = self.inner.workspace();
-            if let Some(workspace) = workspace {
-                prune_caches(&self.inner.context_breakdowns, |id| {
-                    workspace
-                        .chat(id)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|chat| chat.device_id == self.inner.device_id)
-                });
+            if let Some(workspace) = self.inner.workspace() {
+                let inner = self.inner.clone();
+                let pruning = tokio::task::spawn_blocking(move || {
+                    prune_caches(&inner.context_breakdowns, |id| {
+                        workspace
+                            .chat(id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|chat| chat.device_id == inner.device_id)
+                    });
+                })
+                .await;
+                if pruning.is_err() {
+                    let mut report = unavailable("Context inspection workspace lookup failed");
+                    report.availability = ContextAvailability::Error;
+                    return report;
+                }
             }
             cache_for(&mut lock(&self.inner.context_breakdowns), chat_id)
         };
