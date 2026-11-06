@@ -975,31 +975,29 @@ async fn run_session(
             break;
         }
         tokio::select! {
-            request = context_requests.recv() => {
-                if let Some(request) = request {
-                    if request.reply.is_closed() || request.deadline <= tokio::time::Instant::now() {continue;}
-                    if context_unsupported.load(std::sync::atomic::Ordering::Acquire) {
-                        let _ = request.reply.send(Err(HarnessError::Unsupported("Update OMP to inspect context breakdown".into())));
-                        continue;
-                    }
-                    if context_tasks.len() >= 8 {
-                        let _ = request.reply.send(Err(HarnessError::Protocol("Context inspection is busy".into())));continue;
-                    }
-                    let process=process.clone();let unsupported=context_unsupported.clone();
-                    context_tasks.spawn(async move {
-                        let timeout=request.deadline.saturating_duration_since(tokio::time::Instant::now());
-                        let result=process.request_with_timeout(json!({"type":"get_context_breakdown"}),timeout).await;
-                        let report=match result {
-                            Ok(value)=>Ok(crate::context_breakdown::omp(&value)),
-                            Err(error) if error.to_string().contains("Unknown command")=>{
-                                unsupported.store(true,std::sync::atomic::Ordering::Release);
-                                Err(HarnessError::Unsupported("Update OMP to inspect context breakdown".into()))
-                            }
-                            Err(_)=>Err(HarnessError::Protocol("OMP context inspection failed or timed out".into())),
-                        };
-                        let _=request.reply.send(report);
-                    });
+            Some(request) = context_requests.recv() => {
+                if request.reply.is_closed() || request.deadline <= tokio::time::Instant::now() {continue;}
+                if context_unsupported.load(std::sync::atomic::Ordering::Acquire) {
+                    let _ = request.reply.send(Err(HarnessError::Unsupported("Update OMP to inspect context breakdown".into())));
+                    continue;
                 }
+                if context_tasks.len() >= 8 {
+                    let _ = request.reply.send(Err(HarnessError::Protocol("Context inspection is busy".into())));continue;
+                }
+                let process=process.clone();let unsupported=context_unsupported.clone();
+                context_tasks.spawn(async move {
+                    let timeout=request.deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let result=process.request_with_timeout(json!({"type":"get_context_breakdown"}),timeout).await;
+                    let report=match result {
+                        Ok(value)=>Ok(crate::context_breakdown::omp(&value)),
+                        Err(error) if error.to_string().contains("Unknown command")=>{
+                            unsupported.store(true,std::sync::atomic::Ordering::Release);
+                            Err(HarnessError::Unsupported("Update OMP to inspect context breakdown".into()))
+                        }
+                        Err(_)=>Err(HarnessError::Protocol("OMP context inspection failed or timed out".into())),
+                    };
+                    let _=request.reply.send(report);
+                });
             }
             _ = context_tasks.join_next(), if !context_tasks.is_empty() => {}
 

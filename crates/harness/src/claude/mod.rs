@@ -1438,21 +1438,19 @@ async fn run_session(session: Session) {
         }
         let tail_at = tail.as_ref().and_then(ForkTail::next_read);
         tokio::select! {
-            request=context_requests.recv() => {
-                if let Some(request)=request {
-                    if request.reply.is_closed() || request.deadline<=tokio::time::Instant::now() {continue;}
-                    if !inspection_supported || title_only {
-                        let _=request.reply.send(Err(HarnessError::Unsupported("Context summary requires verified Claude Code 2.1.257 or newer".into())));continue;
-                    }
-                    if !steering.is_empty() || !pending_controls.is_empty() || config_unsure {
-                        let _=request.reply.send(Err(HarnessError::Protocol("Runtime configuration is not settled".into())));continue;
-                    }
-                    if pending_context.len()>=8 {let _=request.reply.send(Err(HarnessError::Protocol("Context inspection is busy".into())));continue;}
-                    let id=format!("zeron_context_{}",uuid::Uuid::new_v4());
-                    let line=serde_json::json!({"type":"control_request","request_id":id,"request":{"subtype":"get_context_usage","detail":"summary"}}).to_string();
-                    // Inspection is never replayed as configuration or as a prompt.
-                    if stdin.tx.send(StdinMsg::Line(line)).is_ok() {pending_context.insert(id,request);}
+            Some(request) = context_requests.recv() => {
+                if request.reply.is_closed() || request.deadline<=tokio::time::Instant::now() {continue;}
+                if !inspection_supported || title_only {
+                    let _=request.reply.send(Err(HarnessError::Unsupported("Context summary requires verified Claude Code 2.1.257 or newer".into())));continue;
                 }
+                if !steering.is_empty() || !pending_controls.is_empty() || config_unsure {
+                    let _=request.reply.send(Err(HarnessError::Protocol("Runtime configuration is not settled".into())));continue;
+                }
+                if pending_context.len()>=8 {let _=request.reply.send(Err(HarnessError::Protocol("Context inspection is busy".into())));continue;}
+                let id=format!("zeron_context_{}",uuid::Uuid::new_v4());
+                let line=serde_json::json!({"type":"control_request","request_id":id,"request":{"subtype":"get_context_usage","detail":"summary"}}).to_string();
+                // Inspection is never replayed as configuration or as a prompt.
+                if stdin.tx.send(StdinMsg::Line(line)).is_ok() {pending_context.insert(id,request);}
             }
             _=tokio::time::sleep_until(context_deadline.unwrap_or_else(tokio::time::Instant::now)), if context_deadline.is_some()=>{
                 let now=tokio::time::Instant::now();
