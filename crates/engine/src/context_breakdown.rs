@@ -130,7 +130,9 @@ impl SessionsEngine {
         let Some((run_id, config, control)) = live else {
             return lock(&cache.latest)
                 .as_ref()
-                .filter(|c| c.config == selected)
+                .filter(|c| {
+                    c.config == selected && c.report.availability == ContextAvailability::Available
+                })
                 .map(|cached| {
                     let mut report = cached.report.clone();
                     report.stale = true;
@@ -199,7 +201,8 @@ impl SessionsEngine {
                 | ContextAvailability::NotApplicable
                 | ContextAvailability::Unsupported
         ) && let Some(cached) = lock(&cache.latest).as_mut().filter(|cached| {
-            cached.config == selected
+            cached.report.availability == ContextAvailability::Available
+                && cached.config == selected
                 && cached.report.runtime_id == run_id
                 && cached.resume_binding == native_before
         }) {
