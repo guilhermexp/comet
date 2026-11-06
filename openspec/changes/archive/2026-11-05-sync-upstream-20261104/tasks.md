@@ -55,7 +55,7 @@ A exceção de baseline da seção 5 foi revogada pelo dono. Falhas herdadas ent
 - [x] 6.4 R4: reduzir schema sessions dentro do orçamento atual.
 - [x] 6.5 R5: corrigir ETXTBSY na raiz e provar ao menos 30 invocações sem falha.
 - [x] 6.6 R6: portar os caminhos Windows usados, preservando implementações reais e provar os pacotes native-platform-check via GNU.
-- [ ] 6.7 Executar todos os gates exigidos até exit 0; corrigir falhas adicionais; avaliar leaks conforme CI.
+- [x] 6.7 Executar todos os gates exigidos até exit 0; corrigir falhas adicionais; avaliar leaks conforme CI.
 - [x] 6.8 Atualizar proveniência/vendor, DOX, conflicts/verification e relatório absoluto novo, sem publicação nem archive.
 
 As falhas adicionais de pilha, Git broker, Cloud RPC, interrupt, Cursor JSON, Stop, discovery, hook roots, log writer, isolamento do browser, acceptor IPC, fixture Skill Usage e publicação da fila entram em 6.7; não há exceção de baseline. A execução nativa dos jobs Windows continua exigindo infraestrutura Windows: a única box pareada é Linux amd64. O cross-check GNU cobre o par harness/engine, sem substituir GUI, runtime, instalador ou testes Windows. Os jobs exclusivos macOS/iOS ficam “provado só no CI remoto”, conforme o brief, sem recibo remoto novo desta rodada. Não marcar 6.7 concluído enquanto faltar essa prova; não fazer dispatch ou publicação para obtê-la.
@@ -110,3 +110,8 @@ Recibo remoto recebido neste follow-up: o head 8ec7ab6e6 teve 14 checks verdes (
 - [x] 12.2 Terminar launchers validados primeiro por handles retidos e criação conferida; expandir somente o listener, continuar após erros e devolver o primeiro.
 - [x] 12.3 Limpar a captura de cada teste live no início, com regressão determinística para boundaries antigos.
 - [x] 12.4 Preview e OMP, GNU preview/harness/engine, core, all-targets, fmt e OpenSpec strict exit 0; DOX/relatório, sem push e sem alterar test-core.sh.
+
+## 13. Aceite remoto e revisão (2026-11-06)
+
+- [x] 13.1 CI da PR #26 no head `a41d160e6` (merge ref com origin/main `3f10dc3a0`): 18 checks verdes — core-tests, test, ui-tests, ios-tests, macos-frame-recovery, linux-browser, offline-linux, native-platform-check (macos-15, windows-latest), split-host-probe (macos-15, ubuntu-24.04), runtime-packaging (ubuntu-24.04, windows-latest), networking (macos-latest), cursor-compatibility, changes, coordinator, CodeRabbit. `rust-tests` pulado pela regra do workflow em pull_request; `windows.yml` é manual por desenho do fork e não integra o gate da PR. Isto fecha a pendência remota de 6.7.
+- [x] 13.2 Gate `review-pair.sh --gate` rodadas 1–8 sobre base `3f866aeb9`: achados corrigidos (seções 7–12) ou refutados com evidência; falso positivo gitleaks (nonce de exemplo RFC 6455) em allowlist exata. Registro: `.tmp/verify/sync-upstream-20261104/review-pair/decisions.md` no checkout Mac do orquestrador. Modalidade: revisão automática com tratamento de achados.
