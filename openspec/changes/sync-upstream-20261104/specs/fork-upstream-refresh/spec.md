@@ -1,5 +1,14 @@
 ## ADDED Requirements
 
+### Requirement: OMP steering follows the acknowledged turn prompt
+
+The integration SHALL hold complete steering messages until the prompt opening their turn has been acknowledged, including while attachment loading is pending. It SHALL drain messages in mailbox order while preserving attachments and message IDs, and SHALL retain host-tool result ordering and cancellation.
+
+#### Scenario: Messages arrive while a warm turn loads an attachment or awaits its prompt ACK
+- **Test:** integration
+- **WHEN** a warm OMP runtime receives follow-up messages while its new prompt is gated on an attachment or its acknowledgement
+- **THEN** the child receives the opening prompt before every steer, and subsequent steering frames and consumption IDs retain their input order
+
 ### Requirement: Windows server termination continues after individual process failures
 
 The integration SHALL attempt termination of every safely captured process handle, including the launcher root, before returning the first relevant error. A descendant that cannot be opened or whose creation cannot be read SHALL be logged and skipped together with descendants that cannot be validated through it. Termination SHALL never use a bare PID, and a captured child SHALL NOT predate its captured parent.

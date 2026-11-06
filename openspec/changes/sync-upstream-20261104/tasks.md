@@ -95,3 +95,11 @@ Esta revisão não transforma o check GNU em execução Windows nativa; a pendê
 
 
 Recibo remoto recebido neste follow-up: o head 8ec7ab6e6 teve 14 checks verdes (13 jobs Actions e o status CodeRabbit), inclusive Windows nativo (compilação, resolução de runtime e inicialização da projeção, etapas conferidas pela API), iOS, macOS frame recovery e browser Linux. Não encerra 6.7: core/test desse head falharam no merge ref e dois jobs macOS foram cancelados pelo runner indisponível. Os novos commits locais precisam ser publicados pelo dono antes de obter CI da integração atual; sem dispatch/publicação nesta execução.
+
+
+## 11. Revisão rodada 6 — ordem OMP e evidência live (2026-11-05)
+
+- [x] 11.1 RED determinístico com child que registra frames e preflight/ACK controlados por eventos, sem sleep; preservar ordem, anexos e message_id.
+- [ ] 11.2 Reter steers até ACK do prompt e drenar em ordem, conservando host tools, cancelamento, D4/F3 e runtime warm; GREEN.
+- [ ] 11.3 Separar output/cwd dos dois testes live por subdiretório próprio; não executar provider real sem opt-in.
+- [ ] 11.4 Testes OMP harness/engine, core, workspace completo, all-targets check, fmt, GNU e OpenSpec strict exit 0; DOX e relatório round2, sem push/archive. Não alterar test-core.sh para o achado refutado.
