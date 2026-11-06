@@ -930,6 +930,7 @@ OMP telemetry tests resolve Session roots through `omp_sessions_root_in`/`read_i
 | `session_host::read_retained_output_chunk` — bounded passive recovery, aged cursors and retained floors | integration | Comet downstream: `cargo test -p zeron-workers-unpeel --test terminal_history` |
 | `runtimes/setup_conformance_tests.rs`: ten executable shell reporters and shared transport | integration | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core --lib setup_conformance` |
 | OMP/Pi/Amp/OpenCode adapter and callback contracts; Prime native ownership, framing, cancellation and resume | unit | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core --lib` |
+| `browser_mcp` process retirement and `platform` termination errors | unit — Linux absent-PID filesystem regressions; portable denied-error preservation; Windows library compile | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-core` · Windows GNU core library check |
 | Prime native lifecycle through Comet Host/journal, same-PTY resume and private daemon teardown | integration | Manual official 0.10 CLI probe with private HOME/provider/XDG, hook root distinct from state, managed and external saved history, real Host input/resume/stop APIs and loopback model; record actual generations/provider UUID, never a hosted-model/production-profile substitute |
 | `crates/unpeel-tui/src/activity.rs`: accepted durable seeds and live-event precedence | unit | `cargo test --manifest-path third_party/unpeel/crates/Cargo.toml -p unpeel-tui --bin unpeel activity` |
 
@@ -1047,3 +1048,5 @@ Comet's `crates/ui/src/workers/terminal.rs`, not the Host reader.
 Round2 CI: app_paths default-hook fixture runs in a private child with COMET_WORKERS_HOOKS_DIR removed, then independently verifies the explicit trimmed override. Kimi conformance counts nine parsed managed commands pointing to the resolved hook root, retaining the original theme/user-hook/event/matcher checks. No fixture assumes the caller omitted a supported isolation override.
 
 Session lifecycle socket I/O imports and SOCKET_IO_TIMEOUT share the Unix gate with socket_command; non-Unix builds must not retain its unused std::io imports or timeout constant.
+
+Browser cleanup must finish when an identity-checked positive PID disappears before termination. The platform seam reports definitive absence as NotFound; browser retirement accepts only that error as already stopped. Permission/other errors preserve artifacts and return through the caller's trace path. local_urls::stop_server_for_url keeps its strict error policy. Keep the existing identity checks and daemon grace/escalation budget; cleanup tests never signal an allocatable PID.

@@ -469,6 +469,43 @@ fn remove_singleton_files(dir: &Path) {
     }
 }
 
+fn browser_termination_result(result: std::io::Result<()>) -> std::io::Result<()> {
+    result
+}
+
+// Called only after the caller has checked the orphan's argv and ownership.
+fn retire_orphaned_browser(
+    pid: i32,
+    profile: &Path,
+    mut terminate: impl FnMut(i32, bool) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    browser_termination_result(terminate(pid, true))?;
+    remove_singleton_files(profile);
+    Ok(())
+}
+
+// Called only for an identity-checked daemon without a live child browser.
+fn retire_browserless_daemon(
+    pid: i32,
+    key: &str,
+    socket_dir: &Path,
+    mut terminate: impl FnMut(i32, bool) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    browser_termination_result(terminate(pid, false))?;
+    let deadline = Instant::now() + Duration::from_millis(1000);
+    while pid_is_alive(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if pid_is_alive(pid) {
+        browser_termination_result(terminate(pid, true))?;
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for suffix in ["sock", "pid"] {
+        let _ = std::fs::remove_file(socket_dir.join(format!("{key}.{suffix}")));
+    }
+    Ok(())
+}
+
 /// This session's engine daemon pid, only when that process is still alive.
 fn live_daemon_pid(session_id: &str) -> Option<i32> {
     let key = engine_session_key(session_id);
@@ -566,7 +603,9 @@ falling back to {}",
         if pid_is_alive(pid) && !ours {
             let fallback_str = fallback.to_string_lossy();
             if pid_command_line(pid).is_some_and(|cmd| cmd.contains(fallback_str.as_ref())) {
-                if let Err(error) = crate::platform::terminate_process(pid, true) {
+                if let Err(error) =
+                    retire_orphaned_browser(pid, &fallback, crate::platform::terminate_process)
+                {
                     trace(&format!(
                         "failed to terminate orphaned browser pid={pid}: {error}"
                     ));
@@ -575,8 +614,9 @@ falling back to {}",
                 trace(&format!(
                     "killed orphaned browser chrome pid={pid} session={session_id}"
                 ));
+            } else {
+                remove_singleton_files(&fallback);
             }
-            remove_singleton_files(&fallback);
         } else if !pid_is_alive(pid) {
             remove_singleton_files(&fallback);
         }
@@ -590,28 +630,16 @@ falling back to {}",
         if !pid_has_children(daemon)
             && pid_command_line(daemon).is_some_and(|cmd| cmd.contains("agent-browser"))
         {
-            if let Err(error) = crate::platform::terminate_process(daemon, false) {
+            if let Err(error) = retire_browserless_daemon(
+                daemon,
+                &engine_session_key(session_id),
+                &engine_socket_dir(),
+                crate::platform::terminate_process,
+            ) {
                 trace(&format!(
-                    "failed to terminate browserless daemon pid={daemon}: {error}"
+                    "failed to retire browserless daemon pid={daemon}: {error}"
                 ));
                 return fallback;
-            }
-            let deadline = Instant::now() + Duration::from_millis(1000);
-            while pid_is_alive(daemon) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            if pid_is_alive(daemon) {
-                if let Err(error) = crate::platform::terminate_process(daemon, true) {
-                    trace(&format!(
-                        "failed to kill browserless daemon pid={daemon}: {error}"
-                    ));
-                    return fallback;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            let key = engine_session_key(session_id);
-            for suffix in ["sock", "pid"] {
-                let _ = std::fs::remove_file(engine_socket_dir().join(format!("{key}.{suffix}")));
             }
             trace(&format!(
                 "restarted browserless daemon pid={daemon} session={session_id} \
@@ -1451,6 +1479,101 @@ fn trace(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn absent_positive_pid() -> i32 {
+        // This PID cannot be allocated, so the regression cannot signal a
+        // recycled PID belonging to another test or development session.
+        let maximum: i32 = std::fs::read_to_string("/proc/sys/kernel/pid_max")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(maximum < i32::MAX);
+        assert!(!pid_is_alive(i32::MAX));
+        i32::MAX
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exited_browser_pid_does_not_leave_singleton_files() {
+        let root = tempfile::tempdir().unwrap();
+        let pid = absent_positive_pid();
+        std::os::unix::fs::symlink(format!("host-{pid}"), root.path().join("SingletonLock"))
+            .unwrap();
+        for name in ["SingletonSocket", "SingletonCookie"] {
+            std::fs::write(root.path().join(name), b"stale").unwrap();
+        }
+        let names = ["SingletonLock", "SingletonSocket", "SingletonCookie"];
+        assert!(names
+            .iter()
+            .all(|name| std::fs::symlink_metadata(root.path().join(name)).is_ok()));
+        let result = retire_orphaned_browser(pid, root.path(), crate::platform::terminate_process);
+        assert!(
+            names
+                .iter()
+                .all(|name| std::fs::symlink_metadata(root.path().join(name)).is_err()),
+            "an exited browser must not leave singleton artifacts: {result:?}"
+        );
+        assert!(result.is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exited_daemon_pid_does_not_leave_socket_or_pid_files() {
+        let root = tempfile::tempdir().unwrap();
+        let pid = absent_positive_pid();
+        let key = engine_session_key("exited");
+        let socket = root.path().join(format!("{key}.sock"));
+        let pid_file = root.path().join(format!("{key}.pid"));
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        std::fs::write(&pid_file, pid.to_string()).unwrap();
+        assert!(socket.exists() && pid_file.exists());
+        let result =
+            retire_browserless_daemon(pid, &key, root.path(), crate::platform::terminate_process);
+        assert!(
+            !socket.exists() && !pid_file.exists(),
+            "an exited daemon must not leave socket/PID artifacts: {result:?}"
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn denied_browser_termination_preserves_cleanup_artifacts() {
+        let root = tempfile::tempdir().unwrap();
+        let key = engine_session_key("denied");
+        let names = [
+            "SingletonLock".to_owned(),
+            "SingletonSocket".to_owned(),
+            "SingletonCookie".to_owned(),
+            format!("{key}.sock"),
+            format!("{key}.pid"),
+        ];
+        for name in &names {
+            std::fs::write(root.path().join(name), b"retained").unwrap();
+        }
+        let denied = |_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "denied fixture",
+            ))
+        };
+        assert_eq!(
+            retire_orphaned_browser(42, root.path(), denied)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            retire_browserless_daemon(42, &key, root.path(), denied)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        for name in &names {
+            assert_eq!(std::fs::read(root.path().join(name)).unwrap(), b"retained");
+        }
+    }
 
     fn write_state(path: &Path, value: &Value) {
         std::fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();

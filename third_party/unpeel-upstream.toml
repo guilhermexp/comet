@@ -1,6 +1,6 @@
 repository = "https://github.com/unpeel-com/unpeel.git"
 base_revision = "f27e61a6e4fa5e7180f0cd28c129a3b110a89bbc"
-vendored_tree = "ed6b1eac31ddd261194b342d15e99737331bd9a0"
+vendored_tree = "3a74b5601e88a0936579589ba010aeb100daa5d4"
 vendored_from = "working-tree"
 local_modifications_count = 32
 local_deletions = ["apps/website"]
@@ -300,3 +300,10 @@ base_revision_resolves_upstream = false
 # 2026-11-05 — review2 finding 4: cfg(unix) on session_ops socket-only
 # std::io imports and SOCKET_IO_TIMEOUT, matching socket_command. No behavior,
 # base revision, license or historical modification-count change.
+
+# 2026-11-05 — review3 RED: expose browser singleton/socket/PID artifacts
+# retained when an identity-checked process vanishes before termination.
+# Extract existing retirement steps for direct filesystem regressions; keep
+# the existing grace/escalation logic and error behavior until GREEN. Tests
+# use an unallocatable positive PID on Linux and preserve files on denial.
+# Base/MIT/historical modification count unchanged.

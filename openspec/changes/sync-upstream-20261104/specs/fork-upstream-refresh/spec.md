@@ -1,5 +1,14 @@
 ## ADDED Requirements
 
+### Requirement: Browser cleanup tolerates a process disappearing after identity checks
+
+The integration SHALL classify a missing positive process ID as NotFound and allow browser artifact cleanup to continue after that process has disappeared. Permission and other termination errors SHALL preserve the artifacts and be traced. Other callers SHALL retain their explicit error policy.
+
+#### Scenario: An orphaned browser or browserless daemon exits before termination
+- **Test:** unit
+- **WHEN** the identity-checked process is already absent when termination is attempted
+- **THEN** its singleton files or daemon socket/PID files are removed, while access-denied termination errors leave the files intact
+
 ### Requirement: Queued message publication is complete before delivery
 
 The integration SHALL publish each appended or restored queued message with all of its fields before a concurrent local consumer can observe or remove it, without changing the synchronized queue shape.
