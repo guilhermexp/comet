@@ -365,6 +365,11 @@ async fn context_rpc_never_spawns_and_reads_only_the_selected_live_host() {
     let second: ContextBreakdown = serde_json::from_value(b.unwrap()).unwrap();
     assert_eq!(first, second);
     assert_eq!(first.used_tokens, Some(828300));
+    assert_eq!(
+        first.availability,
+        ContextAvailability::Partial,
+        "OMP fragment estimates are explicitly Partial"
+    );
     assert_eq!(first.host_device_id, core.device_id);
     assert_eq!(first.chat_id, "chat");
     assert!(!first.stale);
@@ -380,15 +385,23 @@ async fn context_rpc_never_spawns_and_reads_only_the_selected_live_host() {
         "concurrent host reads coalesce"
     );
     core.sessions.terminate("chat").await.unwrap();
-    let retained: ContextBreakdown = serde_json::from_value(
+    let unavailable: ContextBreakdown = serde_json::from_value(
         client
             .call("GetChatContextBreakdown", json!({"chatId":"chat"}))
             .await
             .unwrap(),
     )
     .unwrap();
-    assert!(retained.stale);
-    assert_eq!(retained.used_tokens, first.used_tokens);
+    assert_eq!(unavailable.availability, ContextAvailability::NotApplicable);
+    assert!(
+        !unavailable.stale,
+        "Partial is not a retained Available measurement"
+    );
+    assert_eq!(unavailable.used_tokens, None);
+    assert_eq!(
+        unavailable.reason.as_deref(),
+        Some("No live runtime to inspect")
+    );
     assert_eq!(
         std::fs::read_to_string(&log)
             .unwrap()
@@ -398,7 +411,7 @@ async fn context_rpc_never_spawns_and_reads_only_the_selected_live_host() {
         1
     );
     println!(
-        "SANITIZED host/RPC smoke: no-spawn, ownership, coalescing, native categories, stale retained snapshot; one prompt, one inspection"
+        "SANITIZED host/RPC smoke: no-spawn, ownership, coalescing, native categories, Partial becomes unavailable after runtime exit; one prompt, one inspection"
     );
     core.sessions.shutdown().await;
 }
