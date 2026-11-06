@@ -530,6 +530,9 @@ impl DetailsSidebar {
                     div()
                         .text_size(px(12.5))
                         .text_color(theme.text_muted)
+                        .debug_selector(move || {
+                            format!("turn-stats-response:{}", rate(response_rate))
+                        })
                         .child(rate(response_rate)),
                 );
             card = card.child(header);
@@ -577,7 +580,11 @@ impl DetailsSidebar {
                     ),
                 ];
                 for (label, text) in rows {
-                    card = card.child(card_row(None, label, value(text), theme));
+                    let selector = format!("turn-stat-{label}:{text}");
+                    card = card.child(
+                        card_row(None, label, value(text), theme)
+                            .debug_selector(move || selector.clone()),
+                    );
                 }
             }
         }
@@ -811,6 +818,140 @@ mod tests {
     use super::{
         format_cache, format_cost, format_duration_ms, format_token_count, project_skills,
     };
+
+    #[gpui::test]
+    fn turn_stats_keep_missing_model_time_unavailable_in_the_rendered_card(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::super::*;
+        use gpui::{AppContext, Render, Window};
+        let data = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            crate::settings::init(crate::settings::UiSettings::default(), data.path(), cx);
+            cx.set_global(Theme::dark());
+        });
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            state.local_device_id = Some("host".into());
+            state.sessions = vec![
+                serde_json::from_value(serde_json::json!({
+                    "chatId": "chat", "deviceId": "host", "status": "idle",
+                    "updatedAt": chrono::Utc::now()
+                }))
+                .unwrap(),
+            ];
+        });
+        let workers = cx.new(|cx| WorkersModel::detached(state.clone(), cx));
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        let pickers = composer.read_with(cx, |c, _| c.pickers().clone());
+        let sidebar = cx.new(|cx| {
+            DetailsSidebar::new(
+                state.clone(),
+                workers,
+                DetailsSidebarPreferences::default(),
+                pickers,
+                composer,
+                cx,
+            )
+        });
+        sidebar.update(cx, |s, _| {
+            s.sidebar.set_context(Some(DetailsContext {
+                key: "fixture:chat".into(),
+                cwd: data.path().into(),
+                branch: None,
+                chat_id: Some("chat".into()),
+                target_device_id: Some("host".into()),
+                mode: crate::details_sidebar::context::DetailsMode::Orchestrator,
+            }));
+            s.checkout_not_git = true;
+            s.turn_stats_collapsed = false;
+        });
+        struct Probe {
+            sidebar: Entity<DetailsSidebar>,
+            _observe: Subscription,
+        }
+        impl Render for Probe {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let theme = Theme::of(cx).clone();
+                let card = self.sidebar.update(cx, |s, cx| {
+                    let context = s.sidebar.context().unwrap().clone();
+                    s.render_session_card(
+                        &context,
+                        div().into_any_element(),
+                        false,
+                        None,
+                        &theme,
+                        cx,
+                    )
+                });
+                div().w(px(300.0)).h(px(1000.0)).child(card)
+            }
+        }
+        let (_, window) = cx.add_window_view(|_, cx| Probe {
+            sidebar: sidebar.clone(),
+            _observe: cx.observe(&sidebar, |_, _, cx| cx.notify()),
+        });
+        for (model_ms, duration_ms, selectors) in [
+            (
+                None,
+                10_000,
+                [
+                    "turn-stats-response:—",
+                    "turn-stat-Response:—",
+                    "turn-stat-Model time:—",
+                    "turn-stat-Whole turn:~50 tok/s",
+                ],
+            ),
+            (
+                Some(0),
+                10_000,
+                [
+                    "turn-stats-response:—",
+                    "turn-stat-Response:—",
+                    "turn-stat-Model time:0.0s",
+                    "turn-stat-Whole turn:~50 tok/s",
+                ],
+            ),
+            (
+                Some(2_000),
+                10_000,
+                [
+                    "turn-stats-response:~250 tok/s",
+                    "turn-stat-Response:~250 tok/s",
+                    "turn-stat-Model time:2.0s",
+                    "turn-stat-Whole turn:~50 tok/s",
+                ],
+            ),
+            (
+                None,
+                0,
+                [
+                    "turn-stats-response:—",
+                    "turn-stat-Response:—",
+                    "turn-stat-Model time:—",
+                    "turn-stat-Whole turn:—",
+                ],
+            ),
+        ] {
+            state.update(window, |state, _| {
+                state.sessions[0].turn_stats = Some(zeron_proto::TurnStats {
+                    model_ms,
+                    duration_ms,
+                    output_tokens: 500,
+                    ..Default::default()
+                });
+            });
+            sidebar.update(window, |_, cx| cx.notify());
+            window.update(|w, cx| w.draw(cx).clear());
+            for selector in selectors {
+                assert!(
+                    window.debug_bounds(selector).is_some(),
+                    "missing rendered {selector} for model_ms={model_ms:?}, duration_ms={duration_ms}"
+                );
+            }
+        }
+    }
 
     #[gpui::test]
     fn context_disclosure_is_inline_keyboard_accessible_and_scoped(cx: &mut gpui::TestAppContext) {
