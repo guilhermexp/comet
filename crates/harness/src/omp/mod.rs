@@ -1076,6 +1076,19 @@ async fn run_session(
                         Duration::from_millis(500),
                         process.request(json!({ "type": "abort" })),
                     ).await;
+                    // The reader queues events separately from RPC replies:
+                    // frames preceding the abort ACK may still be unnormalized.
+                    // Consume only this ready FIFO prefix; live producers must
+                    // not extend Stop, and no terminal frame can emit a second Done.
+                    let ready_frames = events.len();
+                    'ready: for _ in 0..ready_frames {
+                        let Ok(frame) = events.try_recv() else { break; };
+                        for event in normalizer.push(frame) {
+                            if !emit(&event_tx, event).await {
+                                break 'ready;
+                            }
+                        }
+                    }
                     let _ = emit_done(&event_tx, &mut normalizer, AgentEvent::Done {
                         status: DoneStatus::Interrupted,
                         result: None,
