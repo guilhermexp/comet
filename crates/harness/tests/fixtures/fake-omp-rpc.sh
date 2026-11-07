@@ -272,6 +272,49 @@ while IFS= read -r line; do
       respond "$line" '{}'
       ;;
     prompt)
+      case "$scenario" in
+        timing-*)
+          turn_count=$((turn_count + 1))
+          if [ "$scenario" = "timing-warm" ] && [ "$turn_count" = 2 ]; then
+            respond "$line" '{}'
+            emit '{"type":"message_start","message":{"role":"assistant"}}'
+            emit '{"type":"message_end","message":{"role":"assistant","duration":250.4,"usage":{"input":11,"output":4,"cacheRead":13,"cacheWrite":17,"cost":{"total":0.25}}}}'
+            emit '{"type":"agent_end","messages":[]}'
+            continue
+          fi
+          [ "$scenario" = "timing-prompt-error" ] || respond "$line" '{}'
+          emit '{"type":"message_start","message":{"role":"assistant"}}'
+          emit '{"type":"message_end","message":{"role":"assistant","duration":125.4,"usage":{"input":2,"output":3,"cacheRead":5,"cacheWrite":7,"cost":{"total":0.125}}}}'
+          case "$scenario" in
+            timing-stop-model|timing-stop-model-child|timing-eof|timing-error|timing-prompt-error|timing-warm)
+              emit '{"type":"message_start","message":{"role":"assistant"}}' ;;
+            timing-stop-tool)
+              emit '{"type":"message_start","message":{"role":"toolResult"}}'
+              emit '{"type":"message_end","message":{"role":"toolResult","duration":999,"usage":{"output":999}}}'
+              emit '{"type":"tool_execution_start","toolCallId":"timing-tool","toolName":"bash","args":{"command":"fixture"}}' ;;
+            timing-stop-between)
+              emit '{"type":"message_start","message":{"role":"user"}}' ;;
+          esac
+          case "$scenario" in
+            timing-stop-child|timing-stop-model-child)
+              emit '{"type":"subagent_lifecycle","payload":{"id":"timing-child","parentToolCallId":"child-tool","status":"started","agent":"fixture"}}'
+              emit '{"type":"subagent_event","payload":{"id":"timing-child","event":{"type":"message_start","message":{"role":"assistant"}}}}'
+              emit '{"type":"subagent_event","payload":{"id":"timing-child","event":{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"child barrier"}}}}'
+              if [ "$scenario" = "timing-stop-model-child" ]; then
+                emit '{"type":"subagent_event","payload":{"id":"timing-child","event":{"type":"message_end","message":{"role":"assistant","duration":999,"usage":{"output":999}}}}}'
+                emit '{"type":"subagent_lifecycle","payload":{"id":"timing-child","status":"completed"}}'
+              fi ;;
+          esac
+          # FIFO barrier: the driver processed every lifecycle frame above.
+          emit '{"type":"command_output","text":"timing-ready"}'
+          case "$scenario" in
+            timing-eof) exit 12 ;;
+            timing-error) emit '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"error","errorMessage":"synthetic timing error"}]}' ;;
+            timing-prompt-error) emit "{\"type\":\"response\",\"id\":\"$(field id "$line")\",\"command\":\"prompt\",\"success\":false,\"error\":\"synthetic prompt failure\"}" ;;
+            timing-warm) emit '{"type":"agent_end","messages":[]}' ;;
+          esac
+          continue ;;
+      esac
       if [ "$scenario" = "local-compaction-background" ]; then
         respond "$line" '{"agentInvoked":false}'
         (
