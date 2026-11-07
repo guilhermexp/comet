@@ -263,7 +263,15 @@ pub fn omp(value: &Value) -> ContextBreakdown {
         || native.context_files.availability != ContextAvailability::Available
     {
         report.memory_files.availability = if report.memory_files.items.is_empty() {
-            ContextAvailability::Unsupported
+            match (
+                native.context_files.availability,
+                native.memory.availability,
+            ) {
+                (ContextAvailability::NotApplicable, ContextAvailability::NotApplicable) => {
+                    ContextAvailability::NotApplicable
+                }
+                _ => ContextAvailability::Unsupported,
+            }
         } else {
             ContextAvailability::Partial
         };
