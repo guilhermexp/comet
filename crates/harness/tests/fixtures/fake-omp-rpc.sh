@@ -185,6 +185,15 @@ while IFS= read -r line; do
         respond "$line" '{"protocolVersion":2}'
       fi
       ;;
+    get_context_breakdown)
+      if [ "$scenario" = "context-unknown" ]; then
+        emit "{\"type\":\"response\",\"id\":\"$(field id "$line")\",\"command\":\"get_context_breakdown\",\"success\":false,\"error\":\"Unknown command: get_context_breakdown\"}"
+        continue
+      fi
+      if [ "$scenario" = "context-exit" ]; then exit 0; fi
+      if [ "$scenario" = "context-timeout" ]; then continue; fi
+      respond "$line" '{"schemaVersion":1,"identity":{"sessionId":"s-1","model":{"provider":"openai-codex","id":"gpt-5.6-sol"},"contextWindow":1000000,"compactionEpoch":0,"contextUsageRevision":1,"messageCount":2},"snapshot":{"capturedAtMs":1000,"lastProviderAtMs":900,"usedBasis":"provider-anchor","streaming":false,"pendingRequest":false},"total":{"usedTokens":828300,"contextWindow":1000000,"reserveTokens":33000,"freeTokens":138700},"categories":{"messages":{"tokens":828300,"basis":"provider-anchor-residual"},"systemPrompt":{"tokens":0,"basis":"tokenizer-estimate"},"systemTools":{"tokens":0,"basis":"tokenizer-estimate"},"systemContext":{"tokens":0,"basis":"tokenizer-estimate"},"skills":{"tokens":0,"basis":"tokenizer-estimate"}}}'
+      ;;
     get_state)
       if [ "$scenario" = "live-event-flood" ]; then
         sequence=0
@@ -260,9 +269,79 @@ while IFS= read -r line; do
     extension_ui_response|host_tool_result)
       ;;
     abort)
+      case "$scenario" in
+        timing-stop-queued-*)
+          # Transport gate: the actor chose interrupt before sending abort.
+          # The reader must enqueue these frames before routing the ACK below,
+          # while the actor awaits that ACK instead of normalizing events.
+          case "$scenario" in
+            timing-stop-queued-model|timing-stop-queued-model-child|timing-stop-queued-complete)
+              emit '{"type":"message_start","message":{"role":"assistant"}}' ;;
+            timing-stop-queued-tool)
+              emit '{"type":"message_start","message":{"role":"toolResult"}}'
+              emit '{"type":"message_end","message":{"role":"toolResult","duration":999,"usage":{"output":999}}}'
+              emit '{"type":"tool_execution_start","toolCallId":"timing-tool-queued","toolName":"bash","args":{"command":"fixture"}}' ;;
+          esac
+          case "$scenario" in
+            timing-stop-queued-complete|timing-stop-queued-finish)
+              emit '{"type":"message_end","message":{"role":"assistant","duration":250.4,"usage":{"input":11,"output":4,"cacheRead":13,"cacheWrite":17,"cost":{"total":0.25}}}}'
+              emit '{"type":"agent_end","messages":[]}' ;;
+          esac
+          case "$scenario" in
+            timing-stop-queued-child|timing-stop-queued-model-child)
+              emit '{"type":"subagent_lifecycle","payload":{"id":"timing-child","parentToolCallId":"child-tool","status":"started","agent":"fixture"}}'
+              emit '{"type":"subagent_event","payload":{"id":"timing-child","event":{"type":"message_start","message":{"role":"assistant"}}}}'
+              emit '{"type":"subagent_event","payload":{"id":"timing-child","event":{"type":"message_end","message":{"role":"assistant","duration":999,"usage":{"output":999}}}}}'
+              emit '{"type":"subagent_lifecycle","payload":{"id":"timing-child","status":"completed"}}' ;;
+          esac
+          emit '{"type":"command_output","text":"timing-queued"}' ;;
+      esac
       respond "$line" '{}'
       ;;
     prompt)
+      case "$scenario" in
+        timing-*)
+          turn_count=$((turn_count + 1))
+          if [ "$scenario" = "timing-warm" ] && [ "$turn_count" = 2 ]; then
+            respond "$line" '{}'
+            emit '{"type":"message_start","message":{"role":"assistant"}}'
+            emit '{"type":"message_end","message":{"role":"assistant","duration":250.4,"usage":{"input":11,"output":4,"cacheRead":13,"cacheWrite":17,"cost":{"total":0.25}}}}'
+            emit '{"type":"agent_end","messages":[]}'
+            continue
+          fi
+          [ "$scenario" = "timing-prompt-error" ] || respond "$line" '{}'
+          emit '{"type":"message_start","message":{"role":"assistant"}}'
+          emit '{"type":"message_end","message":{"role":"assistant","duration":125.4,"usage":{"input":2,"output":3,"cacheRead":5,"cacheWrite":7,"cost":{"total":0.125}}}}'
+          case "$scenario" in
+            timing-stop-model|timing-stop-model-child|timing-eof|timing-error|timing-prompt-error|timing-warm|timing-stop-queued-finish)
+              emit '{"type":"message_start","message":{"role":"assistant"}}' ;;
+            timing-stop-tool)
+              emit '{"type":"message_start","message":{"role":"toolResult"}}'
+              emit '{"type":"message_end","message":{"role":"toolResult","duration":999,"usage":{"output":999}}}'
+              emit '{"type":"tool_execution_start","toolCallId":"timing-tool","toolName":"bash","args":{"command":"fixture"}}' ;;
+            timing-stop-between)
+              emit '{"type":"message_start","message":{"role":"user"}}' ;;
+          esac
+          case "$scenario" in
+            timing-stop-child|timing-stop-model-child)
+              emit '{"type":"subagent_lifecycle","payload":{"id":"timing-child","parentToolCallId":"child-tool","status":"started","agent":"fixture"}}'
+              emit '{"type":"subagent_event","payload":{"id":"timing-child","event":{"type":"message_start","message":{"role":"assistant"}}}}'
+              emit '{"type":"subagent_event","payload":{"id":"timing-child","event":{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"child barrier"}}}}'
+              if [ "$scenario" = "timing-stop-model-child" ]; then
+                emit '{"type":"subagent_event","payload":{"id":"timing-child","event":{"type":"message_end","message":{"role":"assistant","duration":999,"usage":{"output":999}}}}}'
+                emit '{"type":"subagent_lifecycle","payload":{"id":"timing-child","status":"completed"}}'
+              fi ;;
+          esac
+          # FIFO barrier: the driver processed every lifecycle frame above.
+          emit '{"type":"command_output","text":"timing-ready"}'
+          case "$scenario" in
+            timing-eof) exit 12 ;;
+            timing-error) emit '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"error","errorMessage":"synthetic timing error"}]}' ;;
+            timing-prompt-error) emit "{\"type\":\"response\",\"id\":\"$(field id "$line")\",\"command\":\"prompt\",\"success\":false,\"error\":\"synthetic prompt failure\"}" ;;
+            timing-warm) emit '{"type":"agent_end","messages":[]}' ;;
+          esac
+          continue ;;
+      esac
       if [ "$scenario" = "local-compaction-background" ]; then
         respond "$line" '{"agentInvoked":false}'
         (
@@ -607,7 +686,10 @@ while IFS= read -r line; do
         fi
         emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"after-dup"}}'
         emit '{"type":"agent_end","messages":[]}'
-      elif [ "$scenario" = "multi-turn" ]; then
+      elif [ "$scenario" = "context-active" ]; then
+        emit '{"type":"agent_start"}'
+        emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"active"}}'
+      elif [ "$scenario" = "multi-turn" ] || [ "$scenario" = "context-unknown" ] || [ "$scenario" = "context-exit" ] || [ "$scenario" = "context-timeout" ]; then
         # One agent run per prompt, in the SAME process. A steer that reaches
         # a turn in flight is answered by the main loop below.
         turn_count=$((turn_count + 1))

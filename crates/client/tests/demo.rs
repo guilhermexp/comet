@@ -27,6 +27,23 @@ fn fast() -> DemoOptions {
     }
 }
 
+#[tokio::test]
+async fn context_inspection_facade_reports_scoped_unavailability_without_usage() {
+    let (client, _dir) = demo(fast());
+    let report = client
+        .get_chat_context_breakdown("host", "chat-veil")
+        .await
+        .unwrap();
+    assert_eq!(report.chat_id, "chat-veil");
+    assert_eq!(report.host_device_id, "host");
+    assert_eq!(
+        report.availability,
+        zeron_proto::ContextAvailability::Unsupported
+    );
+    assert_eq!(report.used_tokens, None);
+    assert!(report.categories.is_empty());
+}
+
 fn wait_for(what: &str, timeout: Duration, mut f: impl FnMut() -> bool) {
     let start = Instant::now();
     while !f() {

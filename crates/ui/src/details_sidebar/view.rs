@@ -238,6 +238,8 @@ use zeron_proto::{
 };
 use zeron_rpc::methods;
 
+#[path = "context_breakdown.rs"]
+mod context_breakdown;
 #[path = "session_card.rs"]
 mod session_card;
 #[path = "skill_usage.rs"]
@@ -504,6 +506,9 @@ pub struct DetailsSidebar {
     project_skill_usage_watch: Option<Task<()>>,
     project_skill_usage_connection: Option<crate::state::EngineHandle>,
     project_skill_usage_available: Option<bool>,
+    context_breakdown: context_breakdown::PanelState,
+    context_breakdown_task: Option<Task<()>>,
+    context_breakdown_connection: Option<crate::state::EngineHandle>,
     context_sources: Option<session_card::ContextSources>,
     context_sources_task: Option<Task<()>>,
     context_sources_pending: Option<String>,
@@ -607,6 +612,9 @@ impl DetailsSidebar {
             project_skill_usage_watch: None,
             project_skill_usage_connection: None,
             project_skill_usage_available: None,
+            context_breakdown: Default::default(),
+            context_breakdown_task: None,
+            context_breakdown_connection: None,
             context_sources: None,
             context_sources_task: None,
             context_sources_pending: None,
@@ -633,6 +641,7 @@ impl DetailsSidebar {
         let before = self.sidebar.load_generation();
         let after = self.sidebar.set_context(context);
         if before != after {
+            self.hide_context_breakdown();
             self.chat_workers
                 .sync_context(self.sidebar.context().map(|context| context.key.as_str()));
             self.source_control_watch = None;
@@ -3099,6 +3108,7 @@ impl DetailsSidebar {
 
     fn render_details(&mut self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         let Some(context) = self.sidebar.context().cloned() else {
+            self.hide_context_breakdown();
             self.hide_project_skill_usage();
             self.ensure_worked_project_diff_watch(Vec::new(), cx);
             self.ensure_dev_server_watch(None, Vec::new(), None, cx);
@@ -3109,6 +3119,7 @@ impl DetailsSidebar {
         };
         let hide_workspace = self.sidebar.widget_hidden("workspace-widget");
         if hide_workspace {
+            self.hide_context_breakdown();
             self.hide_project_skill_usage();
         }
         let hide_workers = self.sidebar.widget_hidden("chat-workers-widget");

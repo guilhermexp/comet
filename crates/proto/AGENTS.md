@@ -12,6 +12,8 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 
 ## Local Contracts
 
+- `context_breakdown` defines optional ephemeral `GetChatContextBreakdown` metadata, explicit availability and native provenance. Nested category attribution and deferred tools never add active budget; missing cells/lists are not zero. `TurnMetrics.model_timing_incomplete` is defaulted for old peers and invalidates partial native model-time sums, independently of auxiliary cache/cost metrics. Detailed inspection never enters synced documents. Native metadata preserves complete identity/lifecycle, nullable local-change evidence, signed BPE residual and separate historical provider/transcript indices; unknown is never inferred false/zero.
+
 - `ZGX_INTERFACE_V1` é constante de compatibilidade, mas fica fora de `capabilities::CURRENT` no fork: a engine D1a serve plugins/templates sem prometer a interface zgx ausente; esses clientes chamam RPC diretamente e não há capability independente. `BACKGROUND_TASKS_V1` continua anunciado.
 
 - Sync `35561ead`: `AccessMode`/`ChatConfig.access`/`plan`, `RunRequest.extra_mcp`, `Chat.childKind`, `Session.backgroundTasks` e tail/exit code de tool são aditivos com defaults. `childKind` não reparenta: `originChatId` e `parentChatId` continuam fatos independentes. `HarnessId::ALL` conserva OMP/Kimi e acrescenta Fx; identidades ACP registry mantêm validação estrita.
@@ -76,6 +78,8 @@ Crate-base do workspace. Não depende de nenhuma outra crate do repo — se voc�
 - Comandos: `cargo test -p zeron-proto`
 
 | Camada / path | Tier exigido | Como rodar |
+|---|---|---|
+| `src/context_breakdown.rs` (zero/desconhecido, capacidade excedida, nested/deferred sem dupla contagem) | unit | `cargo test --locked -p zeron-proto context_breakdown` |
 | `src/view` (derivações puras) | unit | `cargo test -p zeron-proto` |
 | `src/**` (tipos serde) | unit — roundtrip de serialização quando o shape tem regra | `cargo test -p zeron-proto` |
 | `src/run_errors.rs` + `src/view.rs` (limite, prazo informado, fallback diagnóstico e faixa de status) | unit | `cargo test -p zeron-proto run_errors` · `cargo test -p zeron-proto failure_text_tests` |

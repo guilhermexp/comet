@@ -2670,3 +2670,210 @@ async fn live_unrestorable_session_relaunches_fresh() {
     )));
     assert_eq!(done(&events).0, DoneStatus::Errored);
 }
+
+async fn context_fixture(
+    mode: &str,
+    version: &str,
+) -> (tempfile::TempDir, ClaudeHarness, RunRequest) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("claude");
+    let source = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-context-claude.py"),
+    )
+    .unwrap();
+    std::fs::write(
+        &exe,
+        source.replace("VERSION = \"2.1.318\"", &format!("VERSION = {version:?}")),
+    )
+    .unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut request = request("synthetic prompt");
+    request.cwd = dir.path().to_string_lossy().into_owned();
+    request.env.insert(
+        "COMET_CONTEXT_FIXTURE_LOG".into(),
+        dir.path().join("wire").to_string_lossy().into_owned(),
+    );
+    request
+        .env
+        .insert("COMET_CONTEXT_FIXTURE_MODE".into(), mode.into());
+    request.env.insert(
+        "CLAUDE_CONFIG_DIR".into(),
+        dir.path().join("config").to_string_lossy().into_owned(),
+    );
+    (dir, ClaudeHarness::new().with_executable(exe), request)
+}
+
+#[tokio::test]
+async fn context_summary_between_turns_is_correlated_and_next_prompt_still_works() {
+    let (dir, harness, request) = context_fixture("idle", "2.1.318").await;
+    let (controls, steering, interrupt) = controls("yes");
+    let turn = controls.turn.clone();
+    let mut stream = harness.run(request, controls).await.unwrap().fuse();
+    while let Some(event) = stream.next().await {
+        if matches!(event.unwrap(), AgentEvent::Done { .. }) {
+            break;
+        }
+    }
+    let report = turn.inspect_context().await.unwrap();
+    assert_eq!(report.used_tokens, Some(42));
+    assert_eq!(report.measured_at_ms, None);
+    steering
+        .send(SteerMessage::text("second synthetic prompt"))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = stream.next().await {
+            if matches!(event.unwrap(), AgentEvent::Done { .. }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    interrupt.cancel();
+    while stream.next().await.is_some() {}
+    let wire = std::fs::read_to_string(dir.path().join("wire")).unwrap();
+    let rows: Vec<serde_json::Value> = wire
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rows.iter().filter(|r| r["type"] == "user").count(), 2);
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r["subtype"] == "get_context_usage" && r["detail"] == "summary")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn context_summary_while_active_does_not_emit_a_turn_or_steer() {
+    let (_dir, harness, request) = context_fixture("active", "2.1.318").await;
+    let (controls, _steering, interrupt) = controls("yes");
+    let turn = controls.turn.clone();
+    let mut stream = harness.run(request, controls).await.unwrap().fuse();
+    while let Some(event) = stream.next().await {
+        if matches!(event.unwrap(), AgentEvent::TextDelta { .. }) {
+            break;
+        }
+    }
+    assert_eq!(turn.inspect_context().await.unwrap().used_tokens, Some(42));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), stream.next())
+            .await
+            .is_err()
+    );
+    interrupt.cancel();
+    while stream.next().await.is_some() {}
+}
+
+#[tokio::test]
+async fn context_summary_replies_do_not_postpone_a_held_turn_end() {
+    let (_dir, harness, request) = context_fixture("settle", "2.1.318").await;
+    let (controls, steering, interrupt) = controls("yes");
+    let turn = controls.turn.clone();
+    let mut stream = harness.run(request, controls).await.unwrap().fuse();
+    while let Some(event) = stream.next().await {
+        if matches!(event.unwrap(), AgentEvent::TextDelta { .. }) {
+            break;
+        }
+    }
+    steering
+        .send(SteerMessage::text("absorbed steer"))
+        .await
+        .unwrap();
+    while let Some(event) = stream.next().await {
+        if matches!(event.unwrap(), AgentEvent::TextDelta { .. }) {
+            break;
+        }
+    }
+    // A native result is held for the legacy five-second quiet settlement.
+    // Successful inspection traffic must not reset that turn-state clock.
+    let done = tokio::spawn(async move {
+        while let Some(event) = stream.next().await {
+            if matches!(event.unwrap(), AgentEvent::Done { .. }) {
+                return stream;
+            }
+        }
+        panic!("runtime ended without settling");
+    });
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(turn.inspect_context().await.unwrap().used_tokens, Some(42));
+    }
+    let settled = tokio::time::timeout(Duration::from_millis(1800), done).await;
+    interrupt.cancel();
+    let mut stream = settled
+        .expect("summary controls must not postpone the held turn end")
+        .unwrap();
+    while stream.next().await.is_some() {}
+}
+
+#[tokio::test]
+async fn context_summary_version_gate_timeout_and_exit_preserve_prompt_state() {
+    for (mode, version) in [
+        ("idle", "2.1.256"),
+        ("idle", "unknown"),
+        ("timeout", "2.1.318"),
+        ("exit", "2.1.318"),
+    ] {
+        let (dir, harness, request) = context_fixture(mode, version).await;
+        let (controls, _steering, interrupt) = controls("yes");
+        let turn = controls.turn.clone();
+        let mut stream = harness.run(request, controls).await.unwrap().fuse();
+        while let Some(event) = stream.next().await {
+            if matches!(event.unwrap(), AgentEvent::Done { .. }) {
+                break;
+            }
+        }
+        let inspection = turn.inspect_context();
+        let result = tokio::select! {result=inspection=>result,_=async {while stream.next().await.is_some(){}}=>Err(HarnessError::Protocol("runtime exited".into()))};
+        assert!(result.is_err());
+        interrupt.cancel();
+        while stream.next().await.is_some() {}
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(dir.path().join("wire"))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.iter().filter(|r| r["type"] == "user").count(), 1);
+        let inspections = rows
+            .iter()
+            .filter(|r| r["subtype"] == "get_context_usage")
+            .count();
+        assert_eq!(
+            inspections,
+            usize::from(version == "2.1.318"),
+            "unverified versions must not be probed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn context_summary_never_claims_a_refused_model_switch_is_current() {
+    let (dir, harness, request) = context_fixture("refuse-model", "2.1.318").await;
+    let mut next = request.clone();
+    next.model = Some("new-model".into());
+    let (controls, steering, interrupt) = controls("yes");
+    let turn = controls.turn.clone();
+    let mut stream = harness.run(request, controls).await.unwrap().fuse();
+    while let Some(event) = stream.next().await {
+        if matches!(event.unwrap(), AgentEvent::Done { .. }) {
+            break;
+        }
+    }
+    let mut steer = SteerMessage::text("second synthetic prompt");
+    steer.config = Some(Box::new(next));
+    steering.send(steer).await.unwrap();
+    while let Some(event) = stream.next().await {
+        if matches!(event.unwrap(), AgentEvent::Done { .. }) {
+            break;
+        }
+    }
+    assert!(turn.inspect_context().await.is_err());
+    interrupt.cancel();
+    while stream.next().await.is_some() {}
+    let rows = std::fs::read_to_string(dir.path().join("wire")).unwrap();
+    assert!(!rows.contains("get_context_usage"));
+}

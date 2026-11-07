@@ -622,7 +622,7 @@ pub struct TurnStats {
     pub cost_usd: Option<f64>,
     /// Wall time from the turn's start to its `Done`.
     pub duration_ms: u64,
-    /// Model API time: harness-measured, else `duration_ms - tool_ms`.
+    /// Complete native model API time. Missing/partial timing stays unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_ms: Option<u64>,
     /// Summed tool execution time, from the tools that report one.

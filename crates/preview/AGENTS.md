@@ -33,6 +33,8 @@ Preservar limites de frames, backpressure e teardown de peers. Não colocar cred
 
 ## Verification
 
+O teste de privacidade do catálogo examina o JSON anunciado inteiro, incluindo todos os metadados, e mantém a igualdade do process label. Valores de segredo sintéticos usam alfabeto distinto dos UUIDs gerados, para que IDs aleatórios não sejam confundidos com vazamento de argumento. Não limitar a asserção apenas ao campo process nem repetir o teste até obter um UUID favorável.
+
 Os guards de subprocesso em `tests/discovery.rs` possuem um process group Unix exclusivo e encerram launcher + descendentes no Drop. Matar apenas o shell deixa o servidor com stderr do gate aberto; `dropping_a_launcher_closes_its_servers_output_pipe` exige EOF após teardown, sem retry/sleep. O cenário double-fork mantém seu guard explícito separado.
 
 | Camada / path | Tier | Comando |

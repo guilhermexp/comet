@@ -2,12 +2,25 @@
 
 Tracks local/private fork changes against upstream.
 
+## 2026-11-07: v1.0.18
+
+- Turn stats usa a soma das durações nativas das chamadas ao modelo. Timing ausente, parcial ou interrompido antes de concluir a chamada fica indisponível; tokens, cache e custo recebidos são preservados.
+- Context mantém o indicador compacto e abre o detalhamento nativo por host/runtime, com categorias, origem, atualização e listas limitadas. Inspeção não envia prompts nem faz polling; versões de OMP sem a RPC mostram indisponibilidade, sem quebrar a sessão.
+- Sidebar mostra em azul a quantidade de workers CLI ativos vinculados ao chat, independente do status do chat e do contador de subagentes.
+- Integração com v1.0.17 preserva OMP warm runtime, access/plan e grants MCP. Corrigidos isolamento de configuração, retenção de snapshots, fechamento de mailbox e conclusão da UI após mudanças transitórias de apresentação.
+
 ## 2026-11-06: v1.0.17
 
 - Sync do upstream zeronsh/zeron até `35561ead` (PR #26): busca, Markdown e anotações, smooth scrolling, percentuais Cursor e port do zui, preservando shell gpui, Workers, Usage local, terminal direito, updater e engine in-process do fork.
 - Runtime de plugins e templates ativo no startup normal; grants raiz inalterados (runs sem MCP injetado) e falha em `/plugin-keys` não quebra login nem startup. Interface zgx, Cloud/vault/runner e canal beta seguem dormentes.
 - OMP: steers aguardam o ACK do prompt do turno e saem em ordem; warm runtime respeita acesso, plano e MCP do fork.
 - Correções de Stop em turnos com mensagem chegando, fila de mensagens publicada inteira, acceptor IPC encerrado em filhos herdados, broker Git preso ao próprio HOME e limpeza de navegador/servidores de preview (incluindo Windows).
+
+## 2026-11-05 — Turn stats e Session Context (entrega local)
+
+- Model time e Response rate usam a soma completa das durações nativas; duração fracionária do OMP é preservada por arredondamento verificado, e timing parcial/ausente fica indisponível. Totais de tokens/cache/custo e exclusão de filhos continuam independentes.
+- Context mantém o indicador compacto e abre orçamento inline com categorias, estimativas e listas limitadas. Inspeção é somente leitura no host/runtime selecionado, sem prompt, polling ou provider token-count; falhas retêm o snapshot anterior como stale.
+- Claude usa apenas summary em versão verificada. OMP v1 preserva atribuição aninhada, residual BPE assinado e deferred histórico; o smoke source-built com provider loopback passou sem requests extras em inspeções. Aparência do app instalado não foi comprovada. Sem release, upgrade ou substituição do app.
 
 ## 2026-11-03: v1.0.16
 

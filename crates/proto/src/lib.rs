@@ -11,6 +11,7 @@ pub mod attachment_mentions;
 pub mod change_request_assessment;
 pub mod chat_mentions;
 pub mod cloud;
+pub mod context_breakdown;
 pub mod device_mentions;
 pub mod device_paths;
 pub mod entities;
@@ -33,6 +34,7 @@ pub mod workspace;
 
 pub use agent::*;
 pub use cloud::*;
+pub use context_breakdown::*;
 pub use entities::*;
 pub use preview::*;
 pub use program_status::*;

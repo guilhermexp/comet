@@ -12,6 +12,8 @@ Dona da fronteira UI↔engine. É o que mantém honesto o modo in-process: mesmo
 
 ## Local Contracts
 
+- `GetChatContextBreakdown` is additive unary/forwardable with typed proto params/reply and a 10s forwarding deadline. The target host validates Chat ownership and never starts a runtime for inspection; old hosts may return UnknownMethod. It is registered only in `rpc_methods!`.
+
 - Sync `35561ead`: Caller/agent-scoped bearer e provas de device são aditivos; `local_only` permanece atributo do registry único `method.rs`, consultado também pelo relay. Novos métodos de ACP, output/processos, imagens, plugins e temas não criam outra tabela de forwardables/deadlines. `PublishImage` é local-only.
 - `zeron mcp` e controller Workers do fork continuam usando o bearer completo do engine do grant e a validação de identidade; o novo allowlist de agente não representa integralmente `SpawnChat`/`WorkerWaitState`. Não ampliar o allowlist para contornar isso. Token nunca é herdado pelos Workers.
 

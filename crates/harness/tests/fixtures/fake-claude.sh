@@ -7,6 +7,8 @@
 # mirror live captures from CLI 2.1.228. Driven by
 # crates/harness/tests/claude.rs.
 
+if [ "${1:-}" = "--version" ]; then printf '%s\n' '2.1.228 (Claude Code)'; exit 0; fi
+
 read -r first || exit 1
 # A run opens with an `initialize` control request (the SDK handshake); the
 # real CLI answers it before the first user line. (Command discovery sends

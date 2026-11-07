@@ -524,11 +524,13 @@ impl Harness for OmpHarness {
             .await
             .map_err(|_| HarnessError::Protocol("OMP event consumer closed".into()))?;
 
+        let context_requests = controls.turn.context_requests();
         tokio::spawn(run_session(
             process,
             events,
             event_tx,
             controls,
+            context_requests,
             workers,
             zeron,
             computer_use,
@@ -821,6 +823,7 @@ async fn run_session(
     mut events: mpsc::Receiver<Value>,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     controls: RunControls,
+    mut context_requests: mpsc::Receiver<crate::context_inspection::ContextInspectionRequest>,
     workers: Option<Arc<WorkersBridge>>,
     zeron: Option<Arc<WorkersBridge>>,
     computer_use: Option<Arc<WorkersBridge>>,
@@ -839,7 +842,7 @@ async fn run_session(
         mut steering,
         interrupt,
         chat_id: _,
-        turn: _,
+        turn: _turn,
     } = controls;
     let request_input: Arc<RequestInputFn> = request_input.into();
     let (interactive_tx, mut interactive_rx) = mpsc::unbounded_channel::<InteractiveResolution>();
@@ -955,6 +958,8 @@ async fn run_session(
         }};
     }
 
+    let context_unsupported = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut context_tasks = tokio::task::JoinSet::new();
     while !finished {
         // One delivery at a time: image preflight cannot reorder adjacent
         // messages, and nothing overtakes the opening prompt's ACK or a
@@ -970,8 +975,34 @@ async fn run_session(
             break;
         }
         tokio::select! {
+            Some(request) = context_requests.recv() => {
+                if request.reply.is_closed() || request.deadline <= tokio::time::Instant::now() {continue;}
+                if context_unsupported.load(std::sync::atomic::Ordering::Acquire) {
+                    let _ = request.reply.send(Err(HarnessError::Unsupported("Update OMP to inspect context breakdown".into())));
+                    continue;
+                }
+                if context_tasks.len() >= 8 {
+                    let _ = request.reply.send(Err(HarnessError::Protocol("Context inspection is busy".into())));continue;
+                }
+                let process=process.clone();let unsupported=context_unsupported.clone();
+                context_tasks.spawn(async move {
+                    let timeout=request.deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let result=process.request_with_timeout(json!({"type":"get_context_breakdown"}),timeout).await;
+                    let report=match result {
+                        Ok(value)=>Ok(crate::context_breakdown::omp(&value)),
+                        Err(error) if error.to_string().contains("Unknown command")=>{
+                            unsupported.store(true,std::sync::atomic::Ordering::Release);
+                            Err(HarnessError::Unsupported("Update OMP to inspect context breakdown".into()))
+                        }
+                        Err(_)=>Err(HarnessError::Protocol("OMP context inspection failed or timed out".into())),
+                    };
+                    let _=request.reply.send(report);
+                });
+            }
+            _ = context_tasks.join_next(), if !context_tasks.is_empty() => {}
+
             _ = tokio::time::sleep_until(compaction_deadline), if compacting => {
-                finish_agent_end(&process, &event_tx, &mut session_id, &mut pending_interactive,
+                finish_agent_end(&process, &event_tx, &mut normalizer, &mut session_id, &mut pending_interactive,
                     AgentEndDisposition::Error("OMP compaction timed out before completion".into())).await;
                 finished = true;
             }
@@ -1000,6 +1031,7 @@ async fn run_session(
                                 settle!(finish_agent_end(
                                     &process,
                                     &event_tx,
+                                    &mut normalizer,
                                     &mut session_id,
                                     &mut pending_interactive,
                                     AgentEndDisposition::Complete,
@@ -1017,7 +1049,7 @@ async fn run_session(
                         }
                         let message = err.to_string();
                         let _ = emit(&event_tx, AgentEvent::Error { message: message.clone() }).await;
-                        let _ = emit(&event_tx, AgentEvent::Done {
+                        let _ = emit_done(&event_tx, &mut normalizer, AgentEvent::Done {
                             status: DoneStatus::Errored,
                             result: None,
                             error: Some(message),
@@ -1044,7 +1076,20 @@ async fn run_session(
                         Duration::from_millis(500),
                         process.request(json!({ "type": "abort" })),
                     ).await;
-                    let _ = emit(&event_tx, AgentEvent::Done {
+                    // The reader queues events separately from RPC replies:
+                    // frames preceding the abort ACK may still be unnormalized.
+                    // Consume only this ready FIFO prefix; live producers must
+                    // not extend Stop, and no terminal frame can emit a second Done.
+                    let ready_frames = events.len();
+                    'ready: for _ in 0..ready_frames {
+                        let Ok(frame) = events.try_recv() else { break; };
+                        for event in normalizer.push(frame) {
+                            if !emit(&event_tx, event).await {
+                                break 'ready;
+                            }
+                        }
+                    }
+                    let _ = emit_done(&event_tx, &mut normalizer, AgentEvent::Done {
                         status: DoneStatus::Interrupted,
                         result: None,
                         error: None,
@@ -1177,7 +1222,7 @@ async fn run_session(
                         }
                     }
                     let _ = emit(&event_tx, AgentEvent::Error { message: message.clone() }).await;
-                    let _ = emit(&event_tx, AgentEvent::Done {
+                    let _ = emit_done(&event_tx, &mut normalizer, AgentEvent::Done {
                         status: DoneStatus::Errored,
                         result: None,
                         error: Some(message),
@@ -1188,7 +1233,7 @@ async fn run_session(
                 if compacting {
                     if let Some(disposition) = compaction_completion(&frame) {
                         settle!(finish_agent_end(
-                            &process, &event_tx, &mut session_id, &mut pending_interactive, disposition,
+                            &process, &event_tx, &mut normalizer, &mut session_id, &mut pending_interactive, disposition,
                         ).await);
                         continue;
                     }
@@ -1362,6 +1407,7 @@ async fn run_session(
                                 settle!(finish_agent_end(
                                     &process,
                                     &event_tx,
+                                    &mut normalizer,
                                     &mut session_id,
                                     &mut pending_interactive,
                                     disposition,
@@ -1384,6 +1430,7 @@ async fn run_session(
                             settle!(finish_agent_end(
                                 &process,
                                 &event_tx,
+                                &mut normalizer,
                                 &mut session_id,
                                 &mut pending_interactive,
                                 disposition,
@@ -1395,6 +1442,9 @@ async fn run_session(
         }
     }
 
+    context_tasks.abort_all();
+    context_requests.close();
+    drop(context_requests);
     for (_, cancellation) in pending_interactive.drain() {
         cancellation.cancel();
     }
@@ -1434,6 +1484,7 @@ fn compaction_completion(frame: &Value) -> Option<AgentEndDisposition> {
 async fn finish_agent_end(
     process: &OmpProcess,
     event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
+    normalizer: &mut OmpNormalizer,
     session_id: &mut String,
     pending_interactive: &mut HashMap<String, tokio_util::sync::CancellationToken>,
     disposition: AgentEndDisposition,
@@ -1473,8 +1524,9 @@ async fn finish_agent_end(
     }
     match disposition {
         AgentEndDisposition::Complete => {
-            let _ = emit(
+            let _ = emit_done(
                 event_tx,
+                normalizer,
                 AgentEvent::Done {
                     status: DoneStatus::Completed,
                     result: None,
@@ -1496,8 +1548,9 @@ async fn finish_agent_end(
             {
                 return TurnEnd::Errored;
             }
-            let _ = emit(
+            let _ = emit_done(
                 event_tx,
+                normalizer,
                 AgentEvent::Done {
                     status: DoneStatus::Errored,
                     result: None,
@@ -1510,6 +1563,19 @@ async fn finish_agent_end(
         }
         AgentEndDisposition::Continue => TurnEnd::Open,
     }
+}
+
+async fn emit_done(
+    event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
+    normalizer: &mut OmpNormalizer,
+    done: AgentEvent,
+) -> bool {
+    if let Some(timing) = normalizer.finish_model_timing()
+        && !emit(event_tx, timing).await
+    {
+        return false;
+    }
+    emit(event_tx, done).await
 }
 
 async fn emit(
@@ -1921,6 +1987,107 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn closed_context_mailbox_parks_and_keeps_processing_events() {
+        use crate::context_inspection::tests::{idle_poll_wakes, next_text};
+        let dir = tempfile::tempdir().unwrap();
+        let process = OmpProcess::start(process::OmpLaunch {
+            executable: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/fake-omp-rpc.sh"),
+            cwd: dir.path().to_owned(),
+            ephemeral: true,
+            system_prompt_append: None,
+            env: Some(HashMap::from([(
+                "FAKE_OMP_SCENARIO".into(),
+                "context-active".into(),
+            )])),
+            handshake_timeout: Duration::from_secs(1),
+            request_timeout: Duration::from_secs(1),
+        })
+        .await
+        .unwrap();
+        let mut native_events = process.take_events().unwrap();
+        let (frames, events) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let (_steer, steering) = mpsc::channel(8);
+        let interrupt = tokio_util::sync::CancellationToken::new();
+        let turn = crate::TurnControl::default();
+        let context_requests = turn.context_requests();
+        let controls = RunControls {
+            realtime: None,
+            execution_lease: None,
+            request_input: Box::new(|_| {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = tx.send(Vec::new());
+                rx
+            }),
+            steering,
+            interrupt: interrupt.clone(),
+            chat_id: "closed-context".into(),
+            turn: turn.clone(),
+        };
+        let actor = run_session(
+            process,
+            events,
+            event_tx,
+            controls,
+            context_requests,
+            None,
+            None,
+            None,
+            dir.path().to_string_lossy().into_owned(),
+            "fixture".into(),
+            "session".into(),
+            json!({"type":"prompt","message":"synthetic"}),
+            Duration::from_secs(1),
+            None,
+        );
+        tokio::pin!(actor);
+        // Positive acknowledgement from the real CLI transport: the prompt
+        // started, and its turn remains active until the test sends an end.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                tokio::select! {
+                    _ = actor.as_mut() => panic!("session ended before prompt startup"),
+                    frame = native_events.recv() => {
+                        let frame = frame.unwrap();
+                        if frame["assistantMessageEvent"]["delta"] == "active" { break; }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let text_frame = |text| {
+            json!({"type":"message_update",
+            "assistantMessageEvent":{"type":"text_delta","delta":text}})
+        };
+        frames.send(text_frame("before close")).await.unwrap();
+        assert_eq!(
+            next_text(actor.as_mut(), &mut event_rx).await,
+            "before close"
+        );
+        // attach() replaces the sender while this active driver owns the old receiver.
+        let _replacement = turn.context_requests();
+        let (wakes, budget_remaining) = idle_poll_wakes(actor.as_mut()).await;
+        frames.send(text_frame("after close")).await.unwrap();
+        let following = next_text(actor.as_mut(), &mut event_rx).await;
+        interrupt.cancel();
+        tokio::time::timeout(Duration::from_secs(3), actor.as_mut())
+            .await
+            .unwrap();
+        assert_eq!(following, "after close");
+        assert!(
+            budget_remaining,
+            "closed context mailbox must not consume the entire cooperative poll budget (wakes={wakes})"
+        );
+        assert_eq!(
+            wakes, 0,
+            "closed context mailbox must park without self-waking"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn warm_prompt_preflight_and_ack_precede_ordered_steers() {
         let dir = tempfile::tempdir().unwrap();
         let image = dir.path().join("attachment.png");
@@ -1964,11 +2131,13 @@ mod tests {
             chat_id: "ordered-fixture".into(),
             turn: Default::default(),
         };
+        let context_requests = controls.turn.context_requests();
         let actor = tokio::spawn(run_session(
             process.clone(),
             process.take_events().unwrap(),
             event_tx,
             controls,
+            context_requests,
             None,
             None,
             None,

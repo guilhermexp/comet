@@ -39,6 +39,8 @@ use crate::doc_host::{ChatDocHandle, DocHost};
 
 #[path = "session_activity.rs"]
 mod activity;
+#[path = "context_breakdown.rs"]
+mod context_breakdown;
 use crate::registry::{HarnessDescriptor, HarnessRegistry};
 use crate::run_journal::RunJournal;
 use crate::{EngineError, new_id, now_ms};
@@ -373,6 +375,7 @@ struct Inner {
     doc_host: Mutex<Option<DocHost>>,
     /// chat_id → live run.
     runs: Mutex<HashMap<String, RunHandle>>,
+    context_breakdowns: Mutex<HashMap<String, Arc<context_breakdown::ContextCache>>>,
     /// chat_id → broadcast hub (retained across runs so subscribers survive turns).
     hubs: Mutex<HashMap<String, broadcast::Sender<JournaledEvent>>>,
     statuses: Mutex<HashMap<String, Session>>,
@@ -487,6 +490,7 @@ impl SessionsEngine {
                 registry,
                 doc_host: Mutex::new(None),
                 runs: Mutex::new(HashMap::new()),
+                context_breakdowns: Mutex::new(HashMap::new()),
                 hubs: Mutex::new(HashMap::new()),
                 statuses: Mutex::new(HashMap::new()),
                 sessions_tx,
@@ -3309,6 +3313,7 @@ struct TurnAccumulator {
     cache_write_tokens: Option<u64>,
     cost_usd: Option<f64>,
     model_ms: Option<u64>,
+    model_timing_incomplete: bool,
     /// Harness-reported tool durations (`ToolExecutionMeta`), used only when
     /// no call/result span was observed.
     tool_ms: Option<u64>,
@@ -3353,10 +3358,17 @@ impl TurnAccumulator {
                 cache_write_tokens,
                 cost_usd,
                 model_ms,
+                model_timing_incomplete,
             } => {
                 add(&mut self.cache_read_tokens, *cache_read_tokens);
                 add(&mut self.cache_write_tokens, *cache_write_tokens);
-                add(&mut self.model_ms, *model_ms);
+                self.model_timing_incomplete |= *model_timing_incomplete;
+                if let Some(value) = model_ms {
+                    match self.model_ms.unwrap_or(0).checked_add(*value) {
+                        Some(total) => self.model_ms = Some(total),
+                        None => self.model_timing_incomplete = true,
+                    }
+                }
                 if let Some(cost) = cost_usd {
                     self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + cost);
                 }
@@ -3384,9 +3396,7 @@ impl TurnAccumulator {
         } else {
             Some(union_ms(&self.tool_spans))
         };
-        let model_ms = self.model_ms.or_else(|| {
-            (duration_ms > 0).then(|| duration_ms.saturating_sub(tool_ms.unwrap_or(0)))
-        });
+        let model_ms = self.model_ms.filter(|_| !self.model_timing_incomplete);
         zeron_proto::TurnStats {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
@@ -6606,6 +6616,7 @@ mod tests {
             cache_write_tokens: Some(100),
             cost_usd: Some(0.25),
             model_ms: None,
+            model_timing_incomplete: false,
         });
         let stats = turn.finish(11_000);
         assert_eq!(
@@ -6619,14 +6630,371 @@ mod tests {
             "measured spans win over reports"
         );
         assert_eq!(
-            stats.model_ms,
-            Some(6_000),
-            "falls back to wall time minus tools"
+            stats.model_ms, None,
+            "missing native timing must remain unavailable"
         );
         assert_eq!((stats.input_tokens, stats.output_tokens), (100, 40));
         assert_eq!(stats.cost_usd, Some(0.25));
         assert_eq!(stats.cache_fraction(), Some(0.6));
         assert_eq!(stats.output_rate(10_000), Some(4.0));
+    }
+
+    #[test]
+    fn native_timing_requires_every_model_contribution_and_resets_between_turns() {
+        let metrics = |model_ms, incomplete| AgentEvent::TurnMetrics {
+            model_ms,
+            model_timing_incomplete: incomplete,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost_usd: None,
+        };
+        let mut turn = super::TurnAccumulator::starting_at(1000);
+        turn.observe(&metrics(Some(0), false));
+        assert_eq!(turn.finish(2000).model_ms, Some(0));
+        turn.observe(&metrics(Some(1234), false));
+        turn.observe(&metrics(None, false)); // auxiliary cache/cost data
+        turn.observe(&AgentEvent::Subagent {
+            parent_tool_use_id: "child".into(),
+            event: Box::new(metrics(Some(99000), true)),
+        });
+        assert_eq!(turn.finish(5000).model_ms, Some(1234));
+        turn.observe(&metrics(None, true));
+        turn.observe(&metrics(Some(500), false));
+        assert_eq!(turn.finish(6000).model_ms, None);
+        let mut next = super::TurnAccumulator::starting_at(6000);
+        next.observe(&metrics(Some(100), false));
+        assert_eq!(next.finish(7000).model_ms, Some(100));
+        next.observe(&metrics(Some(u64::MAX), false));
+        assert_eq!(
+            next.finish(8000).model_ms,
+            None,
+            "overflow cannot be measured timing"
+        );
+    }
+
+    #[cfg(unix)] // The protocol peer below is an executable shell fixture.
+    #[tokio::test]
+    async fn native_timing_from_omp_process_requires_parent_call_completion() {
+        use std::time::Duration;
+        use zeron_harness::{Harness as _, OmpHarness};
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for (scenario, complete, status) in [
+            ("timing-stop-model", false, DoneStatus::Interrupted),
+            ("timing-stop-tool", true, DoneStatus::Interrupted),
+            ("timing-stop-between", true, DoneStatus::Interrupted),
+            ("timing-stop-child", true, DoneStatus::Interrupted),
+            ("timing-stop-model-child", false, DoneStatus::Interrupted),
+            ("timing-stop-queued-model", false, DoneStatus::Interrupted),
+            ("timing-stop-queued-complete", true, DoneStatus::Interrupted),
+            ("timing-stop-queued-finish", true, DoneStatus::Interrupted),
+            ("timing-stop-queued-tool", true, DoneStatus::Interrupted),
+            ("timing-stop-queued-child", true, DoneStatus::Interrupted),
+            (
+                "timing-stop-queued-model-child",
+                false,
+                DoneStatus::Interrupted,
+            ),
+            ("timing-eof", false, DoneStatus::Errored),
+            ("timing-error", false, DoneStatus::Errored),
+            ("timing-prompt-error", false, DoneStatus::Errored),
+            ("timing-warm", false, DoneStatus::Completed),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("wire.log");
+            let harness = OmpHarness::new()
+                .with_executable(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../harness/tests/fixtures/fake-omp-rpc.sh"),
+                )
+                .with_env(HashMap::from([
+                    ("FAKE_OMP_SCENARIO".into(), scenario.into()),
+                    ("FAKE_OMP_LOG".into(), log.to_string_lossy().into_owned()),
+                ]))
+                .with_timeouts(Duration::from_secs(1), Duration::from_secs(1));
+            let (steer, steering) = mpsc::channel(8);
+            let interrupt = CancellationToken::new();
+            let controls = RunControls {
+                realtime: None,
+                execution_lease: None,
+                request_input: Box::new(|_| {
+                    let (tx, rx) = oneshot::channel();
+                    let _ = tx.send(Vec::new());
+                    rx
+                }),
+                steering,
+                interrupt: interrupt.clone(),
+                chat_id: "timing-fixture".into(),
+                turn: Default::default(),
+            };
+            let mut run_request = request();
+            run_request.model = None;
+            run_request.reasoning = None;
+            run_request.cwd = dir.path().to_string_lossy().into_owned();
+            let mut stream = harness.run(run_request, controls).await.unwrap();
+            let mut turn = super::TurnAccumulator::starting_at(0);
+            let mut events = Vec::new();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let event = stream.next().await.unwrap().unwrap();
+                    turn.observe_at(&event, 10);
+                    let ready =
+                        matches!(&event, AgentEvent::TextDelta { text } if text == "timing-ready");
+                    events.push(event);
+                    if ready {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("positive lifecycle barrier from the actual driver");
+            assert_eq!(turn.finish(10).model_ms, Some(125));
+            if scenario.contains("child") && !scenario.contains("queued") {
+                assert!(
+                    events
+                        .iter()
+                        .any(|e| matches!(e, AgentEvent::Subagent { .. }))
+                );
+            }
+            if scenario == "timing-stop-tool" {
+                assert!(
+                    events.iter().any(
+                        |e| matches!(e, AgentEvent::ToolCall { id, .. } if id == "timing-tool")
+                    )
+                );
+            }
+            if scenario.starts_with("timing-stop-") {
+                interrupt.cancel();
+            }
+            let observed_status = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let event = stream.next().await.unwrap().unwrap();
+                    turn.observe_at(&event, 20);
+                    let done = if let AgentEvent::Done { status, .. } = &event {
+                        Some(*status)
+                    } else {
+                        None
+                    };
+                    events.push(event);
+                    if let Some(status) = done {
+                        break status;
+                    }
+                }
+            })
+            .await
+            .expect("terminal Done after stop/error/EOF");
+            assert_eq!(observed_status, status, "{scenario}");
+            let stats = turn.finish(5000);
+            let accounting = (
+                stats.input_tokens,
+                stats.output_tokens,
+                stats.cache_read_tokens,
+                stats.cache_write_tokens,
+                stats.cost_usd,
+            );
+            let markers = events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        AgentEvent::TurnMetrics {
+                            model_ms: None,
+                            model_timing_incomplete: true,
+                            cache_read_tokens: None,
+                            cache_write_tokens: None,
+                            cost_usd: None,
+                        }
+                    )
+                })
+                .count();
+            let queued = scenario.contains("queued");
+            // The fixture emits this last, before the abort ACK. FIFO dispatch
+            // proves every preceding frame was already queued at that boundary.
+            let queued_barriers = events.iter().filter(|event|
+                matches!(event, AgentEvent::TextDelta { text } if text == "timing-queued")
+            ).count();
+            let queued_in_order = !queued
+                || matches!(
+                    events.get(events.len() - 2 - markers),
+                    Some(AgentEvent::TextDelta { text }) if text == "timing-queued"
+                );
+            let child_seen = events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Subagent { .. }));
+            actual.push((
+                scenario,
+                stats.model_ms,
+                stats.model_ms.and_then(|ms| stats.output_rate(ms)),
+                markers,
+                accounting,
+                queued_barriers,
+                queued_in_order,
+                child_seen,
+            ));
+            let queued_completion = matches!(
+                scenario,
+                "timing-stop-queued-complete" | "timing-stop-queued-finish"
+            );
+            let expected_model_ms = complete.then_some(if queued_completion { 375 } else { 125 });
+            let expected_accounting = if queued_completion {
+                (13, 7, Some(18), Some(24), Some(0.375))
+            } else {
+                (2, 3, Some(5), Some(7), Some(0.125))
+            };
+            expected.push((
+                scenario,
+                expected_model_ms,
+                expected_model_ms.map(|ms| expected_accounting.1 as f64 / (ms as f64 / 1000.0)),
+                usize::from(!complete),
+                expected_accounting,
+                usize::from(queued),
+                true,
+                scenario.contains("child"),
+            ));
+            if markers > 0 {
+                assert!(
+                    matches!(
+                        events[events.len() - 2],
+                        AgentEvent::TurnMetrics {
+                            model_timing_incomplete: true,
+                            ..
+                        }
+                    ),
+                    "the timing marker must precede Done directly"
+                );
+            }
+            if scenario == "timing-warm" {
+                steer
+                    .send(zeron_harness::SteerMessage {
+                        prompt: "next".into(),
+                        message_id: None,
+                        attachments: vec![],
+                        config: None,
+                    })
+                    .await
+                    .unwrap();
+                let mut next = super::TurnAccumulator::starting_at(5000);
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        let event = stream.next().await.unwrap().unwrap();
+                        next.observe_at(&event, 5010);
+                        if matches!(
+                            event,
+                            AgentEvent::Done {
+                                status: DoneStatus::Completed,
+                                ..
+                            }
+                        ) {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .expect("the same warm runtime must complete its next turn");
+                let stats = next.finish(6000);
+                assert_eq!(
+                    (
+                        stats.model_ms,
+                        stats.input_tokens,
+                        stats.output_tokens,
+                        stats.cache_read_tokens,
+                        stats.cache_write_tokens,
+                        stats.cost_usd
+                    ),
+                    (Some(250), 11, 4, Some(13), Some(17), Some(0.25))
+                );
+                let wire = std::fs::read_to_string(&log).unwrap();
+                assert_eq!(wire.lines().filter(|l| l.ends_with(" prompt")).count(), 2);
+                assert_eq!(
+                    wire.lines()
+                        .filter_map(|l| l.split_whitespace().next())
+                        .collect::<HashSet<_>>()
+                        .len(),
+                    1
+                );
+                interrupt.cancel();
+            }
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while let Some(event) = stream.next().await {
+                    assert!(
+                        !matches!(event.unwrap(), AgentEvent::Done { .. }),
+                        "only one Done per turn"
+                    );
+                }
+            })
+            .await
+            .expect("driver and fake process must shut down");
+            if scenario.starts_with("timing-stop-") {
+                assert_eq!(
+                    std::fs::read_to_string(&log)
+                        .unwrap()
+                        .lines()
+                        .filter(|l| l.ends_with(" abort"))
+                        .count(),
+                    1
+                );
+            }
+        }
+        assert_eq!(
+            actual, expected,
+            "only an unfinished parent call invalidates model timing/rate"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires private read-only COMET_TIMING_REPLAY_JSONL; prints scalar accounting only"]
+    fn native_turn_replay_from_private_jsonl() {
+        let path = std::env::var("COMET_TIMING_REPLAY_JSONL")
+            .expect("set the private read-only replay path");
+        let source = std::fs::read_to_string(path).unwrap();
+        let mut normalizer = zeron_harness::omp::normalize::OmpNormalizer::new("/replay", "test");
+        let mut turn = super::TurnAccumulator::starting_at(0);
+        let mut selected = false;
+        let mut requests = 0;
+        for line in source.lines() {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            if row["timestamp"] == "2026-11-05T18:16:54.368Z" {
+                selected = true;
+                continue;
+            }
+            if !selected {
+                continue;
+            }
+            let Some(message) = row.get("message") else {
+                continue;
+            };
+            if message["role"] == "user" {
+                break;
+            }
+            if message["role"] != "assistant" {
+                continue;
+            }
+            requests += 1;
+            for event in
+                normalizer.push(serde_json::json!({"type":"message_end","message":message}))
+            {
+                turn.observe_at(&event, 1);
+            }
+        }
+        let stats = turn.finish(160000);
+        assert_eq!(requests, 18);
+        assert_eq!(stats.output_tokens, 13824);
+        assert_eq!(stats.input_tokens, 38);
+        assert_eq!(stats.cache_read_tokens, Some(5017335));
+        assert_eq!(stats.cache_write_tokens, Some(52343));
+        assert!((stats.cost_usd.unwrap() - 1.698843).abs() < 1e-9);
+        assert!((stats.model_ms.unwrap() as f64 - 143607.892374).abs() < 9.0);
+        assert!((stats.output_rate(stats.model_ms.unwrap()).unwrap() - 96.2621).abs() < 0.02);
+        println!(
+            "SANITIZED replay: requests={requests} model_ms={:?} output={} rate={:.4} fresh={} read={:?} write={:?} cost={:.6}",
+            stats.model_ms,
+            stats.output_tokens,
+            stats.output_rate(stats.model_ms.unwrap()).unwrap(),
+            stats.input_tokens,
+            stats.cache_read_tokens,
+            stats.cache_write_tokens,
+            stats.cost_usd.unwrap()
+        );
     }
 
     #[test]

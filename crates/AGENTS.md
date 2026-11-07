@@ -12,6 +12,8 @@ Todas as crates são internas (`publish = false`) e versionadas juntas pelo `[wo
 
 ## Local Contracts
 
+- Native context inspection is optional metadata over `GetChatContextBreakdown`, from an existing host runtime through the harness request/reply mailbox. Proto owns budget/list types, engine owns latest-only ephemeral caching, RPC/`zeron-client` preserve host routing, and Details owns scoped disclosure preferences. It is separate from aggregate context continuity, Chat Transcript, steering and Managed Provider Usage.
+
 - Sync `35561ead`: `plugin-guard` e `preview-label` são membros compartilhados; `cli`, `launch` e `apps/zgx` permanecem excluídos. D1a ativa o runtime engine de plugins/templates no startup, com auth/links/RPC; interface zgx e MCP nativo nas runs seguem desligados. O MCP preserva o default side chat e os modos configured/inherit, aceitando subagent explícito e recusando netos/overrides de access/plan no inherit.
 
 - **Versões de dependência moram no `Cargo.toml` da raiz**, não nas crates. Crate filha usa `dep = { workspace = true }`. Não pinar versão local.

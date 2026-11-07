@@ -657,6 +657,8 @@ pub struct Theme {
     pub success: Hsla,
     /// Working / streaming indicator in the selected accent family.
     pub busy: Hsla,
+    /// Active CLI worker count, blue independently of the Chat's own activity.
+    pub worker_activity: Hsla,
     /// Three-tone animated pixel glyph palette in the selected accent family.
     pub glyph: GlyphPalette,
     /// Softer success for text on a success-tinted chip.
@@ -1157,6 +1159,7 @@ impl Theme {
             warning_muted: oklch(0.924, 0.12, 95.746), // amber-200
             success: oklch(0.765, 0.177, 163.223),     // emerald-400
             busy: accent.activity,
+            worker_activity: accent_tokens(AccentColor::Blue, Appearance::Dark).primary,
             glyph: accent.glyph,
             success_muted: oklch(0.845, 0.143, 164.978), // emerald-300
             surface_raised_hover: neutral(0.29),
@@ -1256,6 +1259,7 @@ impl Theme {
             warning_muted: oklch(0.473, 0.137, 46.201), // amber-800
             success: oklch(0.596, 0.145, 163.225),      // emerald-600
             busy: accent.activity,
+            worker_activity: accent_tokens(AccentColor::Blue, Appearance::Light).primary,
             glyph: accent.glyph,
             success_muted: oklch(0.508, 0.118, 165.612), // emerald-700
             // Opaque pills darken on hover here rather than brighten — same

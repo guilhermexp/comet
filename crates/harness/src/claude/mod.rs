@@ -1034,7 +1034,17 @@ impl ClaudeHarness {
         if let Some(message) = notice {
             let _ = event_tx.try_send(Ok(AgentEvent::Error { message }));
         }
+        let version_exe = exe.clone();
+        let inspection_supported =
+            tokio::task::spawn_blocking(move || crate::executable::binary_version(&version_exe))
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|v| v >= semver::Version::new(2, 1, 257));
+        let context_requests = controls.turn.context_requests();
         tokio::spawn(run_session(Session {
+            inspection_supported,
+            context_requests,
             normalizer,
             instructions,
             exe,
@@ -1230,6 +1240,8 @@ async fn stdin_writer(
 }
 
 struct Session {
+    inspection_supported: bool,
+    context_requests: mpsc::Receiver<crate::context_inspection::ContextInspectionRequest>,
     normalizer: Normalizer,
     /// Isolated (title-style) system prompt; `Some` means a tool-less run.
     instructions: Option<&'static str>,
@@ -1260,6 +1272,8 @@ struct Session {
 /// mailbox, the interrupt token, and consumer liveness.
 async fn run_session(session: Session) {
     let Session {
+        inspection_supported,
+        mut context_requests,
         normalizer: mut norm,
         instructions,
         exe,
@@ -1277,6 +1291,10 @@ async fn run_session(session: Session) {
         mut stderr_tail,
     } = session;
     let title_only = instructions.is_some();
+    let mut pending_context: std::collections::HashMap<
+        String,
+        crate::context_inspection::ContextInspectionRequest,
+    > = Default::default();
     let RunControls {
         realtime: _,
         execution_lease: _execution_lease,
@@ -1368,6 +1386,7 @@ async fn run_session(session: Session) {
 
     'main: loop {
         if std::mem::take(&mut relaunch) {
+            pending_context.clear();
             // The CLI had no conversation for the session and exited
             // without starting one. Everything written to it goes to a fresh
             // process; its own init reports the new session id.
@@ -1408,6 +1427,7 @@ async fn run_session(session: Session) {
                 break 'main;
             }
         }
+        let context_deadline = pending_context.values().map(|r| r.deadline).min();
         let control_deadline = pending_controls.values().map(|(_, _, at)| *at).min();
         match norm.fork_to_follow() {
             Some(fork) if tail.as_ref().is_none_or(|t| t.chip != fork.0) => {
@@ -1418,15 +1438,30 @@ async fn run_session(session: Session) {
         }
         let tail_at = tail.as_ref().and_then(ForkTail::next_read);
         tokio::select! {
+            Some(request) = context_requests.recv() => {
+                if request.reply.is_closed() || request.deadline<=tokio::time::Instant::now() {continue;}
+                if !inspection_supported || title_only {
+                    let _=request.reply.send(Err(HarnessError::Unsupported("Context summary requires verified Claude Code 2.1.257 or newer".into())));continue;
+                }
+                if !steering.is_empty() || !pending_controls.is_empty() || config_unsure {
+                    let _=request.reply.send(Err(HarnessError::Protocol("Runtime configuration is not settled".into())));continue;
+                }
+                if pending_context.len()>=8 {let _=request.reply.send(Err(HarnessError::Protocol("Context inspection is busy".into())));continue;}
+                let id=format!("zeron_context_{}",uuid::Uuid::new_v4());
+                let line=serde_json::json!({"type":"control_request","request_id":id,"request":{"subtype":"get_context_usage","detail":"summary"}}).to_string();
+                // Inspection is never replayed as configuration or as a prompt.
+                if stdin.tx.send(StdinMsg::Line(line)).is_ok() {pending_context.insert(id,request);}
+            }
+            _=tokio::time::sleep_until(context_deadline.unwrap_or_else(tokio::time::Instant::now)), if context_deadline.is_some()=>{
+                let now=tokio::time::Instant::now();
+                pending_context.retain(|_,request|request.deadline>now && !request.reply.is_closed());
+            }
             line = stdout_lines.next_line() => match line {
                 Ok(Some(line)) => {
                     let line = line.trim();
                     if line.is_empty() {
                         continue;
                     }
-                    // The CLI is still producing: whatever it is doing is not
-                    // the quiet end a held turn end's fallback waits for.
-                    last_frame_at = tokio::time::Instant::now();
                     let frame = match wire::parse_frame(line) {
                         Ok(frame) => frame,
                         Err(e) => {
@@ -1434,6 +1469,26 @@ async fn run_session(session: Session) {
                             continue;
                         }
                     };
+                    // Read-only replies (including foreign/late ids) do not touch
+                    // the turn/steering settlement clock or configuration state.
+                    if let Frame::ControlResponse(response) = &frame {
+                        let response = &response.response;
+                        if response.request_id.starts_with("zeron_context_") {
+                            if let Some(request)=pending_context.remove(&response.request_id) {
+                                let report=match response.error_message() {
+                                    Some(_)=>Err(HarnessError::Protocol("Claude context summary failed".into())),
+                                    None=>{
+                                        let mut report=crate::context_breakdown::claude_summary(response.response.as_ref().unwrap_or(&Value::Null));
+                                        report.native_session_id=norm.session_id.clone();Ok(report)
+                                    }
+                                };
+                                let _=request.reply.send(report);
+                            }
+                            continue;
+                        }
+                    }
+                    // Only conversation/configuration traffic resets settlement.
+                    last_frame_at = tokio::time::Instant::now();
                     if restore_fallback
                         && !interrupted
                         && !norm.started()
@@ -1679,6 +1734,7 @@ async fn run_session(session: Session) {
                     let mut switch_mode = !turn_open
                         && cli_mode.as_deref().is_some_and(|mode| mode != permission_mode(&config));
                     if let Some(next) = msg.config {
+                        pending_context.clear();
                         reconfigures += 1;
                         let resend = std::mem::take(&mut config_unsure);
                         let deadline = tokio::time::Instant::now() + CONTROL_TIMEOUT;
@@ -1859,6 +1915,10 @@ async fn run_session(session: Session) {
             _ = event_tx.closed() => break 'main,
         }
     }
+
+    pending_context.clear();
+    context_requests.close();
+    drop(context_requests);
 
     // A turn end still held when the CLI exited is the run's real end.
     if let Some(done) = held_done.take()
@@ -2230,6 +2290,92 @@ mod tests {
             mcp: None,
             env: Default::default(),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn closed_context_mailbox_parks_and_keeps_processing_events() {
+        use crate::context_inspection::tests::{idle_poll_wakes, next_text};
+        let dir = tempfile::tempdir().unwrap();
+        let mut request = workers_request(false);
+        request.cwd = dir.path().to_string_lossy().into_owned();
+        request.env.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            dir.path().join("config").to_string_lossy().into_owned(),
+        );
+        request
+            .env
+            .insert("COMET_CONTEXT_FIXTURE_MODE".into(), "active".into());
+        let exe =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-context-claude.py");
+        let Runtime {
+            child,
+            stdout_lines,
+            mut stdin,
+            stderr_tail,
+        } = ClaudeHarness::launch(&exe, &request, None).unwrap();
+        let first_command = uuid::Uuid::new_v4().to_string();
+        stdin.line(wire::initialize_request_line("zeron_initialize"));
+        stdin.line(wire::prompt_line("synthetic", &first_command, &[]));
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let (steering_tx, steering) = mpsc::channel(8);
+        let interrupt = crate::CancellationToken::new();
+        let turn = crate::TurnControl::default();
+        let context_requests = turn.context_requests();
+        let controls = RunControls {
+            realtime: None,
+            execution_lease: None,
+            request_input: Box::new(|_| {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = tx.send(Vec::new());
+                rx
+            }),
+            steering,
+            interrupt: interrupt.clone(),
+            chat_id: "closed-context".into(),
+            turn: turn.clone(),
+        };
+        let actor = run_session(Session {
+            inspection_supported: true,
+            context_requests,
+            normalizer: Normalizer::new(),
+            instructions: None,
+            exe,
+            launched: request.clone(),
+            child,
+            stdout_lines,
+            first_command,
+            stdin,
+            event_tx,
+            controls,
+            config: request,
+            interrupt_grace: Duration::from_millis(100),
+            kill_grace: Duration::from_millis(100),
+            lock_dir: dir.path().join("config"),
+            stderr_tail,
+        });
+        tokio::pin!(actor);
+        assert_eq!(next_text(actor.as_mut(), &mut event_rx).await, "active");
+        let _replacement = turn.context_requests();
+        let (wakes, budget_remaining) = idle_poll_wakes(actor.as_mut()).await;
+        steering_tx
+            .send(crate::SteerMessage::text("after close"))
+            .await
+            .unwrap();
+        let following = next_text(actor.as_mut(), &mut event_rx).await;
+        interrupt.cancel();
+        tokio::time::timeout(Duration::from_secs(3), actor.as_mut())
+            .await
+            .unwrap();
+        assert_eq!(following, "active");
+        assert!(
+            budget_remaining,
+            "closed context mailbox must not consume the entire cooperative poll budget (wakes={wakes})"
+        );
+        assert_eq!(
+            wakes, 0,
+            "closed context mailbox must park without self-waking"
+        );
     }
 
     #[test]

@@ -3805,6 +3805,23 @@ impl RpcService for EngineRpc {
             methods::LOCAL_DEVICE => {
                 RpcReply::value(&serde_json::json!({ "deviceId": self.doc_host.device_id() }))
             }
+            methods::GET_CHAT_CONTEXT_BREAKDOWN => {
+                let p: zeron_proto::GetChatContextBreakdownParams = parse_params(params)?;
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .ok_or_else(|| RpcError::BadParams("Chat not found".into()))?;
+                if chat.device_id != self.doc_host.device_id() {
+                    return Err(RpcError::Failed("Chat belongs to another device".into()));
+                }
+                RpcReply::value(
+                    &self
+                        .sessions
+                        .context_breakdown(&p.chat_id, chat.config)
+                        .await,
+                )
+            }
             methods::WORKER_WAIT_STATE => {
                 let p: zeron_rpc::WorkerWaitStateParams = parse_params(params)?;
                 if let Some(chat) = self
