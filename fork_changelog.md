@@ -2,6 +2,13 @@
 
 Tracks local/private fork changes against upstream.
 
+## 2026-11-07: v1.0.18
+
+- Turn stats usa a soma das durações nativas das chamadas ao modelo. Timing ausente, parcial ou interrompido antes de concluir a chamada fica indisponível; tokens, cache e custo recebidos são preservados.
+- Context mantém o indicador compacto e abre o detalhamento nativo por host/runtime, com categorias, origem, atualização e listas limitadas. Inspeção não envia prompts nem faz polling; versões de OMP sem a RPC mostram indisponibilidade, sem quebrar a sessão.
+- Sidebar mostra em azul a quantidade de workers CLI ativos vinculados ao chat, independente do status do chat e do contador de subagentes.
+- Integração com v1.0.17 preserva OMP warm runtime, access/plan e grants MCP. Corrigidos isolamento de configuração, retenção de snapshots, fechamento de mailbox e conclusão da UI após mudanças transitórias de apresentação.
+
 ## 2026-11-06: v1.0.17
 
 - Sync do upstream zeronsh/zeron até `35561ead` (PR #26): busca, Markdown e anotações, smooth scrolling, percentuais Cursor e port do zui, preservando shell gpui, Workers, Usage local, terminal direito, updater e engine in-process do fork.
