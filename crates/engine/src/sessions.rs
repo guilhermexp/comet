@@ -6675,6 +6675,7 @@ mod tests {
     #[cfg(unix)] // The protocol peer below is an executable shell fixture.
     #[tokio::test]
     async fn native_timing_from_omp_process_requires_parent_call_completion() {
+        use std::time::Duration;
         use zeron_harness::{Harness as _, OmpHarness};
         let mut actual = Vec::new();
         let mut expected = Vec::new();
@@ -6830,7 +6831,7 @@ mod tests {
                         prompt: "next".into(),
                         message_id: None,
                         attachments: vec![],
-                        ..Default::default()
+                        config: None,
                     })
                     .await
                     .unwrap();
