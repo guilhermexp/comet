@@ -409,6 +409,194 @@ pub fn claude_summary(value: &Value) -> ContextBreakdown {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn omp_with_memory_sections(context: Value, memory: Value) -> ContextBreakdown {
+        omp(&json!({
+            "schemaVersion": 1,
+            "identity": {"sessionId": "merge-fixture", "model": {"provider": "fixture", "id": "model"}},
+            "snapshot": {"usedBasis": "provider-anchor"},
+            "total": {"usedTokens": 17, "contextWindow": 1000},
+            "details": {"contextFiles": context, "memory": memory}
+        }))
+    }
+
+    #[test]
+    fn omp_memory_context_merge_distinguishes_inapplicable_from_measured_empty() {
+        use ContextAvailability::{Available, NotApplicable, Unsupported};
+        let statuses = ["available", "partial", "unsupported", "not-applicable"];
+        let expected = [
+            [Available, Unsupported, Unsupported, Unsupported],
+            [Unsupported, Unsupported, Unsupported, Unsupported],
+            [Unsupported, Unsupported, Unsupported, Unsupported],
+            [Unsupported, Unsupported, Unsupported, NotApplicable],
+        ];
+        let mut actual_rows = Vec::new();
+        let mut expected_rows = Vec::new();
+        for (left, context_status) in statuses.into_iter().enumerate() {
+            for (right, memory_status) in statuses.into_iter().enumerate() {
+                let report = omp_with_memory_sections(
+                    json!({"availability": context_status, "items": []}),
+                    json!({"availability": memory_status, "items": [], "reason": "memory metadata boundary"}),
+                );
+                let merged = &report.memory_files;
+                let category = report
+                    .categories
+                    .iter()
+                    .find(|c| c.id == "memory_files")
+                    .unwrap();
+                actual_rows.push((
+                    context_status,
+                    memory_status,
+                    merged.availability,
+                    merged.items.len(),
+                    category.tokens,
+                ));
+                expected_rows.push((
+                    context_status,
+                    memory_status,
+                    expected[left][right],
+                    0,
+                    (expected[left][right] == Available).then_some(0),
+                ));
+                assert_eq!(category.parent_id.as_deref(), Some("systemContext"));
+                assert_eq!(
+                    merged.reason.as_deref(),
+                    if left == 0 && right == 0 {
+                        None
+                    } else {
+                        Some("memory metadata boundary")
+                    }
+                );
+                assert_eq!(category.reason, merged.reason);
+                assert_eq!(
+                    report.used_tokens,
+                    Some(17),
+                    "nested lists cannot change native usage"
+                );
+            }
+        }
+        assert_eq!(
+            actual_rows, expected_rows,
+            "merging two inapplicable sections must not advertise missing runtime support or measured zero"
+        );
+    }
+
+    #[test]
+    fn omp_memory_context_merge_preserves_partial_unknown_and_bounded_attribution() {
+        use ContextAvailability::{Available, Partial};
+        let section =
+            |status: &str, items: Vec<Value>| json!({"availability": status, "items": items});
+        for status in ["partial", "unsupported", "not-applicable"] {
+            for swapped in [false, true] {
+                let incomplete = section(
+                    status,
+                    if status == "partial" {
+                        vec![json!({"name": "fragment", "tokens": 2})]
+                    } else {
+                        vec![]
+                    },
+                );
+                let available =
+                    section("available", vec![json!({"name": "measured", "tokens": 0})]);
+                let report = if swapped {
+                    omp_with_memory_sections(available, incomplete)
+                } else {
+                    omp_with_memory_sections(incomplete, available)
+                };
+                assert_eq!(
+                    report.memory_files.availability, Partial,
+                    "{status}, swapped={swapped}"
+                );
+                let names = report
+                    .memory_files
+                    .items
+                    .iter()
+                    .map(|i| i.name.as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    names,
+                    if status != "partial" {
+                        vec!["measured"]
+                    } else if swapped {
+                        vec!["measured", "fragment"]
+                    } else {
+                        vec!["fragment", "measured"]
+                    }
+                );
+                assert_eq!(
+                    report
+                        .categories
+                        .iter()
+                        .find(|c| c.id == "memory_files")
+                        .unwrap()
+                        .tokens,
+                    None,
+                    "an incomplete union has no aggregate even when retained items have counts"
+                );
+            }
+        }
+        for (tokens, expected_total) in [(json!(0), Some(3)), (Value::Null, None)] {
+            let report = omp_with_memory_sections(
+                section(
+                    "available",
+                    vec![json!({"name": "context", "tokens": tokens})],
+                ),
+                section("available", vec![json!({"name": "memory", "tokens": 3})]),
+            );
+            assert_eq!(report.memory_files.availability, Available);
+            assert_eq!(
+                report
+                    .categories
+                    .iter()
+                    .find(|c| c.id == "memory_files")
+                    .unwrap()
+                    .tokens,
+                expected_total
+            );
+        }
+        for extra in [0, 1] {
+            let context = (0..256)
+                .map(|i| json!({"name": format!("context-{i}"), "tokens": 2}))
+                .collect();
+            let memory = (0..256 + extra)
+                .map(|i| json!({"name": format!("memory-{i}"), "tokens": 3}))
+                .collect();
+            let report = omp_with_memory_sections(
+                section("available", context),
+                section("available", memory),
+            );
+            assert_eq!(report.memory_files.items.len(), 512);
+            assert_eq!(report.memory_files.items[255].name, "context-255");
+            assert_eq!(report.memory_files.items[256].name, "memory-0");
+            assert_eq!(report.memory_files.items[511].name, "memory-255");
+            assert_eq!(
+                report.memory_files.availability,
+                if extra == 0 { Available } else { Partial }
+            );
+            assert_eq!(
+                report
+                    .categories
+                    .iter()
+                    .find(|c| c.id == "memory_files")
+                    .unwrap()
+                    .tokens,
+                if extra == 0 { Some(1280) } else { None }
+            );
+            assert_eq!(
+                report.memory_files.reason.as_deref(),
+                if extra == 0 {
+                    None
+                } else {
+                    Some("Native memory/context list truncated at 512 items")
+                }
+            );
+            let native = report.native.as_ref().unwrap();
+            assert_eq!(native.context_files.items.len(), 256);
+            assert_eq!(native.memory.items.len(), 256 + extra);
+            assert_eq!(report.used_tokens, Some(17));
+        }
+    }
+
     #[test]
     fn claude_summary_preserves_estimates_null_api_and_unknown_categories() {
         let value = json!({"totalTokens":828300,"maxTokens":1000000,"model":"test", "apiUsage":null,
