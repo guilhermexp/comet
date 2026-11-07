@@ -40,6 +40,7 @@ pub struct OmpNormalizer {
     todos: Vec<TodoItem>,
     todo_previous: HashMap<String, Vec<TodoItem>>,
     streaming_tools: HashMap<usize, StreamingToolInput>,
+    model_call_open: bool,
 }
 
 impl OmpNormalizer {
@@ -51,6 +52,7 @@ impl OmpNormalizer {
             todos: Vec::new(),
             todo_previous: HashMap::new(),
             streaming_tools: HashMap::new(),
+            model_call_open: false,
         }
     }
 
@@ -67,10 +69,16 @@ impl OmpNormalizer {
                 .collect(),
             Some("message_update") => self.message_update(&frame),
             Some("message_start") => {
+                if frame["message"]["role"].as_str() == Some("assistant") {
+                    self.model_call_open = true;
+                }
                 self.streaming_tools.clear();
                 Vec::new()
             }
             Some("message_end") => {
+                if frame["message"]["role"].as_str() == Some("assistant") {
+                    self.model_call_open = false;
+                }
                 self.streaming_tools.clear();
                 message_usage(&frame)
             }
@@ -98,6 +106,18 @@ impl OmpNormalizer {
 
     pub fn active_subagents(&self) -> usize {
         self.subagents.len()
+    }
+
+    /// A terminal turn can cut off a parent call before its native duration
+    /// arrives. Nested subagent events never enter the parent's lifecycle.
+    pub(super) fn finish_model_timing(&mut self) -> Option<AgentEvent> {
+        std::mem::take(&mut self.model_call_open).then_some(AgentEvent::TurnMetrics {
+            model_ms: None,
+            model_timing_incomplete: true,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost_usd: None,
+        })
     }
 
     fn tool_start(&mut self, frame: &Value) -> Option<AgentEvent> {

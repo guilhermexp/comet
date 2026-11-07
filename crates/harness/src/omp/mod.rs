@@ -1002,7 +1002,7 @@ async fn run_session(
             _ = context_tasks.join_next(), if !context_tasks.is_empty() => {}
 
             _ = tokio::time::sleep_until(compaction_deadline), if compacting => {
-                finish_agent_end(&process, &event_tx, &mut session_id, &mut pending_interactive,
+                finish_agent_end(&process, &event_tx, &mut normalizer, &mut session_id, &mut pending_interactive,
                     AgentEndDisposition::Error("OMP compaction timed out before completion".into())).await;
                 finished = true;
             }
@@ -1031,6 +1031,7 @@ async fn run_session(
                                 settle!(finish_agent_end(
                                     &process,
                                     &event_tx,
+                                    &mut normalizer,
                                     &mut session_id,
                                     &mut pending_interactive,
                                     AgentEndDisposition::Complete,
@@ -1048,7 +1049,7 @@ async fn run_session(
                         }
                         let message = err.to_string();
                         let _ = emit(&event_tx, AgentEvent::Error { message: message.clone() }).await;
-                        let _ = emit(&event_tx, AgentEvent::Done {
+                        let _ = emit_done(&event_tx, &mut normalizer, AgentEvent::Done {
                             status: DoneStatus::Errored,
                             result: None,
                             error: Some(message),
@@ -1075,7 +1076,7 @@ async fn run_session(
                         Duration::from_millis(500),
                         process.request(json!({ "type": "abort" })),
                     ).await;
-                    let _ = emit(&event_tx, AgentEvent::Done {
+                    let _ = emit_done(&event_tx, &mut normalizer, AgentEvent::Done {
                         status: DoneStatus::Interrupted,
                         result: None,
                         error: None,
@@ -1208,7 +1209,7 @@ async fn run_session(
                         }
                     }
                     let _ = emit(&event_tx, AgentEvent::Error { message: message.clone() }).await;
-                    let _ = emit(&event_tx, AgentEvent::Done {
+                    let _ = emit_done(&event_tx, &mut normalizer, AgentEvent::Done {
                         status: DoneStatus::Errored,
                         result: None,
                         error: Some(message),
@@ -1219,7 +1220,7 @@ async fn run_session(
                 if compacting {
                     if let Some(disposition) = compaction_completion(&frame) {
                         settle!(finish_agent_end(
-                            &process, &event_tx, &mut session_id, &mut pending_interactive, disposition,
+                            &process, &event_tx, &mut normalizer, &mut session_id, &mut pending_interactive, disposition,
                         ).await);
                         continue;
                     }
@@ -1393,6 +1394,7 @@ async fn run_session(
                                 settle!(finish_agent_end(
                                     &process,
                                     &event_tx,
+                                    &mut normalizer,
                                     &mut session_id,
                                     &mut pending_interactive,
                                     disposition,
@@ -1415,6 +1417,7 @@ async fn run_session(
                             settle!(finish_agent_end(
                                 &process,
                                 &event_tx,
+                                &mut normalizer,
                                 &mut session_id,
                                 &mut pending_interactive,
                                 disposition,
@@ -1468,6 +1471,7 @@ fn compaction_completion(frame: &Value) -> Option<AgentEndDisposition> {
 async fn finish_agent_end(
     process: &OmpProcess,
     event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
+    normalizer: &mut OmpNormalizer,
     session_id: &mut String,
     pending_interactive: &mut HashMap<String, tokio_util::sync::CancellationToken>,
     disposition: AgentEndDisposition,
@@ -1507,8 +1511,9 @@ async fn finish_agent_end(
     }
     match disposition {
         AgentEndDisposition::Complete => {
-            let _ = emit(
+            let _ = emit_done(
                 event_tx,
+                normalizer,
                 AgentEvent::Done {
                     status: DoneStatus::Completed,
                     result: None,
@@ -1530,8 +1535,9 @@ async fn finish_agent_end(
             {
                 return TurnEnd::Errored;
             }
-            let _ = emit(
+            let _ = emit_done(
                 event_tx,
+                normalizer,
                 AgentEvent::Done {
                     status: DoneStatus::Errored,
                     result: None,
@@ -1544,6 +1550,19 @@ async fn finish_agent_end(
         }
         AgentEndDisposition::Continue => TurnEnd::Open,
     }
+}
+
+async fn emit_done(
+    event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
+    normalizer: &mut OmpNormalizer,
+    done: AgentEvent,
+) -> bool {
+    if let Some(timing) = normalizer.finish_model_timing()
+        && !emit(event_tx, timing).await
+    {
+        return false;
+    }
+    emit(event_tx, done).await
 }
 
 async fn emit(
