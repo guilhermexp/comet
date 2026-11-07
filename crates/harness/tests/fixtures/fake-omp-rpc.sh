@@ -269,6 +269,33 @@ while IFS= read -r line; do
     extension_ui_response|host_tool_result)
       ;;
     abort)
+      case "$scenario" in
+        timing-stop-queued-*)
+          # Transport gate: the actor chose interrupt before sending abort.
+          # The reader must enqueue these frames before routing the ACK below,
+          # while the actor awaits that ACK instead of normalizing events.
+          case "$scenario" in
+            timing-stop-queued-model|timing-stop-queued-model-child|timing-stop-queued-complete)
+              emit '{"type":"message_start","message":{"role":"assistant"}}' ;;
+            timing-stop-queued-tool)
+              emit '{"type":"message_start","message":{"role":"toolResult"}}'
+              emit '{"type":"message_end","message":{"role":"toolResult","duration":999,"usage":{"output":999}}}'
+              emit '{"type":"tool_execution_start","toolCallId":"timing-tool-queued","toolName":"bash","args":{"command":"fixture"}}' ;;
+          esac
+          case "$scenario" in
+            timing-stop-queued-complete|timing-stop-queued-finish)
+              emit '{"type":"message_end","message":{"role":"assistant","duration":250.4,"usage":{"input":11,"output":4,"cacheRead":13,"cacheWrite":17,"cost":{"total":0.25}}}}'
+              emit '{"type":"agent_end","messages":[]}' ;;
+          esac
+          case "$scenario" in
+            timing-stop-queued-child|timing-stop-queued-model-child)
+              emit '{"type":"subagent_lifecycle","payload":{"id":"timing-child","parentToolCallId":"child-tool","status":"started","agent":"fixture"}}'
+              emit '{"type":"subagent_event","payload":{"id":"timing-child","event":{"type":"message_start","message":{"role":"assistant"}}}}'
+              emit '{"type":"subagent_event","payload":{"id":"timing-child","event":{"type":"message_end","message":{"role":"assistant","duration":999,"usage":{"output":999}}}}}'
+              emit '{"type":"subagent_lifecycle","payload":{"id":"timing-child","status":"completed"}}' ;;
+          esac
+          emit '{"type":"command_output","text":"timing-queued"}' ;;
+      esac
       respond "$line" '{}'
       ;;
     prompt)
@@ -286,7 +313,7 @@ while IFS= read -r line; do
           emit '{"type":"message_start","message":{"role":"assistant"}}'
           emit '{"type":"message_end","message":{"role":"assistant","duration":125.4,"usage":{"input":2,"output":3,"cacheRead":5,"cacheWrite":7,"cost":{"total":0.125}}}}'
           case "$scenario" in
-            timing-stop-model|timing-stop-model-child|timing-eof|timing-error|timing-prompt-error|timing-warm)
+            timing-stop-model|timing-stop-model-child|timing-eof|timing-error|timing-prompt-error|timing-warm|timing-stop-queued-finish)
               emit '{"type":"message_start","message":{"role":"assistant"}}' ;;
             timing-stop-tool)
               emit '{"type":"message_start","message":{"role":"toolResult"}}'

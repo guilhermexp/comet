@@ -6685,6 +6685,16 @@ mod tests {
             ("timing-stop-between", true, DoneStatus::Interrupted),
             ("timing-stop-child", true, DoneStatus::Interrupted),
             ("timing-stop-model-child", false, DoneStatus::Interrupted),
+            ("timing-stop-queued-model", false, DoneStatus::Interrupted),
+            ("timing-stop-queued-complete", true, DoneStatus::Interrupted),
+            ("timing-stop-queued-finish", true, DoneStatus::Interrupted),
+            ("timing-stop-queued-tool", true, DoneStatus::Interrupted),
+            ("timing-stop-queued-child", true, DoneStatus::Interrupted),
+            (
+                "timing-stop-queued-model-child",
+                false,
+                DoneStatus::Interrupted,
+            ),
             ("timing-eof", false, DoneStatus::Errored),
             ("timing-error", false, DoneStatus::Errored),
             ("timing-prompt-error", false, DoneStatus::Errored),
@@ -6739,7 +6749,7 @@ mod tests {
             .await
             .expect("positive lifecycle barrier from the actual driver");
             assert_eq!(turn.finish(10).model_ms, Some(125));
-            if scenario.contains("child") {
+            if scenario.contains("child") && !scenario.contains("queued") {
                 assert!(
                     events
                         .iter()
@@ -6775,16 +6785,12 @@ mod tests {
             .expect("terminal Done after stop/error/EOF");
             assert_eq!(observed_status, status, "{scenario}");
             let stats = turn.finish(5000);
-            assert_eq!(
-                (
-                    stats.input_tokens,
-                    stats.output_tokens,
-                    stats.cache_read_tokens,
-                    stats.cache_write_tokens,
-                    stats.cost_usd
-                ),
-                (2, 3, Some(5), Some(7), Some(0.125)),
-                "{scenario}"
+            let accounting = (
+                stats.input_tokens,
+                stats.output_tokens,
+                stats.cache_read_tokens,
+                stats.cache_write_tokens,
+                stats.cost_usd,
             );
             let markers = events
                 .iter()
@@ -6801,17 +6807,49 @@ mod tests {
                     )
                 })
                 .count();
+            let queued = scenario.contains("queued");
+            // The fixture emits this last, before the abort ACK. FIFO dispatch
+            // proves every preceding frame was already queued at that boundary.
+            let queued_barriers = events.iter().filter(|event|
+                matches!(event, AgentEvent::TextDelta { text } if text == "timing-queued")
+            ).count();
+            let queued_in_order = !queued
+                || matches!(
+                    events.get(events.len() - 2 - markers),
+                    Some(AgentEvent::TextDelta { text }) if text == "timing-queued"
+                );
+            let child_seen = events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Subagent { .. }));
             actual.push((
                 scenario,
                 stats.model_ms,
                 stats.model_ms.and_then(|ms| stats.output_rate(ms)),
                 markers,
+                accounting,
+                queued_barriers,
+                queued_in_order,
+                child_seen,
             ));
+            let queued_completion = matches!(
+                scenario,
+                "timing-stop-queued-complete" | "timing-stop-queued-finish"
+            );
+            let expected_model_ms = complete.then_some(if queued_completion { 375 } else { 125 });
+            let expected_accounting = if queued_completion {
+                (13, 7, Some(18), Some(24), Some(0.375))
+            } else {
+                (2, 3, Some(5), Some(7), Some(0.125))
+            };
             expected.push((
                 scenario,
-                complete.then_some(125),
-                complete.then_some(24.0),
+                expected_model_ms,
+                expected_model_ms.map(|ms| expected_accounting.1 as f64 / (ms as f64 / 1000.0)),
                 usize::from(!complete),
+                expected_accounting,
+                usize::from(queued),
+                true,
+                scenario.contains("child"),
             ));
             if markers > 0 {
                 assert!(
