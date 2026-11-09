@@ -71,3 +71,7 @@ Conferidos os 51 hashes da entrega `f77bb787d3659b9b6b164d20a73bf9b484050d56` (t
 **3.1 permanece pendente:** o smoke read-only atual exige build OMP compatível disponível; o launcher histórico aponta para runtime privado removido e a fonte identificada não tem dependências instaladas. Fixtures e recibo histórico não substituem essa prova. Implementação das demais tarefas aceita; esta change não será arquivada.
 
 Destinos: branch local retida; principal local divergente e hook preexistente preservados. Sem push, release, instalação ou recuperação de conta real.
+
+## Autorização posterior de publicação
+
+O usuário autorizou seguir com a integração e gerar a release no GitHub. Destino: `origin/main` do fork `guilhermexp/comet` e release `v1.0.19`, pelo workflow nativo `release.yml`, sem sobrescrever a principal local divergente ou o hook alheio. Plano e provas da publicação: `.tmp/verify/release-v1.0.19/`. A publicação das correções verificadas não marca 3.1 nem a recuperação real de 401 como comprovadas e não autoriza instalar um produtor externo ou declarar ganhos de Blaze.

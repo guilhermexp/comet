@@ -2,6 +2,14 @@
 
 Tracks local/private fork changes against upstream.
 
+## 2026-11-09: v1.0.19
+
+- Pi: a resposta do Worker volta ao Chat pai após o Stop válido mesmo com a TUI repintando, sem concluir tarefa ativa, bloqueada ou retomada.
+- OMP: admissão e resultado do prompt, yield/wake, startup interativo e compactação seguem os eventos estruturados do runtime compatível.
+- Presets: a tool oferece somente os presets habilitados e instalados de Settings, preservando ordem, favoritos e comandos personalizados.
+- Usage: identidade do workspace, quota histórica, horário de medição e erro da conta Codex ficam separados, sem transformar dados antigos em uma consulta nova.
+- Context: agregados parciais e seus horários são preservados; detalhe indisponível permanece explícito. O smoke com produtor OMP compatível e a recuperação de 401 real continuam não comprovados. Blaze não foi integrado: o piloto parou no manifest ausente do vendor, antes de compilar.
+
 ## 2026-11-09 — Retorno do Worker Pi ao Chat pai
 
 - Stop primário do Pi (`agent_settled`) notifica o Chat pai e libera `completed` mesmo com a TUI repintando. `output_quiescent` não é forçado: a autoridade é `settled_despite_terminal_repaint`, só com `output.bin` medido e identidade Pi.
