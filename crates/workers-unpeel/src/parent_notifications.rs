@@ -41,20 +41,28 @@ pub struct WorkerParentLink {
     pub registered_at_unix_ms: u64,
 }
 
-/// Completion evidence: the runtime said the turn ended and the output has
-/// stopped growing. Process liveness is deliberately NOT part of this — a
-/// worker keeps long-lived service children (MCP servers) alive for the whole
-/// session, so "no process outside a launch-time snapshot" was unsatisfiable
-/// for any runtime that boots one, and the snapshot itself raced the children.
-/// Judging what the worker actually delivered is the orchestrator's job.
+/// Completion evidence: the runtime said the turn ended and, except for a
+/// settled Pi Stop, the output has stopped growing. Process liveness is
+/// deliberately NOT part of this. A worker keeps long-lived service children
+/// (MCP servers) alive for the whole session, so "no process outside a
+/// launch-time snapshot" was unsatisfiable for any runtime that boots one,
+/// and the snapshot itself raced the children. Judging what the worker
+/// actually delivered is the orchestrator's job.
 ///
 /// A `Stop` while the runtime's own background tasks (shells, async agents)
 /// are still out is a pause: the runtime opens a new turn when they report
 /// back, so it withholds completion (see `background_tasks`).
+///
+/// Pi reports that Stop from `agent_settled` while its TUI keeps repainting.
+/// The repaint is not semantic activity, so it does not withhold completion.
+/// OMP and Codex keep the output-stability and rearm guards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerCompletionEvidence {
     pub output_quiescent: bool,
     pub background_tasks_pending: bool,
+    /// Measured `output.bin` exists and this Pi Stop does not wait for the
+    /// terminal to go silent. This is not a claim that the file is quiet.
+    pub settled_despite_terminal_repaint: bool,
 }
 
 impl WorkerCompletionEvidence {
@@ -62,11 +70,13 @@ impl WorkerCompletionEvidence {
         Self {
             output_quiescent: true,
             background_tasks_pending: false,
+            settled_despite_terminal_repaint: false,
         }
     }
 
     fn permits_completion(&self) -> bool {
-        self.output_quiescent && !self.background_tasks_pending
+        !self.background_tasks_pending
+            && (self.output_quiescent || self.settled_despite_terminal_repaint)
     }
 }
 
@@ -169,16 +179,15 @@ fn hook_events(
         {
             continue;
         }
-        // An HTTP-only row from an async provider is held briefly so the
+        // An HTTP-only Stop or PermissionRequest is held briefly so the
         // host's snapshot reconciliation can either attach the durable
         // filesystem episode or prove that this row already covers it. This
         // prevents acknowledging an older same-name HTTP event before a newer
-        // lost snapshot has had a chance to enter the journal.
-        if entry.source_modified_unix_ns.is_none()
-            && now_ms.saturating_sub(entry.occurred_at_unix_ms) < 2_500
-        {
-            continue;
-        }
+        // lost snapshot has had a chance to enter the journal. A Start is the
+        // new-turn boundary and is never held: delaying it keeps the previous
+        // completion visible after Pi resumes.
+        let http_snapshot_grace = entry.source_modified_unix_ns.is_none()
+            && now_ms.saturating_sub(entry.occurred_at_unix_ms) < 2_500;
         match normalized_hook_name(&entry.hook_event_name).as_str() {
             "Start" => {
                 // WaitingForInput is keyed by the last turn-start, not each
@@ -188,7 +197,7 @@ fn hook_events(
                 actionable.clear();
                 retained_latch_event_id = None;
             }
-            "PermissionRequest" => actionable.push((
+            "PermissionRequest" if !http_snapshot_grace => actionable.push((
                 WorkerParentNotificationKind::WaitingForInput,
                 event_id(
                     session,
@@ -198,7 +207,7 @@ fn hook_events(
                 ),
                 entry.occurred_at_unix_ms,
             )),
-            "Stop" | "StopFailure" => {
+            "Stop" | "StopFailure" if !http_snapshot_grace => {
                 actionable
                     .retain(|(kind, _, _)| *kind != WorkerParentNotificationKind::WaitingForInput);
                 const REARM_GRACE_MS: u64 = 5_000;
@@ -726,21 +735,108 @@ pub fn pending_worker_parent_notifications(
     )
 }
 
-fn live_completion_evidence(session: &WorkersSession) -> WorkerCompletionEvidence {
-    let quiet_ms = std::fs::metadata(unpeel_core::session_host::output_path(&session.id))
+fn output_quiet_ms(output_path: &Path) -> Option<u64> {
+    std::fs::metadata(output_path)
         .and_then(|metadata| metadata.modified())
         .ok()
         .and_then(|modified| modified.elapsed().ok())
-        .map(|elapsed| elapsed.as_millis() as u64);
+        .map(|elapsed| elapsed.as_millis() as u64)
+}
+
+fn pi_settled_stop_survives_terminal_repaint(session: &WorkersSession) -> bool {
+    let catalog = unpeel_core::runtime_catalog::builtin_runtime_catalog();
+    let command = unpeel_core::integrations::command_head(&session.command);
+    session
+        .active_runtime_id
+        .as_deref()
+        .and_then(|runtime_id| {
+            catalog
+                .by_id(runtime_id)
+                .or_else(|| catalog.by_slug(runtime_id))
+                .or_else(|| catalog.by_legacy_slug(runtime_id))
+        })
+        .or_else(|| catalog.by_command_alias_for_current_platform(command))
+        .is_some_and(|runtime| runtime.slug == "pi")
+}
+
+/// Shared measurement for notification, `completed` and the post-ACK latch.
+/// Background tasks are read when silence would still consult them, and also
+/// when a settled Pi Stop would otherwise complete while the TUI repaints.
+/// A missing `output.bin` is neither silence nor a repaint.
+fn evidence_from_output(
+    session: &WorkersSession,
+    output_path: &Path,
+    pending_background_tasks: impl FnOnce() -> usize,
+) -> WorkerCompletionEvidence {
+    let quiet_ms = output_quiet_ms(output_path);
     let output_quiescent = quiet_ms.is_some_and(|quiet| quiet >= COMPLETION_OUTPUT_QUIESCENCE_MS);
-    // Only worth reading the transcript when nothing else withholds completion.
-    let background_tasks_pending = output_quiescent
-        && quiet_ms.is_some_and(|quiet| quiet < BACKGROUND_TASK_GRACE_MS)
-        && crate::background_tasks::pending_background_tasks(&session.id) > 0;
+    let within_service_grace = quiet_ms.is_some_and(|quiet| quiet < BACKGROUND_TASK_GRACE_MS);
+    let settled_despite_terminal_repaint =
+        quiet_ms.is_some() && pi_settled_stop_survives_terminal_repaint(session);
+    let background_tasks_pending = within_service_grace
+        && (output_quiescent || settled_despite_terminal_repaint)
+        && pending_background_tasks() > 0;
     WorkerCompletionEvidence {
         output_quiescent,
         background_tasks_pending,
+        settled_despite_terminal_repaint,
     }
+}
+
+fn live_completion_evidence(session: &WorkersSession) -> WorkerCompletionEvidence {
+    evidence_from_output(
+        session,
+        &unpeel_core::session_host::output_path(&session.id),
+        || crate::background_tasks::pending_background_tasks(&session.id),
+    )
+}
+
+fn isolated_pending_background_tasks(session_dir: &Path) -> usize {
+    let Ok(raw) = std::fs::read_to_string(session_dir.join("provider-transcript.jsonl")) else {
+        return 0;
+    };
+    crate::background_tasks::pending_background_task_ids(raw.lines(), 0).len()
+}
+
+fn evidence_for_isolated_session(
+    session: &WorkersSession,
+    sessions_root: &Path,
+) -> WorkerCompletionEvidence {
+    let session_dir = sessions_root.join(&session.id);
+    let output_path = session_dir.join("output.bin");
+    evidence_from_output(session, &output_path, || {
+        isolated_pending_background_tasks(&session_dir)
+    })
+}
+
+#[doc(hidden)]
+pub fn pending_worker_parent_notifications_from_live_output_at(
+    path: &Path,
+    sessions: &[WorkersSession],
+    sessions_root: &Path,
+) -> Result<Vec<WorkerParentNotification>, String> {
+    let state = unpeel_core::app_state::load_for_edit_at(path)?;
+    pending_from_state(
+        &state,
+        sessions,
+        |session_id| sessions_root.join(session_id),
+        |session| evidence_for_isolated_session(session, sessions_root),
+    )
+}
+
+#[doc(hidden)]
+pub fn current_episode_completed_from_live_output_at(
+    path: &Path,
+    session: &WorkersSession,
+    sessions_root: &Path,
+) -> Result<bool, String> {
+    let state = unpeel_core::app_state::load_for_edit_at(path)?;
+    episode_completed_from_state(
+        &state,
+        session,
+        &sessions_root.join(&session.id),
+        evidence_for_isolated_session(session, sessions_root),
+    )
 }
 
 fn episode_completed_from_state(
@@ -757,6 +853,9 @@ fn episode_completed_from_state(
         return Ok(false);
     }
     if binding.acknowledged_completed_episode == Some(binding.active_task_episode) {
+        if newer_start_supersedes_acknowledged_stop(binding, session, worker_session_dir)? {
+            return Ok(false);
+        }
         return Ok(latched_completion_still_holds(binding, session, evidence));
     }
     let submission_recovered =
@@ -787,6 +886,46 @@ fn episode_completed_from_state(
 
 fn activity_blocks_completion(activity: &str) -> bool {
     activity == "blocked" || activity == "working"
+}
+
+fn newer_start_supersedes_acknowledged_stop(
+    binding: &WorkerParentBinding,
+    session: &WorkersSession,
+    session_dir: &Path,
+) -> Result<bool, String> {
+    let Some(entries) = read_entries(session_dir)? else {
+        return Ok(false);
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let episode_cutoff = binding
+        .registered_at_unix_ms
+        .max(binding.submitted_at_unix_ms);
+    let mut last_stop = None;
+    let mut last_start = None;
+    for entry in entries {
+        if entry.occurred_at_unix_ms < episode_cutoff
+            || !event_matches_generation(&entry, session.runtime_generation)
+            || !event_matches_task_episode(&entry, binding.active_task_episode)
+        {
+            continue;
+        }
+        // Same snapshot grace as notification emission, but a Start always
+        // counts. Holding it would leave an acknowledged completion visible
+        // while Pi has already resumed and the activity snapshot is still idle.
+        let http_snapshot_grace = entry.source_modified_unix_ns.is_none()
+            && now_ms.saturating_sub(entry.occurred_at_unix_ms) < 2_500;
+        match normalized_hook_name(&entry.hook_event_name).as_str() {
+            "Start" => last_start = Some(entry.sequence),
+            "Stop" | "StopFailure" if !http_snapshot_grace => {
+                last_stop = Some(entry.sequence);
+            }
+            _ => {}
+        }
+    }
+    Ok(last_start.is_some_and(|start| last_stop.is_none_or(|stop| start > stop)))
 }
 
 fn latched_completion_still_holds(

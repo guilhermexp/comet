@@ -2,6 +2,13 @@
 
 Tracks local/private fork changes against upstream.
 
+## 2026-11-09 — Retorno do Worker Pi ao Chat pai
+
+- Stop primário do Pi (`agent_settled`) notifica o Chat pai e libera `completed` mesmo com a TUI repintando. `output_quiescent` não é forçado: a autoridade é `settled_despite_terminal_repaint`, só com `output.bin` medido e identidade Pi.
+- Tarefa assíncrona real continua a ser lida nesse caso. A graça de 15 min de output parado permanece, sem temporizador novo. Idle sem Stop, bloqueio, trabalho, geração/episódio antigo, Start novo e episódio novo não concluem. ACK é único e o latch cai em retomada, geração ou tarefa nova.
+- OMP e Codex preservam estabilidade de output e, no Codex, a graça de rearm. A extração do tail não mudou: a resposta sintética sobrevive à repintura pelo fallback já existente.
+- Depois do ACK, um `Start` mais novo que o último `Stop` do episódio tira `completed`, inclusive com a TUI do Pi ainda ociosa. Um `Start` entregue só por HTTP também invalida na hora, sem esperar a graça de snapshot; essa graça segue valendo para `Stop` e `PermissionRequest`. Sem journal, o latch permanece.
+
 ## 2026-11-09 — Lifecycle OMP, Usage e Context (implementação local para aceite)
 
 - OMP correlaciona admissão e resultado por request, usa o resultado moderno desde versão verificada 18.18.0, preserva yield/wake/background e conclui compactação pelo evento estruturado. O watchdog moderno mede inatividade após ACK, sem consumir esperas de host tools/input ou interromper streaming ativo. O probe nativo usa o ambiente/cwd reais do processo e seu cache separa esses inputs. Startup atende diálogos durante negociação/configuração, com saída limitada e sem bloquear o stream ainda não exposto; discovery sem Chat usa `--no-ui` preservando extensões/skills.

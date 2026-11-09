@@ -45,12 +45,14 @@ pub use parent_notifications::{
     begin_worker_parent_task_at, build_worker_parent_notification_prompt,
     cancel_worker_parent_task, cancel_worker_parent_task_at, carry_worker_parent_binding,
     carry_worker_parent_binding_at, confirm_worker_parent_task_submission,
-    current_episode_completed, current_episode_completed_with_evidence_at,
-    overlay_unread_from_parent_notifications, pending_worker_parent_notifications,
-    pending_worker_parent_notifications_at, pending_worker_parent_notifications_with_evidence_at,
-    prepare_worker_parent_task, prepare_worker_parent_task_at, register_worker_parent,
-    register_worker_parent_at, worker_has_parent_binding, worker_has_parent_binding_at,
-    worker_parent_links, worker_parent_links_at,
+    current_episode_completed, current_episode_completed_from_live_output_at,
+    current_episode_completed_with_evidence_at, overlay_unread_from_parent_notifications,
+    pending_worker_parent_notifications, pending_worker_parent_notifications_at,
+    pending_worker_parent_notifications_from_live_output_at,
+    pending_worker_parent_notifications_with_evidence_at, prepare_worker_parent_task,
+    prepare_worker_parent_task_at, register_worker_parent, register_worker_parent_at,
+    worker_has_parent_binding, worker_has_parent_binding_at, worker_parent_links,
+    worker_parent_links_at,
 };
 pub use project_git::{AnchorCommit, ProjectGitStatus};
 pub use project_identity::{

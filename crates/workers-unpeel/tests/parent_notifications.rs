@@ -6,10 +6,11 @@ use zeron_workers_unpeel::{
     ack_worker_parent_notification_compacted_at, activate_worker_parent_task_at,
     begin_worker_parent_task_at, build_worker_parent_notification_prompt,
     cancel_worker_parent_task_at, carry_worker_parent_binding_at,
-    current_episode_completed_with_evidence_at, overlay_unread_from_parent_notifications,
-    pending_worker_parent_notifications_at, pending_worker_parent_notifications_with_evidence_at,
-    prepare_worker_parent_task_at, register_worker_parent_at, worker_has_parent_binding_at,
-    worker_parent_links_at,
+    current_episode_completed_from_live_output_at, current_episode_completed_with_evidence_at,
+    overlay_unread_from_parent_notifications, pending_worker_parent_notifications_at,
+    pending_worker_parent_notifications_from_live_output_at,
+    pending_worker_parent_notifications_with_evidence_at, prepare_worker_parent_task_at,
+    register_worker_parent_at, worker_has_parent_binding_at, worker_parent_links_at,
 };
 
 fn session(id: &str, generation: u64, activity: &str, state: &str) -> WorkersSession {
@@ -256,6 +257,7 @@ fn stop_with_background_tasks_pending_is_not_completion() {
     let paused = WorkerCompletionEvidence {
         output_quiescent: true,
         background_tasks_pending: true,
+        settled_despite_terminal_repaint: false,
     };
 
     let pending = pending_worker_parent_notifications_with_evidence_at(
@@ -303,6 +305,7 @@ fn stop_waits_until_the_output_stops_growing() {
         |_| WorkerCompletionEvidence {
             output_quiescent: false,
             background_tasks_pending: false,
+            settled_despite_terminal_repaint: false,
         },
     )
     .unwrap();
@@ -1267,6 +1270,7 @@ fn current_episode_completed_ack_does_not_satisfy_growing_output() {
             WorkerCompletionEvidence {
                 output_quiescent: false,
                 background_tasks_pending: false,
+                settled_despite_terminal_repaint: false,
             },
         )
         .unwrap(),
@@ -1441,5 +1445,493 @@ fn blocked_claude_worker_retains_permission_dialog_in_output_tail() {
     assert!(
         prompt.contains("Allow this action?"),
         "prompt question must be preserved: {prompt}"
+    );
+}
+
+const PI_SETTLED_ANSWER: &str = "PI_SETTLED_ANSWER_7f3a";
+
+fn pi_session(id: &str, generation: u64, activity: &str) -> WorkersSession {
+    let mut worker = session(id, generation, activity, "running");
+    worker.command = "pi".into();
+    worker.provider_id = Some("pi".into());
+    worker.active_runtime_id = Some("pi".into());
+    worker
+}
+
+fn write_repainting_pi_output(root: &std::path::Path, session_id: &str) -> String {
+    let dir = root.join(session_id);
+    std::fs::create_dir_all(&dir).unwrap();
+    let raw = format!(
+        "The final answer is {PI_SETTLED_ANSWER}.\r\n\u{1b}[32mstatus\u{1b}[0m\rold status\rnew status\r"
+    );
+    std::fs::write(dir.join("output.bin"), &raw).unwrap();
+    raw
+}
+
+fn pi_task(root_label: &str) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let (dir, path) = state_file();
+    let sessions_root = dir.path().join("sessions");
+    register_worker_parent_at(&path, root_label, "parent-chat-1", 900).unwrap();
+    begin_worker_parent_task_at(&path, root_label, 950).unwrap();
+    (dir, path, sessions_root)
+}
+
+#[test]
+fn pi_completion_repaint_after_settled_stop_notifies_parent_once() {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+
+    let (_dir, path, sessions_root) = pi_task("pi-worker-1");
+    write_hook(&sessions_root, "pi-worker-1", "Start", 1);
+    write_hook(&sessions_root, "pi-worker-1", "Stop", 1);
+    let raw = write_repainting_pi_output(&sessions_root, "pi-worker-1");
+    let worker = pi_session("pi-worker-1", 1, "idle");
+
+    let pending = pending_worker_parent_notifications_from_live_output_at(
+        &path,
+        &[worker.clone()],
+        &sessions_root,
+    )
+    .unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "a settled Pi stop must notify the parent while the terminal keeps repainting"
+    );
+    assert_eq!(pending[0].kind, WorkerParentNotificationKind::Completed);
+    assert_eq!(pending[0].task_episode, 1);
+    assert_eq!(pending[0].parent_chat_id, "parent-chat-1");
+
+    let screen = zeron_workers_unpeel::controller_mcp_choose_semantic_output(&raw, None, 4 * 1024);
+    let prompt = build_worker_parent_notification_prompt(&pending[0], &screen);
+    assert!(
+        prompt.contains(PI_SETTLED_ANSWER),
+        "the parent notification must carry the settled answer, not only the status repaint: {prompt}"
+    );
+    assert!(
+        current_episode_completed_from_live_output_at(&path, &worker, &sessions_root).unwrap(),
+        "controller completed must agree before ACK"
+    );
+
+    let cancel = AtomicBool::new(false);
+    let polls = AtomicU32::new(0);
+    let started = Instant::now();
+    let waited = zeron_workers_unpeel::controller_mcp_wait_until_matching(
+        30,
+        "completed",
+        &cancel,
+        || {
+            let n = polls.fetch_add(1, Ordering::SeqCst);
+            assert!(n < 3, "completed wait polled {n} times");
+            Ok(worker.clone())
+        },
+        |session| {
+            current_episode_completed_from_live_output_at(&path, session, &sessions_root)
+                .unwrap_or(false)
+        },
+    )
+    .unwrap();
+    assert_eq!(waited["matched"], true);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "completed must not wait for terminal silence"
+    );
+
+    ack_worker_parent_notification_at(&path, &pending[0]).unwrap();
+    let again = write_repainting_pi_output(&sessions_root, "pi-worker-1");
+    assert!(again.contains(PI_SETTLED_ANSWER));
+    assert!(
+        pending_worker_parent_notifications_from_live_output_at(
+            &path,
+            &[worker.clone()],
+            &sessions_root,
+        )
+        .unwrap()
+        .is_empty(),
+        "ACK plus further repaint must not notify twice"
+    );
+    assert!(
+        current_episode_completed_from_live_output_at(&path, &worker, &sessions_root).unwrap(),
+        "completed stays observable after ACK while the terminal repaints"
+    );
+}
+
+fn age_output(root: &std::path::Path, session_id: &str, age: std::time::Duration) {
+    let path = root.join(session_id).join("output.bin");
+    let file = std::fs::File::options().write(true).open(path).unwrap();
+    file.set_modified(std::time::SystemTime::now().checked_sub(age).unwrap())
+        .unwrap();
+}
+
+fn write_pending_background_task(root: &std::path::Path, session_id: &str) {
+    let dir = root.join(session_id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("provider-transcript.jsonl"),
+        "{\"type\":\"user\",\"timestamp\":\"2026-10-14T20:36:15.908Z\",\"toolUseResult\":{\"stdout\":\"\",\"backgroundTaskId\":\"bv55tpwo5\"}}\n",
+    )
+    .unwrap();
+}
+
+fn write_sourced_hook(
+    root: &std::path::Path,
+    session_id: &str,
+    event: &str,
+    generation: u64,
+    task_episode: u64,
+    occurred_at_unix_ms: u64,
+) {
+    let dir = root.join(session_id);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("comet-hook-events.jsonl");
+    let sequence = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .count() as u64
+        + 1;
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&json!({
+            "sequence": sequence,
+            "hook_event_name": event,
+            "runtime_generation": generation,
+            "task_episode": task_episode,
+            "occurred_at_unix_ms": occurred_at_unix_ms,
+            "source_modified_unix_ns": 1
+        }))
+        .unwrap()
+    )
+    .unwrap();
+}
+
+fn assert_pi_not_complete(
+    path: &std::path::Path,
+    sessions_root: &std::path::Path,
+    worker: &WorkersSession,
+) {
+    assert!(
+        pending_worker_parent_notifications_from_live_output_at(
+            path,
+            &[worker.clone()],
+            sessions_root
+        )
+        .unwrap()
+        .is_empty(),
+        "this Pi state must not notify the parent"
+    );
+    assert!(!current_episode_completed_from_live_output_at(path, worker, sessions_root).unwrap());
+}
+
+#[test]
+fn pi_completion_missing_output_is_not_settled_repaint() {
+    let (_dir, path, sessions_root) = pi_task("pi-no-output");
+    write_hook(&sessions_root, "pi-no-output", "Stop", 1);
+    assert_pi_not_complete(
+        &path,
+        &sessions_root,
+        &pi_session("pi-no-output", 1, "idle"),
+    );
+}
+
+#[test]
+fn pi_completion_idle_without_stop_is_not_complete() {
+    let (_dir, path, sessions_root) = pi_task("pi-idle");
+    write_hook(&sessions_root, "pi-idle", "Start", 1);
+    write_repainting_pi_output(&sessions_root, "pi-idle");
+    let worker = pi_session("pi-idle", 1, "idle");
+    assert_pi_not_complete(&path, &sessions_root, &worker);
+    age_output(&sessions_root, "pi-idle", std::time::Duration::from_secs(4));
+    assert_pi_not_complete(&path, &sessions_root, &worker);
+}
+
+#[test]
+fn pi_completion_blocked_or_working_is_not_complete() {
+    let (_dir, path, sessions_root) = pi_task("pi-busy");
+    write_hook(&sessions_root, "pi-busy", "Stop", 1);
+    write_repainting_pi_output(&sessions_root, "pi-busy");
+    for activity in ["blocked", "working"] {
+        assert_pi_not_complete(&path, &sessions_root, &pi_session("pi-busy", 1, activity));
+    }
+}
+
+#[test]
+fn pi_completion_pending_async_withholds_despite_repaint() {
+    let (_dir, path, sessions_root) = pi_task("pi-async");
+    write_hook(&sessions_root, "pi-async", "Stop", 1);
+    write_repainting_pi_output(&sessions_root, "pi-async");
+    write_pending_background_task(&sessions_root, "pi-async");
+    let worker = pi_session("pi-async", 1, "idle");
+    assert_pi_not_complete(&path, &sessions_root, &worker);
+
+    age_output(
+        &sessions_root,
+        "pi-async",
+        std::time::Duration::from_secs(16 * 60),
+    );
+    let pending = pending_worker_parent_notifications_from_live_output_at(
+        &path,
+        &[worker.clone()],
+        &sessions_root,
+    )
+    .unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "the existing output-silence grace must still release a background service"
+    );
+    assert!(current_episode_completed_from_live_output_at(&path, &worker, &sessions_root).unwrap());
+}
+
+#[test]
+fn pi_completion_old_generation_or_episode_does_not_complete() {
+    let (_dir, path, sessions_root) = pi_task("pi-stale");
+    write_hook(&sessions_root, "pi-stale", "Stop", 1);
+    write_repainting_pi_output(&sessions_root, "pi-stale");
+    assert_pi_not_complete(&path, &sessions_root, &pi_session("pi-stale", 2, "idle"));
+
+    begin_worker_parent_task_at(&path, "pi-stale", 1_100).unwrap();
+    write_hook_for_episode(&sessions_root, "pi-stale", "Stop", 1, 1, 1_200);
+    assert_pi_not_complete(&path, &sessions_root, &pi_session("pi-stale", 1, "idle"));
+}
+
+#[test]
+fn pi_completion_new_start_invalidates_settled_stop() {
+    let (_dir, path, sessions_root) = pi_task("pi-restarted");
+    write_hook(&sessions_root, "pi-restarted", "Stop", 1);
+    write_hook(&sessions_root, "pi-restarted", "Start", 1);
+    write_repainting_pi_output(&sessions_root, "pi-restarted");
+    assert_pi_not_complete(
+        &path,
+        &sessions_root,
+        &pi_session("pi-restarted", 1, "idle"),
+    );
+}
+
+#[test]
+fn pi_completion_ack_latch_stops_on_resume_generation_or_new_task() {
+    let (_dir, path, sessions_root) = pi_task("pi-latched");
+    write_hook(&sessions_root, "pi-latched", "Stop", 1);
+    write_repainting_pi_output(&sessions_root, "pi-latched");
+    let worker = pi_session("pi-latched", 1, "idle");
+    let completed = pending_worker_parent_notifications_from_live_output_at(
+        &path,
+        &[worker.clone()],
+        &sessions_root,
+    )
+    .unwrap()
+    .remove(0);
+    ack_worker_parent_notification_at(&path, &completed).unwrap();
+
+    let working = pi_session("pi-latched", 1, "working");
+    assert!(
+        !current_episode_completed_from_live_output_at(&path, &working, &sessions_root).unwrap()
+    );
+    assert!(current_episode_completed_from_live_output_at(&path, &worker, &sessions_root).unwrap());
+    let next_generation = pi_session("pi-latched", 2, "idle");
+    assert!(
+        !current_episode_completed_from_live_output_at(&path, &next_generation, &sessions_root)
+            .unwrap()
+    );
+
+    begin_worker_parent_task_at(&path, "pi-latched", 1_100).unwrap();
+    assert_pi_not_complete(&path, &sessions_root, &worker);
+}
+
+#[test]
+fn pi_completion_ack_then_newer_start_drops_completed_while_idle() {
+    let (_dir, path, sessions_root) = pi_task("pi-resumed");
+    write_hook(&sessions_root, "pi-resumed", "Stop", 1);
+    write_repainting_pi_output(&sessions_root, "pi-resumed");
+    let worker = pi_session("pi-resumed", 1, "idle");
+    let completed = pending_worker_parent_notifications_from_live_output_at(
+        &path,
+        &[worker.clone()],
+        &sessions_root,
+    )
+    .unwrap()
+    .remove(0);
+    ack_worker_parent_notification_at(&path, &completed).unwrap();
+    assert!(current_episode_completed_from_live_output_at(&path, &worker, &sessions_root).unwrap());
+
+    write_hook(&sessions_root, "pi-resumed", "Start", 1);
+    write_repainting_pi_output(&sessions_root, "pi-resumed");
+    assert!(
+        pending_worker_parent_notifications_from_live_output_at(
+            &path,
+            &[worker.clone()],
+            &sessions_root,
+        )
+        .unwrap()
+        .is_empty(),
+        "a newer Start must not emit a second completion notification"
+    );
+    assert!(
+        !current_episode_completed_from_live_output_at(&path, &worker, &sessions_root).unwrap(),
+        "an idle Pi snapshot must not stay completed after a newer Start"
+    );
+
+    let (_dir, omp_path, omp_root) = pi_task("omp-resumed");
+    write_hook(&omp_root, "omp-resumed", "Stop", 1);
+    write_repainting_pi_output(&omp_root, "omp-resumed");
+    age_output(&omp_root, "omp-resumed", std::time::Duration::from_secs(4));
+    let mut omp = session("omp-resumed", 1, "idle", "running");
+    omp.command = "omp".into();
+    omp.provider_id = Some("omp".into());
+    omp.active_runtime_id = Some("omp".into());
+    let omp_completed = pending_worker_parent_notifications_from_live_output_at(
+        &omp_path,
+        &[omp.clone()],
+        &omp_root,
+    )
+    .unwrap()
+    .remove(0);
+    ack_worker_parent_notification_at(&omp_path, &omp_completed).unwrap();
+    write_hook(&omp_root, "omp-resumed", "Start", 1);
+    assert!(
+        !current_episode_completed_from_live_output_at(&omp_path, &omp, &omp_root).unwrap(),
+        "a newer Start drops the acknowledged completion for other runtimes too"
+    );
+}
+
+#[test]
+fn pi_completion_fresh_http_start_invalidates_before_snapshot_grace() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let (_dir, path, sessions_root) = pi_task("pi-http-resume");
+    write_hook(&sessions_root, "pi-http-resume", "Stop", 1);
+    write_repainting_pi_output(&sessions_root, "pi-http-resume");
+    let worker = pi_session("pi-http-resume", 1, "idle");
+    assert_eq!(
+        pending_worker_parent_notifications_from_live_output_at(
+            &path,
+            &[worker.clone()],
+            &sessions_root,
+        )
+        .unwrap()
+        .len(),
+        1
+    );
+
+    write_hook_at(&sessions_root, "pi-http-resume", "Start", 1, now);
+    assert!(
+        pending_worker_parent_notifications_from_live_output_at(
+            &path,
+            &[worker.clone()],
+            &sessions_root,
+        )
+        .unwrap()
+        .is_empty(),
+        "a fresh HTTP Start must drop the pending completion before the snapshot grace elapses"
+    );
+    assert!(
+        !current_episode_completed_from_live_output_at(&path, &worker, &sessions_root).unwrap(),
+        "controller completed must not stay true while Pi has a fresh HTTP Start"
+    );
+
+    let (_dir, latched_path, latched_root) = pi_task("pi-http-latched");
+    write_hook(&latched_root, "pi-http-latched", "Stop", 1);
+    write_repainting_pi_output(&latched_root, "pi-http-latched");
+    let latched = pi_session("pi-http-latched", 1, "idle");
+    let completed = pending_worker_parent_notifications_from_live_output_at(
+        &latched_path,
+        &[latched.clone()],
+        &latched_root,
+    )
+    .unwrap()
+    .remove(0);
+    ack_worker_parent_notification_at(&latched_path, &completed).unwrap();
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    write_hook_at(&latched_root, "pi-http-latched", "Start", 1, started_at);
+    assert!(
+        !current_episode_completed_from_live_output_at(&latched_path, &latched, &latched_root)
+            .unwrap(),
+        "an acknowledged completion must not survive a fresh HTTP Start while Pi is still idle"
+    );
+}
+
+#[test]
+fn pi_completion_wrapped_command_uses_runtime_identity() {
+    let (_dir, path, sessions_root) = pi_task("pi-wrapped");
+    write_hook(&sessions_root, "pi-wrapped", "Stop", 1);
+    write_repainting_pi_output(&sessions_root, "pi-wrapped");
+    let mut worker = pi_session("pi-wrapped", 1, "idle");
+    worker.command = "/bin/zsh -lc echo".into();
+    let pending =
+        pending_worker_parent_notifications_from_live_output_at(&path, &[worker], &sessions_root)
+            .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].kind, WorkerParentNotificationKind::Completed);
+}
+
+#[test]
+fn pi_completion_omp_and_codex_still_require_output_stability() {
+    for (id, command) in [("omp-worker", "omp"), ("codex-worker", "codex")] {
+        let (_dir, path, sessions_root) = pi_task(id);
+        write_hook(&sessions_root, id, "Stop", 1);
+        write_repainting_pi_output(&sessions_root, id);
+        let mut worker = session(id, 1, "idle", "running");
+        worker.command = command.into();
+        worker.provider_id = Some(command.into());
+        worker.active_runtime_id = Some(command.into());
+        assert!(
+            pending_worker_parent_notifications_from_live_output_at(
+                &path,
+                &[worker.clone()],
+                &sessions_root,
+            )
+            .unwrap()
+            .is_empty(),
+            "{command} must keep waiting while its terminal output is fresh"
+        );
+        age_output(&sessions_root, id, std::time::Duration::from_secs(4));
+        let pending = pending_worker_parent_notifications_from_live_output_at(
+            &path,
+            &[worker.clone()],
+            &sessions_root,
+        )
+        .unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "{command} must still complete once output has been quiet"
+        );
+        assert!(
+            current_episode_completed_from_live_output_at(&path, &worker, &sessions_root).unwrap()
+        );
+    }
+
+    let (_dir, path, sessions_root) = pi_task("codex-rearm");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    write_sourced_hook(&sessions_root, "codex-rearm", "Stop", 1, 1, now);
+    write_repainting_pi_output(&sessions_root, "codex-rearm");
+    age_output(
+        &sessions_root,
+        "codex-rearm",
+        std::time::Duration::from_secs(4),
+    );
+    let mut codex = session("codex-rearm", 1, "idle", "running");
+    codex.command = "codex".into();
+    codex.provider_id = Some("codex".into());
+    codex.active_runtime_id = Some("codex".into());
+    assert!(
+        pending_worker_parent_notifications_from_live_output_at(&path, &[codex], &sessions_root)
+            .unwrap()
+            .is_empty(),
+        "a fresh Codex Stop stays inside the rearm grace even when output is quiet"
     );
 }
