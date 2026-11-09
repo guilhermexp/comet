@@ -2,7 +2,7 @@
 
 ## Context
 
-Ver `proposal.md` para o problema e `../../WORK-QUEUE.md` para a ordem de execução. Diagnóstico de 2026-11-08, sem prompts, troca de login ou edição manual de credenciais/cache.
+Ver `proposal.md` para o problema e `../../../WORK-QUEUE.md` para a ordem de execução. Diagnóstico de 2026-11-08, sem prompts, troca de login ou edição manual de credenciais/cache.
 
 ### Evidência reproduzida
 
