@@ -390,6 +390,11 @@ while IFS= read -r line; do
               emit '{"type":"extension_ui_request","id":"long-input","method":"confirm","title":"Fixture confirmation"}' ;;
           esac
           continue ;;
+        structured-compact-validation|structured-compact-validation-before-ack)
+          [ "$scenario" = structured-compact-validation-before-ack ] || respond "$line" '{"agentInvoked":false}'
+          emit '{"type":"command_output","text":"/compact snapcompact does not take focus instructions (fixture)."}'
+          [ "$scenario" != structured-compact-validation-before-ack ] || respond "$line" '{"agentInvoked":false}'
+          continue ;;
         structured-compact-input)
           respond "$line" '{"agentInvoked":false}'
           emit '{"type":"manual_compaction_start"}'

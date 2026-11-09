@@ -9,6 +9,7 @@ Tracks local/private fork changes against upstream.
 - Usage do Codex verifica o workspace autenticado sem confundir a chave composta do slot; erros por conta ficam visíveis com a última quota, backoff e proteção contra resposta de credencial antiga. Resumo identifica histórico/sign-in e a expansão mostra horário e recuperação pelos controles existentes.
 - Os coletores Kimi/Antigravity/Grok/Cursor propagam o horário real da quota pelo campo existente, mantendo o instante do cache; isso preserva a apresentação saudável sob a nova regra de freshness.
 - Context aproveita agregados normalizados de runtime/modelo corretos como Partial, preservando zero e horário de observação. OMP sem RPC detalhada usa estado read-only com ausência cacheada; o painel evita orçamento/listas vazios e concentra os metadados na ajuda Info acessível por teclado.
+- Revisão da árvore entregue encontrou e corrigiu dois casos adicionais: leitor de Context enfileirado respeita agregado mais recente (inclusive zero/ausente), e validação de `/compact` anterior ao início estruturado preserva o diagnóstico sem aguardar o deadline. Regressões específicas reproduzem ambos os defeitos.
 - Provas locais Cargo e fixtures HTTP/GPUI, sem provider pago ou alteração de login. Captura nativa e recuperação do 401 real não comprovadas. Composição completa no OMP instalado continua dependente de produtor externo compatível. Sem instalação, push ou release; aceite e arquivamento pertencem ao orquestrador.
 
 ## 2026-11-07: v1.0.18

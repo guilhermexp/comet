@@ -286,6 +286,9 @@ impl SessionsEngine {
                     .can_route(config.harness_id, &config.request)
                 && cached.report.runtime_id == run_id
                 && cached.resume_binding == native_before
+                // A queued reader may already have received a newer stream
+                // measurement while the preceding inspection was in flight.
+                && cached.stream_usage.as_ref() == aggregate.as_ref()
                 && (cached.completed >= requested
                     || (cached.report.availability == ContextAvailability::Unsupported
                         && aggregate.is_none()))
@@ -853,6 +856,86 @@ mod tests {
         );
         assert!(second.stale);
         core.shutdown().await;
+    }
+    #[tokio::test]
+    async fn context_breakdown_aggregate_queued_reader_does_not_reuse_superseded_stream_usage() {
+        for initial in [Some(0_u64), None] {
+            let (_dir, core, tx) = aggregate_runtime(HarnessId::Codex, false).await;
+            if initial.is_none() {
+                lock(&core.sessions.inner.runs)
+                    .get_mut("aggregate")
+                    .unwrap()
+                    .context_usage = None;
+            }
+            let turn = lock(&core.sessions.inner.runs)
+                .get("aggregate")
+                .unwrap()
+                .turn
+                .clone();
+            let mut requests = turn.context_requests();
+            let sessions = core.sessions.clone();
+            let first =
+                tokio::spawn(async move { sessions.context_breakdown("aggregate", None).await });
+            let native_first = tokio::time::timeout(Duration::from_secs(3), requests.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let sessions = core.sessions.clone();
+            let second = sessions.context_breakdown("aggregate", None);
+            tokio::pin!(second);
+            assert!(matches!(
+                futures::poll!(second.as_mut()),
+                std::task::Poll::Pending
+            ));
+            tx.send(Ok(AgentEvent::ContextUsage {
+                tokens: Some(500),
+                window: Some(5000),
+            }))
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while core
+                    .sessions
+                    .session_status("aggregate")
+                    .unwrap()
+                    .context_usage
+                    .unwrap()
+                    .tokens
+                    != 500
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let unsupported = || {
+                ContextBreakdown::unavailable(
+                    ContextAvailability::Unsupported,
+                    "fixture aggregate only",
+                )
+            };
+            native_first.reply.send(Ok(unsupported())).unwrap();
+            let first_report = first.await.unwrap();
+            let responder = tokio::spawn(async move {
+                while let Some(request) = requests.recv().await {
+                    let _ = request.reply.send(Ok(ContextBreakdown::unavailable(
+                        ContextAvailability::Unsupported,
+                        "fixture aggregate only",
+                    )));
+                }
+            });
+            let second_report = tokio::time::timeout(Duration::from_secs(3), second)
+                .await
+                .unwrap();
+            responder.abort();
+            core.shutdown().await;
+            assert_eq!(first_report.used_tokens, initial);
+            assert_eq!(
+                (second_report.used_tokens, second_report.capacity),
+                (Some(500), Some(5000)),
+                "coalescing cannot discard an already received aggregate B in favor of A"
+            );
+        }
     }
     #[test]
     fn cache_pruning_queries_without_map_lock_and_keeps_active_gates() {

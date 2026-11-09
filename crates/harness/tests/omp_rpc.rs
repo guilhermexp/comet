@@ -3696,3 +3696,38 @@ async fn prompt_outcome_modern_host_wait_keeps_its_own_deadline() {
         "host call owns its wait deadline: {events:?}"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn structured_compaction_validation_failure_before_start_keeps_the_diagnostic() {
+    for scenario in [
+        "structured-compact-validation",
+        "structured-compact-validation-before-ack",
+    ] {
+        let mut fixture = versioned_fixture(scenario, "18.18.0");
+        fixture.harness = fixture.harness.with_prompt_timeout(Duration::from_secs(60));
+        let (controls, _steer, _) = controls_with_answer("Yes");
+        let mut stream = fixture
+            .harness
+            .run(request("/compact snapcompact focus"), controls)
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(750), next_turn(&mut stream)).await;
+        drop(stream);
+        assert_process_gone(fixture.pid()).await;
+        let events =
+            result.expect("pre-operation validation must not wait for the compaction deadline");
+        assert_eq!(done_count(&events), 1);
+        assert!(
+            matches!(
+                events.last(),
+                Some(AgentEvent::Done {
+                    status: DoneStatus::Errored,
+                    ..
+                })
+            ),
+            "{events:?}"
+        );
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::Error {message} if message.contains("does not take focus instructions"))), "{events:?}");
+    }
+}

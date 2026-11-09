@@ -1387,8 +1387,14 @@ async fn run_session(
                             pending_compaction_end = Some(structured_compaction_completion(&frame));
                             compaction_started = false;
                         }
-                        Some("command_output") if !structured_compaction_expected && pending_compaction_end.is_none() => {
-                            if let Some(disposition) = compaction_completion(&frame) { pending_compaction_end = Some(disposition); }
+                        Some("command_output") if pending_compaction_end.is_none() => {
+                            let disposition = compaction_completion(&frame);
+                            // Argument/precondition validation can fail before a
+                            // structured operation starts, even after its ACK.
+                            // Prose never completes a modern compaction operation.
+                            if !structured_compaction_expected || (!compaction_started && matches!(disposition.as_ref(), Some(AgentEndDisposition::Error(_)))) {
+                                pending_compaction_end = disposition;
+                            }
                         }
                         _ => {},
                     }
