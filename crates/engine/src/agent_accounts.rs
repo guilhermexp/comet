@@ -600,6 +600,8 @@ enum ProbeError {
     Network { timeout: bool },
     /// A 2xx whose body didn't carry the windows we parse (schema drift).
     Schema,
+    /// Quota identity is absent, foreign or inconsistent with authenticated workspace claims.
+    Identity,
     /// The slot holds nothing probeable.
     #[serde(rename_all = "camelCase")]
     NoCredentials { why: NoCredentials },
@@ -633,6 +635,7 @@ impl ProbeError {
             ProbeError::Network { timeout: true } => "timeout",
             ProbeError::Network { .. } => "network",
             ProbeError::Schema => "schema",
+            ProbeError::Identity => "identity",
             ProbeError::NoCredentials { .. } => "no-credentials",
             ProbeError::UntrustedEndpoint => "untrusted-endpoint",
         }
@@ -668,7 +671,8 @@ impl ProbeError {
             // CLI refreshing its token) — see `UsageEntry::probe_due`.
             ProbeError::Unauthorized { .. }
             | ProbeError::NoCredentials { .. }
-            | ProbeError::UntrustedEndpoint => Duration::from_secs(10 * 60),
+            | ProbeError::UntrustedEndpoint
+            | ProbeError::Identity => Duration::from_secs(10 * 60),
         }
     }
 
@@ -743,6 +747,7 @@ impl UsageEntry {
                     ProbeError::Unauthorized { .. }
                         | ProbeError::NoCredentials { .. }
                         | ProbeError::UntrustedEndpoint
+                        | ProbeError::Identity
                 ) && self.credentials.as_deref() != Some(credentials)
             }
             _ => true,
@@ -1459,6 +1464,8 @@ impl AgentAccounts {
                     None,
                     "Kimi Code".into(),
                     kimi.usage_windows.clone(),
+                    kimi.usage_fetched_at,
+                    kimi.warning.clone(),
                 ));
             }
         }
@@ -1485,6 +1492,8 @@ impl AgentAccounts {
                 antigravity.email.clone(),
                 "Antigravity".into(),
                 antigravity.usage_windows.clone(),
+                antigravity.usage_fetched_at,
+                antigravity.warning.clone(),
             ));
         }
         if let Some(usage) = grok {
@@ -1498,6 +1507,8 @@ impl AgentAccounts {
                 && let Some(mut account) = self.detect_grok_login()
             {
                 account.usage_windows = usage.usage_windows;
+                account.usage_fetched_at = usage.usage_fetched_at;
+                account.usage_error = usage.warning;
                 accounts.push(account);
             }
         } else if let Some(account) = self.detect_grok_login() {
@@ -1524,7 +1535,8 @@ impl AgentAccounts {
                 });
                 if let Some(account) = target {
                     account.usage_windows = usage.usage_windows;
-                    account.usage_error = None;
+                    account.usage_fetched_at = usage.usage_fetched_at;
+                    account.usage_error = usage.warning;
                 }
             }
         }
@@ -3478,9 +3490,46 @@ impl AgentAccounts {
             return;
         }
         let results = futures::future::join_all(probes).await;
+        // The native CLI can rotate or remove credentials while HTTP is in flight,
+        // outside our account-operation lock. Never bless that earlier generation.
+        let current_codex = if results.iter().any(|row| row.3 == HarnessId::Codex) {
+            let accounts = self.clone();
+            tokio::task::spawn_blocking(move || {
+                let saved: HashMap<_, _> = accounts
+                    .read_slots(HarnessId::Codex)
+                    .into_iter()
+                    .map(|slot| (slot.id, credentials_fingerprint(&slot.credentials)))
+                    .collect();
+                let live = accounts.detect_codex().and_then(|detected| {
+                    detected.credentials.map(|credentials| {
+                        (
+                            usage_key(HarnessId::Codex, &detected.account_key),
+                            credentials_fingerprint(&credentials),
+                        )
+                    })
+                });
+                (saved, live)
+            })
+            .await
+            .ok()
+        } else {
+            None
+        };
         let now = now_ms();
         let mut usage = lock(&self.inner.usage);
         for (key, credentials, result, harness, slot_id, active) in results {
+            if harness == HarnessId::Codex
+                && current_codex.as_ref().is_none_or(|(saved, live)| {
+                    saved.get(&slot_id) != Some(&credentials)
+                        || active
+                            && live.as_ref().is_none_or(|(live_key, live_credentials)| {
+                                live_key != &key || live_credentials != &credentials
+                            })
+                })
+            {
+                tracing::debug!(provider="codex", slot=%slot_id, "ignored usage result for superseded credentials");
+                continue;
+            }
             let entry = usage.entry(key).or_default();
             let previous = entry.error.as_ref().map(ProbeError::class);
             entry.record(result, credentials, now);
@@ -3601,6 +3650,7 @@ impl AgentAccounts {
         let access_token = str_field(tokens, "access_token").ok_or(ProbeError::NoCredentials {
             why: NoCredentials::Missing,
         })?;
+        let (_, workspace) = codex_slot_auth(slot).map_err(|_| ProbeError::Identity)?;
         let body = probe_json(
             "codex",
             "usage",
@@ -3608,18 +3658,11 @@ impl AgentAccounts {
                 .http
                 .get(&self.inner.endpoints.codex_usage)
                 .bearer_auth(&access_token)
-                .header(
-                    "chatgpt-account-id",
-                    str_field(tokens, "account_id").unwrap_or_default(),
-                ),
+                .header("chatgpt-account-id", workspace),
         )
         .await?;
-        if let Some(account_id) = str_field(&body, "account_id")
-            && account_id != slot.account_key
-        {
-            return Err(ProbeError::NoCredentials {
-                why: NoCredentials::Missing,
-            });
+        if str_field(&body, "account_id").as_deref() != Some(workspace) {
+            return Err(ProbeError::Identity);
         }
         let reset_count = body
             .pointer("/rate_limit_reset_credits/available_count")
@@ -4241,6 +4284,8 @@ fn managed_account(
     email: Option<String>,
     display_name: String,
     usage_windows: Vec<AgentUsageWindow>,
+    usage_fetched_at: Option<i64>,
+    usage_error: Option<String>,
 ) -> AgentAccount {
     AgentAccount {
         codex_reset_credits: Default::default(),
@@ -4252,8 +4297,8 @@ fn managed_account(
         active: true,
         usage_windows,
         usage_lines: Vec::new(),
-        usage_fetched_at: None,
-        usage_error: None,
+        usage_fetched_at,
+        usage_error,
         display_name: Some(display_name),
         organization: None,
         auth_kind: Some(AgentAuthKind::Oauth),
@@ -4523,8 +4568,17 @@ fn codex_slot_auth(slot: &Slot) -> Result<(&str, &str), EngineError> {
     match (account_id, access_token) {
         (Some(account_id), Some(access_token))
             if !access_token.is_empty()
-                && account_id == slot.account_key
-                && detected.account_key == slot.account_key =>
+                && !account_id.is_empty()
+                && detected.account_key == slot.account_key
+                && tokens
+                    .and_then(|tokens| tokens.get("id_token"))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(jwt_claims)
+                    .and_then(|claims| {
+                        str_field(&claims["https://api.openai.com/auth"], "chatgpt_account_id")
+                    })
+                    .as_deref()
+                    == Some(account_id) =>
         {
             Ok((access_token, account_id))
         }
@@ -4790,6 +4844,9 @@ fn usage_error_message(
         ProbeError::Unauthorized { .. } if harness == HarnessId::Devin => {
             "Signed out — sign in again".to_string()
         }
+        ProbeError::Unauthorized { .. } if harness == HarnessId::Codex => {
+            "Sign-in required — reconnect this account in Accounts".to_string()
+        }
         ProbeError::Unauthorized { .. } if active => {
             // The CLI owns (and refreshes) the live token; it just hasn't yet.
             format!(
@@ -4819,12 +4876,20 @@ fn usage_error_message(
         ProbeError::Network { timeout: true } => format!("{provider} didn't respond{retry}"),
         ProbeError::Network { .. } => format!("Couldn't reach {provider}{retry}"),
         ProbeError::Schema => "Usage format changed — update zeron".to_string(),
+        ProbeError::Identity => {
+            "Usage identity could not be verified — check this account in Accounts".to_string()
+        }
         ProbeError::NoCredentials {
             why: NoCredentials::ApiKey,
         } => "API keys have no plan usage".to_string(),
         ProbeError::NoCredentials {
             why: NoCredentials::KeyExpired,
         } => "API key expired — connect again".to_string(),
+        ProbeError::NoCredentials {
+            why: NoCredentials::Missing,
+        } if harness == HarnessId::Codex => {
+            "Sign-in required — reconnect this account in Accounts".to_string()
+        }
         ProbeError::NoCredentials {
             why: NoCredentials::Missing,
         } => return None,
@@ -5850,6 +5915,23 @@ mod tests {
                 .map(|account| account.usage_windows.len())
         };
 
+        let measured = |snapshot: &AgentAccountsSnapshot| {
+            snapshot
+                .accounts
+                .iter()
+                .find(|account| account.harness == HarnessId::Kimi)
+                .unwrap()
+                .usage_fetched_at
+        };
+        assert!(
+            measured(&forced).is_some(),
+            "a successful quota probe must carry its measurement time"
+        );
+        assert_eq!(
+            measured(&cached),
+            measured(&forced),
+            "cache reads must preserve measurement time"
+        );
         assert_eq!(windows(&forced), Some(1));
         assert_eq!(windows(&cached), Some(1));
     }
@@ -5926,6 +6008,10 @@ mod tests {
             .find(|account| account.harness == HarnessId::Grok)
             .expect("Grok account present");
 
+        assert!(
+            grok_account.usage_fetched_at.is_some(),
+            "managed Grok quota needs its own measurement time"
+        );
         assert_eq!(grok_account.usage_windows.len(), 1);
         assert_eq!(grok_account.usage_windows[0].label, "Weekly");
         assert_eq!(grok_account.email.as_deref(), Some("user@example.com"));
@@ -6816,7 +6902,7 @@ mod probe_tests {
                     why: NoCredentials::Missing
                 }
             ),
-            None
+            Some("Sign-in required — reconnect this account in Accounts".to_string())
         );
     }
 

@@ -2902,11 +2902,18 @@ async fn context_inspection_old_runtime_is_cached_and_timeout_exit_are_bounded()
         }
         let first = turn.inspect_context().await;
         if scenario == "context-unknown" {
-            assert!(matches!(first, Err(HarnessError::Unsupported(_))));
-            assert!(matches!(
-                turn.inspect_context().await,
-                Err(HarnessError::Unsupported(_))
-            ));
+            let first = first.unwrap();
+            assert_eq!(
+                first.availability,
+                zeron_proto::ContextAvailability::Partial
+            );
+            assert_eq!(
+                (first.used_tokens, first.capacity),
+                (Some(392000), Some(828000))
+            );
+            let second = turn.inspect_context().await.unwrap();
+            assert_eq!(second.used_tokens, first.used_tokens);
+            assert!(!second.reason.unwrap_or_default().contains("Update OMP"));
         } else {
             assert!(first.is_err());
         }
@@ -2921,4 +2928,771 @@ async fn context_inspection_old_runtime_is_cached_and_timeout_exit_are_bounded()
             1
         );
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn prompt_request_identity_precedes_result() {
+    let (process, mut events) = start_fake("normal").await;
+    let id = process.request_id();
+    let response = process
+        .request(json!({"type":"identity_probe", "id":id}))
+        .await
+        .unwrap();
+    assert!(response.is_object());
+    assert_eq!(events.recv().await.unwrap()["id"], id);
+    process.shutdown().await.unwrap();
+}
+
+#[cfg(unix)]
+fn versioned_fixture(scenario: &str, version: &str) -> WarmFixture {
+    use std::os::unix::fs::PermissionsExt;
+    let mut fixture = WarmFixture::new(scenario);
+    let executable = fixture._dir.path().join("omp");
+    std::fs::write(&executable, format!(
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' '{}'; exit 0; fi\nexec '{}' \"$@\"\n",
+        version, fixture_path().display()
+    )).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fixture.harness = fixture
+        .harness
+        .with_executable(executable)
+        .with_prompt_timeout(Duration::from_millis(600));
+    fixture
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn prompt_outcome_local_async_and_sync_complete_once() {
+    for scenario in [
+        "prompt-outcome-local",
+        "prompt-outcome-sync",
+        "prompt-outcome-before-ack",
+        "prompt-outcome-legacy-completed",
+    ] {
+        let fixture = versioned_fixture(scenario, "18.18.0");
+        let (controls, _steer, _) = controls_with_answer("Yes");
+        let mut stream = fixture
+            .harness
+            .run(request("first"), controls)
+            .await
+            .unwrap();
+        let events = next_turn(&mut stream).await;
+        assert_eq!(text_of(&events), "local answer", "{scenario}: {events:?}");
+        assert!(
+            matches!(
+                events.last(),
+                Some(AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    ..
+                })
+            ),
+            "{scenario}: {events:?}"
+        );
+        drop(stream);
+        assert_process_gone(fixture.pid()).await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn prompt_outcome_native_failure_wins_over_empty_terminal_messages() {
+    for (scenario, expected) in [
+        ("prompt-outcome-error", DoneStatus::Errored),
+        ("prompt-outcome-aborted", DoneStatus::Interrupted),
+        ("prompt-outcome-legacy-error", DoneStatus::Errored),
+    ] {
+        let fixture = versioned_fixture(scenario, "18.18.0");
+        let (controls, _steer, _) = controls_with_answer("Yes");
+        let mut stream = fixture
+            .harness
+            .run(request("first"), controls)
+            .await
+            .unwrap();
+        let events = next_turn(&mut stream).await;
+        assert_eq!(text_of(&events), "local answer");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Done {status,..} if *status == expected)),
+            "{scenario}: {events:?}"
+        );
+        assert_eq!(done_count(&events), 1);
+        if scenario.ends_with("error") {
+            assert!(events.iter().any(
+                |e| matches!(e, AgentEvent::Error{message} if message.contains("native failure"))
+            ));
+        }
+        drop(stream);
+        assert_process_gone(fixture.pid()).await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn prompt_outcome_foreign_late_and_duplicate_do_not_complete_next_prompt() {
+    let fixture = versioned_fixture("prompt-outcome-duplicates", "18.18.0");
+    let (controls, steer, _) = controls_with_answer("Yes");
+    let mut stream = fixture
+        .harness
+        .run(request("first"), controls)
+        .await
+        .unwrap();
+    assert_eq!(text_of(&next_turn(&mut stream).await), "local answer");
+    steer.send(user_message("second", "m2")).await.unwrap();
+    let events = next_turn(&mut stream).await;
+    assert_eq!(text_of(&events), "second answer");
+    assert_eq!(done_count(&events), 1);
+    drop(stream);
+    assert_process_gone(fixture.pid()).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn prompt_outcome_modern_missing_result_cannot_fall_back_to_agent_end() {
+    let fixture = versioned_fixture("prompt-outcome-missing", "18.18.0");
+    let (controls, _steer, _) = controls_with_answer("Yes");
+    let mut stream = fixture
+        .harness
+        .run(request("first"), controls)
+        .await
+        .unwrap();
+    let events = next_turn(&mut stream).await;
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Errored,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn structured_compaction_results_override_prose_and_ack() {
+    for (scenario, expected) in [
+        ("structured-compact-success", DoneStatus::Completed),
+        ("structured-compact-skipped", DoneStatus::Completed),
+        ("structured-compact-before-ack", DoneStatus::Completed),
+        ("structured-compact-aborted", DoneStatus::Interrupted),
+        ("structured-compact-error", DoneStatus::Errored),
+        ("structured-compact-unscoped", DoneStatus::Errored),
+    ] {
+        let fixture = versioned_fixture(scenario, "18.18.0");
+        let (controls, _steer, _) = controls_with_answer("Yes");
+        let mut stream = fixture
+            .harness
+            .run(request("/compact"), controls)
+            .await
+            .unwrap();
+        let events = next_turn(&mut stream).await;
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Done {status,..}) if *status == expected),
+            "{scenario}: {events:?}"
+        );
+        assert_eq!(done_count(&events), 1);
+        if expected == DoneStatus::Completed {
+            assert!(
+                events[..events.len() - 1].iter().any(|e| matches!(
+                    e,
+                    AgentEvent::Usage {
+                        context_usage: Some(_),
+                        ..
+                    }
+                )),
+                "{scenario}: {events:?}"
+            );
+            assert!(
+                text_of(&events).is_empty(),
+                "no duplicate CLI completion: {events:?}"
+            );
+        }
+        drop(stream);
+        assert_process_gone(fixture.pid()).await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn yield_lifecycle_pending_background_survives_done_and_settlement_has_no_done() {
+    let fixture = versioned_fixture("yield-lifecycle-settled", "18.18.0");
+    let (controls, steer, _) = controls_with_answer("Yes");
+    let turn = controls.turn.clone();
+    let mut stream = fixture
+        .harness
+        .run(request("first"), controls)
+        .await
+        .unwrap();
+    let events = next_turn(&mut stream).await;
+    assert_eq!(text_of(&events), "before yieldafter continuation");
+    assert!(
+        turn.background_live(),
+        "native pending must be published before Done"
+    );
+    turn.inspect_context().await.unwrap();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            !matches!(event, AgentEvent::Done { .. }),
+            "settlement cannot complete twice"
+        );
+        if matches!(event,AgentEvent::TextDelta{ref text} if text == "settlement observed") {
+            break;
+        }
+    }
+    assert!(!turn.background_live());
+    steer.send(user_message("second", "m2")).await.unwrap();
+    assert_eq!(text_of(&next_turn(&mut stream).await), "second answer");
+    drop(stream);
+    assert_process_gone(fixture.pid()).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn yield_lifecycle_autonomous_wake_has_its_own_completion() {
+    let fixture = versioned_fixture("yield-lifecycle-wake", "18.18.0");
+    let (controls, _steer, _) = controls_with_answer("Yes");
+    let turn = controls.turn.clone();
+    let mut stream = fixture
+        .harness
+        .run(request("first"), controls)
+        .await
+        .unwrap();
+    assert_eq!(done_count(&next_turn(&mut stream).await), 1);
+    assert!(turn.background_live());
+    turn.inspect_context().await.unwrap();
+    let wake = next_turn(&mut stream).await;
+    assert_eq!(text_of(&wake), "wake answer");
+    assert_eq!(done_count(&wake), 1);
+    drop(stream);
+    assert_process_gone(fixture.pid()).await;
+    assert!(!turn.background_live());
+}
+
+#[tokio::test]
+async fn startup_extension_answer_is_serviced_before_negotiation() {
+    let fixture = WarmFixture::new("startup-extension");
+    let (controls, _steer, _) = controls_with_answer("Yes");
+    let mut stream = fixture
+        .harness
+        .run(request("first"), controls)
+        .await
+        .expect("startup dialog must not block negotiation");
+    let events = next_turn(&mut stream).await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+    drop(stream);
+    assert_process_gone(fixture.pid()).await;
+}
+
+#[tokio::test]
+async fn startup_extension_cancellation_terminates_child() {
+    let fixture = WarmFixture::new("startup-extension");
+    let (mut controls, _steer, interrupt) = controls_with_pending_answer();
+    let (asked, question) = tokio::sync::oneshot::channel();
+    let asked = Arc::new(Mutex::new(Some(asked)));
+    let held = Arc::new(Mutex::new(Vec::new()));
+    controls.request_input = Box::new(move |_| {
+        if let Some(asked) = asked.lock().unwrap().take() {
+            let _ = asked.send(());
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        held.lock().unwrap().push(tx);
+        rx
+    });
+    let run = fixture.harness.run(request("first"), controls);
+    tokio::pin!(run);
+    tokio::select! {
+        _=question=>interrupt.cancel(),
+        result=&mut run=>panic!("startup ended without asking: {}",result.is_ok()),
+        _=tokio::time::sleep(Duration::from_secs(3))=>panic!("startup never serviced extension"),
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(3), run)
+        .await
+        .expect("startup cancellation bounded");
+    assert_process_gone(fixture.pid()).await;
+}
+
+#[tokio::test]
+async fn discovery_startup_is_headless_without_disabling_extensions() {
+    assert!(
+        !discover_commands_with_launch(fake_launch("discovery-startup"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !discover_models_with_launch(fake_launch("discovery-startup"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn startup_extension_human_wait_does_not_consume_ack_budget() {
+    let fixture = WarmFixture::new("startup-extension");
+    let (mut controls, _steer, _) = controls_with_answer("Yes");
+    controls.request_input = Box::new(|questions| {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            let _ = tx.send(
+                questions
+                    .into_iter()
+                    .map(|q| UserInputAnswer {
+                        question_id: q.id,
+                        labels: vec!["Yes".into()],
+                    })
+                    .collect(),
+            );
+        });
+        rx
+    });
+    let mut stream = fixture
+        .harness
+        .run(request("first"), controls)
+        .await
+        .expect("human wait exceeded 1s request budget");
+    assert_eq!(done_count(&next_turn(&mut stream).await), 1);
+    drop(stream);
+    assert_process_gone(fixture.pid()).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn prompt_outcome_version_floor_preserves_legacy_and_unknown_fallback() {
+    for (version, expected) in [
+        ("18.17.99", DoneStatus::Completed),
+        ("unknown", DoneStatus::Completed),
+        ("18.18.0", DoneStatus::Errored),
+    ] {
+        let fixture = versioned_fixture("prompt-outcome-missing", version);
+        let (controls, _steer, _) = controls_with_answer("Yes");
+        let mut stream = fixture
+            .harness
+            .run(request("first"), controls)
+            .await
+            .unwrap();
+        assert!(
+            matches!(next_turn(&mut stream).await.last(),Some(AgentEvent::Done{status,..}) if *status==expected)
+        );
+    }
+}
+
+#[tokio::test]
+async fn startup_extension_before_ready_and_eof_remain_bounded() {
+    let fixture = WarmFixture::new("startup-extension-before-ready");
+    let (controls, _steer, _) = controls_with_answer("Yes");
+    let mut stream = fixture
+        .harness
+        .run(request("first"), controls)
+        .await
+        .unwrap();
+    assert_eq!(done_count(&next_turn(&mut stream).await), 1);
+    drop(stream);
+    assert_process_gone(fixture.pid()).await;
+    let fixture = WarmFixture::new("startup-extension-eof");
+    let (controls, _steer, _) = controls_with_pending_answer();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            fixture.harness.run(request("first"), controls)
+        )
+        .await
+        .unwrap()
+        .is_err()
+    );
+    assert_process_gone(fixture.pid()).await;
+}
+
+#[tokio::test]
+async fn startup_extension_chat_retention_preserves_the_total_event_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("pid");
+    let mut env = fake_env("startup-event-overflow");
+    env.insert(
+        "FAKE_OMP_PID_FILE".into(),
+        pid_file.to_string_lossy().into_owned(),
+    );
+    let harness = fake_harness("startup-event-overflow").with_env(env);
+    let (controls, _steer, _) = controls_with_answer("Yes");
+    let error = harness
+        .run(request("first"), controls)
+        .await
+        .err()
+        .expect("startup cannot retain more than the transport event limit");
+    assert!(
+        error.to_string().contains("event buffer exceeded"),
+        "{error}"
+    );
+    let pid = std::fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_process_gone(pid).await;
+}
+
+#[tokio::test]
+async fn context_aggregate_without_breakdown_refreshes_state_without_prompting() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("changed");
+    let log = dir.path().join("wire");
+    let mut env = fake_env("context-aggregate");
+    env.insert("FAKE_OMP_LOG".into(), log.to_string_lossy().into_owned());
+    env.insert(
+        "FAKE_OMP_HOLD_PATH".into(),
+        marker.to_string_lossy().into_owned(),
+    );
+    let harness = fake_harness("context-aggregate").with_env(env);
+    let (controls, _steering, interrupt) = controls_with_answer("yes");
+    let turn = controls.turn.clone();
+    let mut stream = harness.run(request("synthetic"), controls).await.unwrap();
+    while let Some(event) = stream.next().await {
+        if matches!(event.unwrap(), AgentEvent::Done { .. }) {
+            break;
+        }
+    }
+    let first = turn.inspect_context().await.unwrap();
+    assert_eq!((first.used_tokens, first.capacity), (Some(0), Some(1000)));
+    assert_eq!(first.model.as_deref(), Some("fixture/model-a"));
+    assert_eq!(
+        first.availability,
+        zeron_proto::ContextAvailability::Partial
+    );
+    assert!(first.categories.is_empty());
+    std::fs::write(marker, "changed").unwrap();
+    let second = turn.inspect_context().await.unwrap();
+    assert_eq!(
+        (second.used_tokens, second.capacity),
+        (Some(200), Some(2000))
+    );
+    assert_eq!(second.model.as_deref(), Some("fixture/model-b"));
+    interrupt.cancel();
+    while stream.next().await.is_some() {}
+    let wire = std::fs::read_to_string(log).unwrap();
+    assert_eq!(
+        wire.lines()
+            .filter(|l| l.ends_with(" get_context_breakdown"))
+            .count(),
+        1
+    );
+    assert_eq!(wire.lines().filter(|l| l.ends_with(" prompt")).count(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn structured_compaction_preserves_interactive_inputs() {
+    let fixture = versioned_fixture("structured-compact-input", "18.18.0");
+    let (mut controls, _steer, _) = controls_with_answer("Yes");
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = asked.clone();
+    let input = controls.request_input;
+    controls.request_input = Box::new(move |questions| {
+        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        input(questions)
+    });
+    let mut stream = fixture
+        .harness
+        .run(request("/compact"), controls)
+        .await
+        .unwrap();
+    let events = next_turn(&mut stream).await;
+    assert_eq!(
+        asked.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "compaction must call the actual host input boundary"
+    );
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+    assert_eq!(fixture.count("extension_ui_response"), 1);
+    drop(stream);
+    assert_process_gone(fixture.pid()).await;
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn prompt_outcome_rejection_keeps_the_original_diagnostic() {
+    let fixture = versioned_fixture("prompt-outcome-rejection", "18.18.0");
+    let fixture = WarmFixture {
+        harness: fixture.harness.with_prompt_timeout(Duration::from_secs(60)),
+        ..fixture
+    };
+    let (controls, _steer, _) = controls_with_answer("Yes");
+    let mut stream = fixture
+        .harness
+        .run(request("synthetic"), controls)
+        .await
+        .unwrap();
+    let events = tokio::time::timeout(Duration::from_millis(500), next_turn(&mut stream))
+        .await
+        .expect("an explicit native admission rejection must not wait for the turn deadline");
+    assert!(
+        matches!(events.last(),Some(AgentEvent::Done{status:DoneStatus::Errored,error:Some(reason),..}) if reason.contains("fixture admission rejected")),
+        "{events:?}"
+    );
+    drop(stream);
+    assert_process_gone(fixture.pid()).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn prompt_outcome_legacy_active_turn_survives_the_ack_budget() {
+    for version in ["18.17.9", "unknown"] {
+        let mut fixture = versioned_fixture("prompt-outcome-legacy-long", version);
+        fixture.harness = fixture
+            .harness
+            .with_prompt_timeout(Duration::from_millis(100));
+        let (controls, _steer, _) = controls_with_answer("Yes");
+        let turn = controls.turn.clone();
+        let mut stream = fixture
+            .harness
+            .run(request("first"), controls)
+            .await
+            .unwrap();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(
+                !matches!(event, AgentEvent::Done { .. }),
+                "turn ended before fixture barrier: {event:?}"
+            );
+            if matches!(event, AgentEvent::TextDelta {ref text} if text == "legacy active") {
+                break;
+            }
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), stream.next())
+                .await
+                .is_err(),
+            "legacy/unknown executable must retain its native terminal beyond the ACK budget"
+        );
+        // Read-only inspection is a deterministic fixture barrier releasing agent_end.
+        let _ = turn.inspect_context().await;
+        let events = next_turn(&mut stream).await;
+        assert!(
+            matches!(
+                events.last(),
+                Some(AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    ..
+                })
+            ),
+            "{events:?}"
+        );
+        drop(stream);
+        assert_process_gone(fixture.pid()).await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn review2_startup_cancelled_dialog_burst_cannot_block_the_unexposed_stream() {
+    let fixture = WarmFixture::new("startup-extension-cancel-burst");
+    let (controls, _steer, interrupt) = controls_with_pending_answer();
+    let result = tokio::time::timeout(
+        Duration::from_secs(4),
+        fixture.harness.run(request("first"), controls),
+    )
+    .await;
+    if result.is_err() {
+        interrupt.cancel();
+        if let Some((pid, _)) = fixture.rows().first() {
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+        }
+        panic!("startup blocked emitting into its unexposed stream");
+    }
+    let mut stream = result.unwrap().unwrap();
+    let events = next_turn(&mut stream).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::InputResolved { .. }))
+            .count(),
+        300
+    );
+    drop(stream);
+    assert_process_gone(fixture.pid()).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn review2_lifecycle_version_uses_launch_environment_cwd_and_separate_cache_keys() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = WarmFixture::new("prompt-outcome-missing");
+    let executable = fixture._dir.path().join("environment-omp");
+    std::fs::write(&executable, format!("#!/bin/sh\nif [ \"$1\" = --version ]; then if [ \"${{FIXTURE_OMP_VERSION:-}}\" = modern ] || [ -f .fixture-modern ]; then echo 18.18.0; else echo 18.17.0; fi; exit 0; fi\nexec '{}' \"$@\"\n", fixture_path().display())).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let old_cwd = fixture._dir.path().join("old");
+    let new_cwd = fixture._dir.path().join("new");
+    std::fs::create_dir(&old_cwd).unwrap();
+    std::fs::create_dir(&new_cwd).unwrap();
+    std::fs::write(new_cwd.join(".fixture-modern"), "").unwrap();
+    for (version, cwd, expected) in [
+        ("modern", &old_cwd, DoneStatus::Errored),
+        ("legacy", &old_cwd, DoneStatus::Completed),
+        ("legacy", &new_cwd, DoneStatus::Errored),
+    ] {
+        let mut env = fake_env("prompt-outcome-missing");
+        env.insert("FIXTURE_OMP_VERSION".into(), version.into());
+        env.insert(
+            "FAKE_OMP_LOG".into(),
+            fixture.log.to_string_lossy().into_owned(),
+        );
+        let harness = OmpHarness::new()
+            .with_executable(executable.clone())
+            .with_env(env)
+            .with_prompt_timeout(Duration::from_millis(300));
+        let mut req = request("first");
+        req.cwd = cwd.to_string_lossy().into_owned();
+        let (controls, _steer, _) = controls_with_answer("Yes");
+        let mut stream = harness.run(req, controls).await.unwrap();
+        let events = next_turn(&mut stream).await;
+        assert!(
+            matches!(events.last(),Some(AgentEvent::Done{status,..}) if *status==expected),
+            "{version} {cwd:?}: {events:?}"
+        );
+        let pid = fixture.rows().last().unwrap().0;
+        drop(stream);
+        assert_process_gone(pid).await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn prompt_outcome_modern_streaming_and_human_wait_exceed_the_result_idle_budget() {
+    let mut statuses = Vec::new();
+    for scenario in ["prompt-outcome-active", "prompt-outcome-input-wait"] {
+        let mut fixture = versioned_fixture(scenario, "18.18.0");
+        fixture.harness = fixture
+            .harness
+            .with_prompt_timeout(Duration::from_millis(200));
+        let (mut controls, _steer, _) = controls_with_answer("Yes");
+        controls.request_input = Box::new(|questions| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(450)).await;
+                let _ = tx.send(
+                    questions
+                        .into_iter()
+                        .map(|q| UserInputAnswer {
+                            question_id: q.id,
+                            labels: vec!["Yes".into()],
+                        })
+                        .collect(),
+                );
+            });
+            rx
+        });
+        let mut stream = fixture
+            .harness
+            .run(request("first"), controls)
+            .await
+            .unwrap();
+        let events = next_turn(&mut stream).await;
+        statuses.push(matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ));
+        drop(stream);
+        assert_process_gone(fixture.pid()).await;
+    }
+    assert_eq!(
+        statuses,
+        [true, true],
+        "streaming and human wait must not exhaust a result-inactivity budget"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn prompt_outcome_modern_host_wait_keeps_its_own_deadline() {
+    let mut fixture = versioned_fixture("prompt-outcome-host-wait", "18.18.0");
+    let hold = fixture._dir.path().join("release-host");
+    let mut env = fake_env("prompt-outcome-host-wait");
+    env.insert(
+        "FAKE_OMP_LOG".into(),
+        fixture.log.to_string_lossy().into_owned(),
+    );
+    env.insert(
+        "FAKE_OMP_HOLD_PATH".into(),
+        hold.to_string_lossy().into_owned(),
+    );
+    fixture.harness = fixture
+        .harness
+        .with_env(env)
+        .with_prompt_timeout(Duration::from_millis(200));
+    let (controls, _steer, _) = controls_with_answer("Yes");
+    let mut req = request("first");
+    req.enable_workers_mcp = true;
+    req.workers_parent_chat_id = Some("fixture-chat".into());
+    let mut stream = fixture.harness.run(req, controls).await.unwrap();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            !matches!(event, AgentEvent::Done { .. }),
+            "ended before host wait: {event:?}"
+        );
+        if matches!(event,AgentEvent::TextDelta{ref text} if text=="host waiting") {
+            break;
+        }
+    }
+    let early = tokio::time::timeout(Duration::from_millis(450), stream.next()).await;
+    std::fs::write(hold, "").unwrap();
+    let quiet = early.is_err();
+    let mut events = Vec::new();
+    if let Ok(Some(Ok(event))) = early {
+        events.push(event);
+    }
+    if !events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::Done { .. }))
+    {
+        events.extend(next_turn(&mut stream).await);
+    }
+    let completed = matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    );
+    drop(stream);
+    assert_process_gone(fixture.pid()).await;
+    assert!(
+        quiet && completed,
+        "host call owns its wait deadline: {events:?}"
+    );
 }

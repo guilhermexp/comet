@@ -362,132 +362,172 @@ impl Harness for OmpHarness {
         // resolve them BEFORE the spawn so no process sits idle through
         // multi-megabyte reads.
         let images = load_images(&request.attachments, &request.prompt, "prompt").await?;
-        let process = OmpProcess::start(self.launch(cwd, false, system_prompt_append)?).await?;
-        let events = process.take_events()?;
-        process
-            .request(json!({ "type": "set_subagent_subscription", "level": "events" }))
-            .await?;
-        // Multi-question `ask` arrives as one request instead of a chain of
-        // selects, so the wizard can go back to an earlier question. An OMP
-        // without the command keeps the select chain.
-        let _ = process
-            .request(json!({ "type": "set_ask_dialog", "enabled": true }))
-            .await;
-        let executable = if workers_expected || request.sessions.is_some() {
-            Some(self.workers_executable().ok_or_else(|| {
-                HarnessError::Protocol("Workers controller executable is unavailable".into())
-            })?)
-        } else {
-            None
-        };
-        let workers = if workers_expected {
-            let executable = executable.clone().expect("checked");
-            WorkersBridge::start(WorkersBridgeOptions {
-                enabled: true,
-                executable,
-                parent_chat_id: request.workers_parent_chat_id.clone(),
-            })
-            .await?
-            .map(Arc::new)
-        } else {
-            None
-        };
-        let zeron = if let Some(grant) = &request.sessions {
-            let executable = executable.clone().expect("checked");
-            // Optional: a run without chat tools beats a run that fails to
-            // start because `zeron mcp` could not come up.
-            match WorkersBridge::start_zeron(&executable, grant).await {
-                Ok(bridge) => bridge.map(Arc::new),
-                Err(error) => {
-                    tracing::warn!(target: "zeron_harness::omp", %error, "zeron chat MCP unavailable");
-                    None
+        let (process, startup) =
+            OmpProcess::spawn(self.launch(cwd, false, system_prompt_append)?).await?;
+        let mut events = process.take_startup_events()?;
+        let (event_tx, mut event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
+        let mut workers = None;
+        let mut zeron = None;
+        let mut computer_use = None;
+        let setup = async {
+            process.initialize(startup).await?;
+            process
+                .request(json!({ "type": "set_subagent_subscription", "level": "events" }))
+                .await?;
+            // Multi-question `ask` arrives as one request instead of a chain of
+            // selects, so the wizard can go back to an earlier question. An OMP
+            // without the command keeps the select chain.
+            let _ = process
+                .request(json!({ "type": "set_ask_dialog", "enabled": true }))
+                .await;
+            let executable = if workers_expected || request.sessions.is_some() {
+                Some(self.workers_executable().ok_or_else(|| {
+                    HarnessError::Protocol("Workers controller executable is unavailable".into())
+                })?)
+            } else {
+                None
+            };
+            workers = if workers_expected {
+                let executable = executable.clone().expect("checked");
+                WorkersBridge::start(WorkersBridgeOptions {
+                    enabled: true,
+                    executable,
+                    parent_chat_id: request.workers_parent_chat_id.clone(),
+                })
+                .await?
+                .map(Arc::new)
+            } else {
+                None
+            };
+            zeron = if let Some(grant) = &request.sessions {
+                let executable = executable.clone().expect("checked");
+                // Optional: a run without chat tools beats a run that fails to
+                // start because `zeron mcp` could not come up.
+                match WorkersBridge::start_zeron(&executable, grant).await {
+                    Ok(bridge) => bridge.map(Arc::new),
+                    Err(error) => {
+                        tracing::warn!(target: "zeron_harness::omp", %error, "zeron chat MCP unavailable");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            // Optional like `zeron`: a run without Computer Use beats a run that
+            // fails to start. The server itself enforces the Settings switch.
+            computer_use = match (request.enable_workers_mcp, self.workers_executable()) {
+                (true, Some(executable)) => match WorkersBridge::start_computer_use(
+                    &executable,
+                    request.workers_parent_chat_id.as_deref(),
+                    self.data_dir().as_deref(),
+                )
+                .await
+                {
+                    Ok(bridge) => bridge.map(Arc::new),
+                    Err(error) => {
+                        tracing::warn!(target: "zeron_harness::omp", %error, "Computer Use MCP unavailable");
+                        None
+                    }
+                },
+                _ => None,
+            };
+            let host_tools: Vec<_> = workers
+                .iter()
+                .chain(zeron.iter())
+                .chain(computer_use.iter())
+                .flat_map(|bridge| bridge.definitions().iter().cloned())
+                .collect();
+            if !host_tools.is_empty() {
+                process
+                    .request(json!({
+                        "type": "set_host_tools",
+                        "tools": host_tools
+                    }))
+                    .await?;
+            }
+
+            // Resume AFTER the host tools exist. OMP builds the resumed session's
+            // system prompt (and its tool roster) when `switch_session` loads it;
+            // with the host tools registered afterwards, the first request listed
+            // none of them in the system prompt, differed from the previous
+            // process's prefix there, and queued a hidden "Tool availability
+            // changed" notice before the user message. Anthropic then missed the
+            // prompt cache from the system block on and dropped the signed
+            // thinking of earlier turns. Measured against the installed omp 18.16
+            // (openspec preserve-omp-prompt-cache-across-turns, request-diff):
+            // tools first leaves the whole prefix byte-identical.
+            if let Some(session_path) = request.resume.as_deref() {
+                // Hand OMP the chat's model up front: since OMP 18.11 a headless
+                // switch_session throws "Could not restore model" when the
+                // session's saved model does not resolve at open time, instead of
+                // falling back. An explicit model skips that restore.
+                let mut switch = json!({ "type": "switch_session", "sessionPath": session_path });
+                if let Some(model) = request.model.as_deref() {
+                    let (provider, model_id) = split_model_id(model)?;
+                    switch["provider"] = json!(provider);
+                    switch["modelId"] = json!(model_id);
+                }
+                let response = process.request(switch).await?;
+                if response.get("cancelled").and_then(Value::as_bool) == Some(true) {
+                    return Err(HarnessError::Protocol(
+                        "OMP session resume was cancelled".into(),
+                    ));
                 }
             }
-        } else {
-            None
-        };
-        // Optional like `zeron`: a run without Computer Use beats a run that
-        // fails to start. The server itself enforces the Settings switch.
-        let computer_use = match (request.enable_workers_mcp, self.workers_executable()) {
-            (true, Some(executable)) => match WorkersBridge::start_computer_use(
-                &executable,
-                request.workers_parent_chat_id.as_deref(),
-                self.data_dir().as_deref(),
-            )
-            .await
-            {
-                Ok(bridge) => bridge.map(Arc::new),
-                Err(error) => {
-                    tracing::warn!(target: "zeron_harness::omp", %error, "Computer Use MCP unavailable");
-                    None
-                }
-            },
-            _ => None,
-        };
-        let host_tools: Vec<_> = workers
-            .iter()
-            .chain(zeron.iter())
-            .chain(computer_use.iter())
-            .flat_map(|bridge| bridge.definitions().iter().cloned())
-            .collect();
-        if !host_tools.is_empty() {
-            process
-                .request(json!({
-                    "type": "set_host_tools",
-                    "tools": host_tools
-                }))
-                .await?;
-        }
 
-        // Resume AFTER the host tools exist. OMP builds the resumed session's
-        // system prompt (and its tool roster) when `switch_session` loads it;
-        // with the host tools registered afterwards, the first request listed
-        // none of them in the system prompt, differed from the previous
-        // process's prefix there, and queued a hidden "Tool availability
-        // changed" notice before the user message. Anthropic then missed the
-        // prompt cache from the system block on and dropped the signed
-        // thinking of earlier turns. Measured against the installed omp 18.16
-        // (openspec preserve-omp-prompt-cache-across-turns, request-diff):
-        // tools first leaves the whole prefix byte-identical.
-        if let Some(session_path) = request.resume.as_deref() {
-            // Hand OMP the chat's model up front: since OMP 18.11 a headless
-            // switch_session throws "Could not restore model" when the
-            // session's saved model does not resolve at open time, instead of
-            // falling back. An explicit model skips that restore.
-            let mut switch = json!({ "type": "switch_session", "sessionPath": session_path });
             if let Some(model) = request.model.as_deref() {
                 let (provider, model_id) = split_model_id(model)?;
-                switch["provider"] = json!(provider);
-                switch["modelId"] = json!(model_id);
+                process
+                    .request(json!({
+                        "type": "set_model",
+                        "provider": provider,
+                        "modelId": model_id
+                    }))
+                    .await?;
             }
-            let response = process.request(switch).await?;
-            if response.get("cancelled").and_then(Value::as_bool) == Some(true) {
+            if let Some(reasoning) = request.reasoning {
+                process
+                    .request(json!({
+                        "type": "set_thinking_level",
+                        "level": reasoning_wire(reasoning)
+                    }))
+                    .await?;
+            }
+
+            let state = process.request(json!({ "type": "get_state" })).await?;
+            if state_session_id(&state).is_none() {
                 return Err(HarnessError::Protocol(
-                    "OMP session resume was cancelled".into(),
+                    "OMP state omitted its session identity".into(),
                 ));
             }
-        }
-
-        if let Some(model) = request.model.as_deref() {
-            let (provider, model_id) = split_model_id(model)?;
-            process
-                .request(json!({
-                    "type": "set_model",
-                    "provider": provider,
-                    "modelId": model_id
-                }))
-                .await?;
-        }
-        if let Some(reasoning) = request.reasoning {
-            process
-                .request(json!({
-                    "type": "set_thinking_level",
-                    "level": reasoning_wire(reasoning)
-                }))
-                .await?;
-        }
-
-        let state = process.request(json!({ "type": "get_state" })).await?;
+            Ok(state)
+        };
+        let startup_result = service_startup(
+            &process,
+            &mut events,
+            &controls,
+            &event_tx,
+            &mut event_rx,
+            setup,
+        )
+        .await;
+        let (state, startup_events, startup_output) = match startup_result {
+            Ok(value) => {
+                process.activate_events();
+                value
+            }
+            Err(error) => {
+                for bridge in workers
+                    .iter()
+                    .chain(zeron.iter())
+                    .chain(computer_use.iter())
+                {
+                    let _ = bridge.shutdown().await;
+                }
+                let _ = process.shutdown().await;
+                return Err(error);
+            }
+        };
         let model = request
             .model
             .clone()
@@ -511,7 +551,6 @@ impl Harness for OmpHarness {
         if !images.is_empty() {
             prompt["images"] = Value::Array(images);
         }
-        let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         event_tx
             .send(Ok(AgentEvent::SessionStarted {
                 harness: HarnessId::Omp,
@@ -528,6 +567,7 @@ impl Harness for OmpHarness {
         tokio::spawn(run_session(
             process,
             events,
+            startup_events,
             event_tx,
             controls,
             context_requests,
@@ -543,12 +583,12 @@ impl Harness for OmpHarness {
             None,
         ));
 
-        Ok(
-            futures::stream::unfold(event_rx, |mut receiver| async move {
-                receiver.recv().await.map(|event| (event, receiver))
-            })
-            .boxed(),
-        )
+        Ok(futures::stream::iter(startup_output)
+            .chain(futures::stream::unfold(
+                event_rx,
+                |mut receiver| async move { receiver.recv().await.map(|event| (event, receiver)) },
+            ))
+            .boxed())
     }
 }
 
@@ -557,7 +597,7 @@ pub async fn discover_models_with_launch(
     mut launch: process::OmpLaunch,
 ) -> Result<Vec<Model>, HarnessError> {
     launch.ephemeral = true;
-    let process = process::OmpProcess::start(launch).await?;
+    let process = process::OmpProcess::start_discovery(launch).await?;
     let (state, available) = tokio::join!(
         process.request(json!({ "type": "get_state" })),
         process.request(json!({ "type": "get_available_models" })),
@@ -574,7 +614,7 @@ pub async fn discover_commands_with_launch(
     mut launch: process::OmpLaunch,
 ) -> Result<Vec<SlashCommand>, HarnessError> {
     launch.ephemeral = true;
-    let process = process::OmpProcess::start(launch).await?;
+    let process = process::OmpProcess::start_discovery(launch).await?;
     let result = process
         .request(json!({ "type": "get_available_commands" }))
         .await;
@@ -729,13 +769,13 @@ fn state_session_id(state: &Value) -> Option<String> {
 
 fn context_usage_from_state(state: &Value) -> Option<zeron_proto::ContextUsage> {
     let usage = state.get("contextUsage")?;
-    let tokens = usage.get("tokens").and_then(Value::as_u64)?;
-    let context_window = usage.get("contextWindow").and_then(Value::as_u64)?;
-    (context_window > 0).then_some(zeron_proto::ContextUsage {
-        tokens,
-        context_window,
-        tokens_reported: None,
-    })
+    let tokens = usage.get("tokens").and_then(Value::as_u64);
+    let window = usage
+        .get("contextWindow")
+        .and_then(Value::as_u64)
+        .filter(|n| *n > 0);
+    (tokens.is_some() || window.is_some())
+        .then(|| zeron_proto::ContextUsage::reported(tokens, window))
 }
 
 fn user_steering_text(frame: &Value) -> Option<String> {
@@ -797,7 +837,9 @@ fn begin_prompt(
     process: OmpProcess,
     message: String,
     attachments: Vec<String>,
+    request_id: String,
     timeout: Duration,
+    admission: process::PromptAdmission,
     #[cfg(test)] gate: Option<Arc<tests::PromptGate>>,
 ) -> PromptFuture {
     Box::pin(async move {
@@ -809,11 +851,11 @@ fn begin_prompt(
             gate.release.notified().await;
         }
         let images = load_images(&attachments, &message, "prompt").await?;
-        let mut prompt = json!({ "type": "prompt", "message": message });
+        let mut prompt = json!({ "type": "prompt", "message": message, "id": request_id });
         if !images.is_empty() {
             prompt["images"] = Value::Array(images);
         }
-        process.request_with_timeout(prompt, timeout).await
+        process.request_prompt(prompt, timeout, admission).await
     })
 }
 
@@ -821,6 +863,7 @@ fn begin_prompt(
 async fn run_session(
     process: OmpProcess,
     mut events: mpsc::Receiver<Value>,
+    mut startup_events: VecDeque<Value>,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     controls: RunControls,
     mut context_requests: mpsc::Receiver<crate::context_inspection::ContextInspectionRequest>,
@@ -830,7 +873,7 @@ async fn run_session(
     cwd: String,
     model: String,
     mut session_id: String,
-    prompt: Value,
+    mut prompt: Value,
     prompt_timeout: Duration,
     #[cfg(test)] gate: Option<Arc<tests::PromptGate>>,
 ) {
@@ -842,7 +885,7 @@ async fn run_session(
         mut steering,
         interrupt,
         chat_id: _,
-        turn: _turn,
+        turn,
     } = controls;
     let request_input: Arc<RequestInputFn> = request_input.into();
     let (interactive_tx, mut interactive_rx) = mpsc::unbounded_channel::<InteractiveResolution>();
@@ -859,8 +902,18 @@ async fn run_session(
             .and_then(Value::as_str)
             .unwrap_or_default(),
     );
-    let mut compaction_deadline = tokio::time::Instant::now() + prompt_timeout;
+    let mut completion_deadline = tokio::time::Instant::now() + prompt_timeout;
+    let mut prompt_wait_paused = true;
     let mut pending_agent_end: Option<Value> = None;
+    let mut active_prompt = Some(process.request_id());
+    prompt["id"] = json!(active_prompt.as_ref().unwrap());
+    let mut pending_prompt_result: Option<Value> = None;
+    let mut prompt_admission = process::PromptAdmission::default();
+    let mut compaction_started = false;
+    let mut pending_compaction_end = None;
+    let mut suppress_compaction_output = false;
+    let modern_lifecycle = process.modern_lifecycle();
+    let mut structured_compaction_expected = modern_lifecycle;
     let mut steering_open = true;
     let mut finished = false;
     let mut queued_steers: VecDeque<SteerMessage> = VecDeque::new();
@@ -876,7 +929,12 @@ async fn run_session(
 
     let mut prompt_fut: PromptFuture = {
         let process = process.clone();
-        Box::pin(async move { process.request_with_timeout(prompt, prompt_timeout).await })
+        let admission = prompt_admission.clone();
+        Box::pin(async move {
+            process
+                .request_prompt(prompt, prompt_timeout, admission)
+                .await
+        })
     };
     let mut prompt_pending = true;
 
@@ -889,6 +947,9 @@ async fn run_session(
                 TurnEnd::Errored => finished = true,
                 TurnEnd::Complete => {
                     turn_active = false;
+                    active_prompt = None;
+                    pending_prompt_result = None;
+                    pending_compaction_end = None;
                     compacting = false;
                     pending_agent_end = None;
                     // A wait_for_status still blocking when its turn ended
@@ -930,13 +991,22 @@ async fn run_session(
                 steer_pending = true;
             } else {
                 turn_active = true;
+                active_prompt = Some(process.request_id());
+                pending_prompt_result = None;
+                prompt_admission = process::PromptAdmission::default();
+                compaction_started = false;
+                structured_compaction_expected = modern_lifecycle;
+                pending_compaction_end = None;
+                suppress_compaction_output = false;
                 compacting = is_compact_prompt(&prompt);
-                compaction_deadline = tokio::time::Instant::now() + prompt_timeout;
+                completion_deadline = tokio::time::Instant::now() + prompt_timeout;
                 prompt_fut = begin_prompt(
                     process.clone(),
                     prompt,
                     attachments,
+                    active_prompt.clone().unwrap(),
                     prompt_timeout,
+                    prompt_admission.clone(),
                     #[cfg(test)]
                     gate.clone(),
                 );
@@ -961,6 +1031,37 @@ async fn run_session(
     let context_unsupported = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut context_tasks = tokio::task::JoinSet::new();
     while !finished {
+        if turn_active && !prompt_pending {
+            let disposition = if compacting {
+                pending_compaction_end
+                    .take()
+                    .inspect(|_| suppress_compaction_output = true)
+            } else {
+                pending_prompt_result.take().map(|result| {
+                    if result.get("sessionSettled").and_then(Value::as_bool) == Some(true) {
+                        turn.set_background(0);
+                    }
+                    prompt_result_disposition(&result)
+                })
+            };
+            if let Some(disposition) = disposition {
+                settle!(
+                    finish_agent_end(
+                        &process,
+                        &event_tx,
+                        &mut normalizer,
+                        &mut session_id,
+                        &mut pending_interactive,
+                        &turn,
+                        disposition
+                    )
+                    .await
+                );
+            }
+        }
+        if finished {
+            break;
+        }
         // One delivery at a time: image preflight cannot reorder adjacent
         // messages, and nothing overtakes the opening prompt's ACK or a
         // pending host-tool result. Keep the complete message until dispatch.
@@ -974,43 +1075,68 @@ async fn run_session(
         if finished {
             break;
         }
+        // Host tools and people own their existing wait budgets. Once the ACK
+        // is consumed, only native inactivity while no such wait is pending
+        // spends the prompt-result budget; compaction keeps its absolute bound.
+        let result_wait_paused =
+            prompt_pending || !delivering.is_empty() || !pending_interactive.is_empty();
+        if modern_lifecycle && !compacting && (result_wait_paused || prompt_wait_paused) {
+            completion_deadline = tokio::time::Instant::now() + prompt_timeout;
+        }
+        prompt_wait_paused = result_wait_paused;
         tokio::select! {
             Some(request) = context_requests.recv() => {
                 if request.reply.is_closed() || request.deadline <= tokio::time::Instant::now() {continue;}
-                if context_unsupported.load(std::sync::atomic::Ordering::Acquire) {
-                    let _ = request.reply.send(Err(HarnessError::Unsupported("Update OMP to inspect context breakdown".into())));
-                    continue;
-                }
                 if context_tasks.len() >= 8 {
                     let _ = request.reply.send(Err(HarnessError::Protocol("Context inspection is busy".into())));continue;
                 }
                 let process=process.clone();let unsupported=context_unsupported.clone();
                 context_tasks.spawn(async move {
-                    let timeout=request.deadline.saturating_duration_since(tokio::time::Instant::now());
-                    let result=process.request_with_timeout(json!({"type":"get_context_breakdown"}),timeout).await;
-                    let report=match result {
-                        Ok(value)=>Ok(crate::context_breakdown::omp(&value)),
-                        Err(error) if error.to_string().contains("Unknown command")=>{
-                            unsupported.store(true,std::sync::atomic::Ordering::Release);
-                            Err(HarnessError::Unsupported("Update OMP to inspect context breakdown".into()))
+                    let timeout = || request.deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let detailed = if unsupported.load(std::sync::atomic::Ordering::Acquire) { None } else {
+                        match process.request_with_timeout(json!({"type":"get_context_breakdown"}),timeout()).await {
+                            Ok(value) => Some(Ok(crate::context_breakdown::omp(&value))),
+                            Err(error) if error.to_string().contains("Unknown command") => {
+                                unsupported.store(true,std::sync::atomic::Ordering::Release);
+                                None
+                            }
+                            Err(_) => Some(Err(HarnessError::Protocol("OMP context inspection failed or timed out".into()))),
                         }
-                        Err(_)=>Err(HarnessError::Protocol("OMP context inspection failed or timed out".into())),
+                    };
+                    let report = match detailed {
+                        Some(report) => report,
+                        None => match process.request_with_timeout(json!({"type":"get_state"}), timeout()).await {
+                            Ok(state) => {
+                                let mut report = zeron_proto::ContextBreakdown::unavailable(zeron_proto::ContextAvailability::Unsupported, "This OMP runtime exposes aggregate context only; detailed inspection is unavailable");
+                                report.source = "omp-aggregate".into();
+                                report.native_session_id = bounded_string(&state, "sessionId", 512).ok().filter(|s| !s.chars().any(char::is_control)).map(str::to_owned);
+                                report.model = state_model(&state).filter(|s| s.len() <= 512 && !s.chars().any(char::is_control));
+                                if let Some(usage) = context_usage_from_state(&state) {
+                                    report.availability = zeron_proto::ContextAvailability::Partial;
+                                    report.used_tokens = usage.reported_tokens();
+                                    report.capacity = usage.reported_window();
+                                    report.used_basis = report.used_tokens.map(|_| "native-aggregate".into());
+                                }
+                                Ok(report)
+                            }
+                            Err(_) => Err(HarnessError::Protocol("OMP aggregate context inspection failed or timed out".into())),
+                        }
                     };
                     let _=request.reply.send(report);
                 });
             }
             _ = context_tasks.join_next(), if !context_tasks.is_empty() => {}
 
-            _ = tokio::time::sleep_until(compaction_deadline), if compacting => {
-                finish_agent_end(&process, &event_tx, &mut normalizer, &mut session_id, &mut pending_interactive,
-                    AgentEndDisposition::Error("OMP compaction timed out before completion".into())).await;
+            _ = tokio::time::sleep_until(completion_deadline), if turn_active && active_prompt.is_some() && (compacting || modern_lifecycle && !result_wait_paused) => {
+                finish_agent_end(&process, &event_tx, &mut normalizer, &mut session_id, &mut pending_interactive, &turn,
+                    AgentEndDisposition::Error(if compacting {"OMP compaction timed out before completion"} else {"OMP prompt timed out before completion"}.into())).await;
                 finished = true;
             }
             prompt_res = &mut prompt_fut, if prompt_pending => {
                 prompt_pending = false;
                 match prompt_res {
                     Ok(prompt_response) => {
-                        if prompt_response.get("agentInvoked").and_then(Value::as_bool) == Some(false) {
+                        if turn_active && prompt_response.get("agentInvoked").and_then(Value::as_bool) == Some(false) {
                             // OMP runs /compact in the background. This ACK only
                             // confirms dispatch; command_output carries completion.
                             if compacting {
@@ -1033,13 +1159,19 @@ async fn run_session(
                                     &event_tx,
                                     &mut normalizer,
                                     &mut session_id,
-                                    &mut pending_interactive,
+                                    &mut pending_interactive, &turn,
                                     AgentEndDisposition::Complete,
                                 ).await);
                             }
                         }
                     }
                     Err(err) => {
+                        if modern_lifecycle && turn_active && prompt_admission.awaits_result() {
+                            // An ambiguous transport failure after send can still
+                            // precede a native result. Explicit admission rejection
+                            // (or failure before send) ends immediately below.
+                            continue;
+                        }
                         while let Ok(frame) = events.try_recv() {
                             for event in normalizer.push(frame) {
                                 if !emit(&event_tx, event).await {
@@ -1200,7 +1332,7 @@ async fn run_session(
                 }
                 delivering.remove(&tool_id);
             }
-            frame = events.recv() => {
+            frame = async { if let Some(frame) = startup_events.pop_front() {Some(frame)} else {events.recv().await} } => {
                 let Some(frame) = frame else {
                     // A child that dies between turns owes nobody a Done: the
                     // last turn already settled, and the engine reads the
@@ -1230,18 +1362,43 @@ async fn run_session(
                     }).await;
                     break;
                 };
-                if compacting {
-                    if let Some(disposition) = compaction_completion(&frame) {
-                        settle!(finish_agent_end(
-                            &process, &event_tx, &mut normalizer, &mut session_id, &mut pending_interactive, disposition,
-                        ).await);
-                        continue;
-                    }
-                    // A summarizer's model turn is not the command lifecycle.
-                    if frame.get("type").and_then(Value::as_str) == Some("agent_end") {
-                        continue;
-                    }
+                let kind = frame.get("type").and_then(Value::as_str);
+                if kind == Some("session_settled") {
+                    turn.set_background(0);
+                    continue;
                 }
+                if modern_lifecycle && !compacting && kind.is_some_and(|kind| kind != "prompt_result") {
+                    completion_deadline = tokio::time::Instant::now() + prompt_timeout;
+                }
+                if frame.get("sessionSettled").and_then(Value::as_bool) == Some(false)
+                    && kind == Some("prompt_result") && active_prompt.is_some() && frame.get("id").and_then(Value::as_str) == active_prompt.as_deref()
+                    || kind == Some("agent_end") && frame.get("awaitingAsyncWork").and_then(Value::as_bool) == Some(true)
+                {
+                    turn.set_background(1);
+                }
+                if kind == Some("prompt_result") {
+                    if turn_active && !compacting && frame.get("id").and_then(Value::as_str) == active_prompt.as_deref() && active_prompt.is_some() && pending_prompt_result.is_none() {
+                        pending_prompt_result = Some(frame);
+                    }
+                } else if compacting && matches!(kind,Some("manual_compaction_start" | "manual_compaction_end" | "agent_end" | "command_output")) {
+                    match kind {
+                        Some("manual_compaction_start") => {compaction_started = true; structured_compaction_expected = true;},
+                        Some("manual_compaction_end") if compaction_started => {
+                            pending_compaction_end = Some(structured_compaction_completion(&frame));
+                            compaction_started = false;
+                        }
+                        Some("command_output") if !structured_compaction_expected && pending_compaction_end.is_none() => {
+                            if let Some(disposition) = compaction_completion(&frame) { pending_compaction_end = Some(disposition); }
+                        }
+                        _ => {},
+                    }
+                    // Summarizer turns and CLI prose never decide structured completion.
+                    if matches!(kind, Some("agent_end" | "command_output" | "manual_compaction_start" | "manual_compaction_end")) {
+                        // The common outcome block below also handles result-before-ACK.
+                    } else {
+                        for event in normalizer.push(frame) { if !emit(&event_tx,event).await {finished=true;break;} }
+                    }
+                } else {
                 if let Some(text) = user_steering_text(&frame)
                     && let Some(index) = in_flight_steers
                         .iter()
@@ -1262,6 +1419,7 @@ async fn run_session(
                 // one Done at its terminal agent_end, like any other turn.
                 if !turn_active && frame.get("type").and_then(Value::as_str) == Some("agent_start") {
                     turn_active = true;
+                    suppress_compaction_output = false;
                 }
                 match frame.get("type").and_then(Value::as_str) {
                     Some("host_tool_call") => {
@@ -1339,65 +1497,16 @@ async fn run_session(
                         }
                     }
                     Some("extension_ui_request") => {
-                        let method = frame.get("method").and_then(Value::as_str).unwrap_or_default();
-                        if method == "cancel" {
-                            if let Some(target_id) = frame
-                                .get("targetId")
-                                .and_then(Value::as_str)
-                                .filter(|id| !id.is_empty())
-                                && let Some(token) = pending_interactive.remove(target_id)
-                            {
-                                token.cancel();
-                                let _ = emit(&event_tx, AgentEvent::InputResolved {
-                                    request_id: target_id.to_owned(),
-                            answers: None,
-                                }).await;
-                            }
-                        } else if matches!(method, "select" | "confirm" | "input" | "editor" | "ask") {
-                            match interactive_question(&frame) {
-                                Ok((id, method, questions, timeout)) => {
-                                    if let Some(previous) = pending_interactive.remove(&id) {
-                                        previous.cancel();
-                                        let message = "OMP interactive request used a duplicate id".to_owned();
-                                        let _ = process.send_control(cancelled_interactive_response(&id, false));
-                                        let _ = emit(&event_tx, AgentEvent::InputResolved {
-                                            request_id: id.clone(),
-                            answers: None,
-                                        }).await;
-                                        let _ = emit(&event_tx, AgentEvent::Error { message }).await;
-                                    } else if pending_interactive.len() >= MAX_PENDING_INTERACTIVE_REQUESTS {
-                                        let message = "OMP interactive pending-request limit exceeded".to_owned();
-                                        let _ = process.send_control(cancelled_interactive_response(&id, false));
-                                        let _ = emit(&event_tx, AgentEvent::Error { message }).await;
-                                    } else {
-                                        let answers = (request_input)(questions);
-                                        let cancellation = tokio_util::sync::CancellationToken::new();
-                                        pending_interactive.insert(id.clone(), cancellation.clone());
-                                        spawn_interactive_answer(
-                                            id,
-                                            method,
-                                            timeout,
-                                            answers,
-                                            cancellation,
-                                            interrupt.clone(),
-                                            interactive_tx.clone(),
-                                        );
-                                    }
-                                }
-                                Err(message) => {
-                                    if let Some(id) = frame.get("id").and_then(Value::as_str) {
-                                        let _ = process.send_control(cancelled_interactive_response(id, false));
-                                    }
-                                    let _ = emit(&event_tx, AgentEvent::Error { message }).await;
-                                }
-                            }
-                        }
+                        handle_extension_request(&process, &frame, request_input.as_ref(), &mut pending_interactive,
+                            &interactive_tx, &interrupt, &event_tx).await;
                     }
                     Some("agent_end") => {
                         // A terminal agent_end with no turn behind it was
                         // already answered with a Done.
                         if !turn_active
-                            || frame.get("isTerminal").and_then(Value::as_bool) == Some(false)
+                            || modern_lifecycle && active_prompt.is_some()
+                            || frame.get("yielded").and_then(Value::as_bool) == Some(false)
+                            || frame.get("yielded").and_then(Value::as_bool) != Some(true) && frame.get("isTerminal").and_then(Value::as_bool) == Some(false)
                         {
                             continue;
                         }
@@ -1409,13 +1518,14 @@ async fn run_session(
                                     &event_tx,
                                     &mut normalizer,
                                     &mut session_id,
-                                    &mut pending_interactive,
+                                    &mut pending_interactive, &turn,
                                     disposition,
                                 ).await);
                             }
                         }
                     }
                     _ => {
+                        if suppress_compaction_output && frame.get("type").and_then(Value::as_str) == Some("command_output") {continue;}
                         for event in normalizer.push(frame) {
                             if !emit(&event_tx, event).await {
                                 finished = true;
@@ -1432,16 +1542,18 @@ async fn run_session(
                                 &event_tx,
                                 &mut normalizer,
                                 &mut session_id,
-                                &mut pending_interactive,
+                                &mut pending_interactive, &turn,
                                 disposition,
                             ).await);
                         }
                     }
                 }
+                }
             }
         }
     }
 
+    turn.set_background(0);
     context_tasks.abort_all();
     context_requests.close();
     drop(context_requests);
@@ -1459,6 +1571,37 @@ async fn run_session(
         let _ = computer_use.shutdown().await;
     }
     let _ = process.shutdown().await;
+}
+
+fn prompt_result_disposition(frame: &Value) -> AgentEndDisposition {
+    match frame.get("status").and_then(Value::as_str) {
+        Some("completed") => AgentEndDisposition::Complete,
+        Some("aborted") => AgentEndDisposition::Interrupted,
+        Some("error") => AgentEndDisposition::Error(protocol::sanitize_diagnostic(
+            frame
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("OMP prompt failed"),
+        )),
+        _ => AgentEndDisposition::Error("OMP prompt returned an invalid outcome".into()),
+    }
+}
+
+fn structured_compaction_completion(frame: &Value) -> AgentEndDisposition {
+    if frame.get("aborted").and_then(Value::as_bool) == Some(true) {
+        AgentEndDisposition::Interrupted
+    } else if frame.get("result").is_some_and(Value::is_object)
+        || frame.get("skipped").and_then(Value::as_bool) == Some(true)
+    {
+        AgentEndDisposition::Complete
+    } else {
+        AgentEndDisposition::Error(protocol::sanitize_diagnostic(
+            frame
+                .get("errorMessage")
+                .and_then(Value::as_str)
+                .unwrap_or("OMP compaction failed"),
+        ))
+    }
 }
 
 fn compaction_completion(frame: &Value) -> Option<AgentEndDisposition> {
@@ -1487,6 +1630,7 @@ async fn finish_agent_end(
     normalizer: &mut OmpNormalizer,
     session_id: &mut String,
     pending_interactive: &mut HashMap<String, tokio_util::sync::CancellationToken>,
+    turn: &crate::TurnControl,
     disposition: AgentEndDisposition,
 ) -> TurnEnd {
     if disposition == AgentEndDisposition::Continue {
@@ -1507,6 +1651,9 @@ async fn finish_agent_end(
         .await;
     }
     if let Ok(state) = process.request(json!({ "type": "get_state" })).await {
+        if state.get("isSettled").and_then(Value::as_bool) == Some(true) {
+            turn.set_background(0);
+        }
         if let Some(current) = state_session_id(&state) {
             *session_id = current;
         }
@@ -1523,12 +1670,17 @@ async fn finish_agent_end(
         }
     }
     match disposition {
-        AgentEndDisposition::Complete => {
+        AgentEndDisposition::Complete | AgentEndDisposition::Interrupted => {
+            let status = if disposition == AgentEndDisposition::Interrupted {
+                DoneStatus::Interrupted
+            } else {
+                DoneStatus::Completed
+            };
             let _ = emit_done(
                 event_tx,
                 normalizer,
                 AgentEvent::Done {
-                    status: DoneStatus::Completed,
+                    status,
                     result: None,
                     error: None,
                     session_id: Some(session_id.clone()),
@@ -1583,6 +1735,154 @@ async fn emit(
     event: AgentEvent,
 ) -> bool {
     event_tx.send(Ok(event)).await.is_ok()
+}
+
+async fn handle_extension_request(
+    process: &OmpProcess,
+    frame: &Value,
+    request_input: &RequestInputFn,
+    pending_interactive: &mut HashMap<String, tokio_util::sync::CancellationToken>,
+    interactive_tx: &mpsc::UnboundedSender<InteractiveResolution>,
+    interrupt: &tokio_util::sync::CancellationToken,
+    event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
+) {
+    let method = frame
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if method == "cancel" {
+        if let Some(target_id) = frame
+            .get("targetId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            && let Some(token) = pending_interactive.remove(target_id)
+        {
+            token.cancel();
+            let _ = emit(
+                &event_tx,
+                AgentEvent::InputResolved {
+                    request_id: target_id.to_owned(),
+                    answers: None,
+                },
+            )
+            .await;
+        }
+    } else if matches!(method, "select" | "confirm" | "input" | "editor" | "ask") {
+        match interactive_question(frame) {
+            Ok((id, method, questions, timeout)) => {
+                if let Some(previous) = pending_interactive.remove(&id) {
+                    previous.cancel();
+                    let message = "OMP interactive request used a duplicate id".to_owned();
+                    let _ = process.send_control(cancelled_interactive_response(&id, false));
+                    let _ = emit(
+                        &event_tx,
+                        AgentEvent::InputResolved {
+                            request_id: id.clone(),
+                            answers: None,
+                        },
+                    )
+                    .await;
+                    let _ = emit(&event_tx, AgentEvent::Error { message }).await;
+                } else if pending_interactive.len() >= MAX_PENDING_INTERACTIVE_REQUESTS {
+                    let message = "OMP interactive pending-request limit exceeded".to_owned();
+                    let _ = process.send_control(cancelled_interactive_response(&id, false));
+                    let _ = emit(&event_tx, AgentEvent::Error { message }).await;
+                } else {
+                    let answers = (request_input)(questions);
+                    let cancellation = tokio_util::sync::CancellationToken::new();
+                    pending_interactive.insert(id.clone(), cancellation.clone());
+                    spawn_interactive_answer(
+                        id,
+                        method,
+                        timeout,
+                        answers,
+                        cancellation,
+                        interrupt.clone(),
+                        interactive_tx.clone(),
+                    );
+                }
+            }
+            Err(message) => {
+                if let Some(id) = frame.get("id").and_then(Value::as_str) {
+                    let _ = process.send_control(cancelled_interactive_response(id, false));
+                }
+                let _ = emit(&event_tx, AgentEvent::Error { message }).await;
+            }
+        }
+    }
+}
+
+/// Service the same input protocol while readiness, negotiation and ordered
+/// configuration are pending. Other startup frames retain their FIFO order.
+async fn service_startup<T>(
+    process: &OmpProcess,
+    events: &mut mpsc::Receiver<Value>,
+    controls: &RunControls,
+    event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
+    event_rx: &mut mpsc::Receiver<Result<AgentEvent, HarnessError>>,
+    setup: impl std::future::Future<Output = Result<T, HarnessError>>,
+) -> Result<(T, VecDeque<Value>, Vec<Result<AgentEvent, HarnessError>>), HarnessError> {
+    tokio::pin!(setup);
+    let (interactive_tx, mut resolutions) = mpsc::unbounded_channel::<InteractiveResolution>();
+    let mut pending = HashMap::new();
+    let mut buffered = VecDeque::new();
+    let mut configured = None;
+    let mut output = Vec::new();
+    let result = 'startup: loop {
+        // The public receiver is exposed only after setup. Drain between each
+        // bounded input dispatch, keeping sends and cancellation responsive.
+        while let Ok(event) = event_rx.try_recv() {
+            if output.len() >= 1024 {
+                break 'startup Err(HarnessError::Protocol(
+                    "OMP RPC startup output exceeded its limit of 1024 events".into(),
+                ));
+            }
+            output.push(event);
+        }
+        if configured.is_some() && pending.is_empty() {
+            break Ok((configured.take().unwrap(), buffered, output));
+        }
+        tokio::select! {
+            result = &mut setup, if configured.is_none() => {
+                match result { Ok(value) => configured = Some(value), Err(error) => break Err(error) }
+            }
+            _ = controls.interrupt.cancelled() => break Err(HarnessError::Protocol("OMP startup was cancelled".into())),
+            frame = events.recv() => {
+                let Some(frame) = frame else { break Err(HarnessError::Protocol(process.fatal_reason().unwrap_or_else(|| "OMP exited during startup".into()))); };
+                if frame.get("type").and_then(Value::as_str) == Some("extension_ui_request") {
+                    handle_extension_request(process, &frame, controls.request_input.as_ref(), &mut pending,
+                        &interactive_tx, &controls.interrupt, event_tx).await;
+                    process.startup_input_pending(!pending.is_empty());
+                    process.consumed_startup_input();
+                } else if buffered.len() >= 1024 {
+                    break Err(HarnessError::Protocol("OMP RPC startup event buffer exceeded its limit of 1024 frames".into()));
+                } else { buffered.push_back(frame); }
+            }
+            Some(resolution) = resolutions.recv() => {
+                if pending.remove(&resolution.id).is_some() {
+                    if resolution.cancel_host_input {
+                        let _=emit(event_tx,AgentEvent::InputResolved{request_id:resolution.id.clone(),answers:None}).await;
+                    }
+                    if let Err(error)=process.send_control(resolution.response) {break Err(error);}
+                    process.startup_input_pending(!pending.is_empty());
+                }
+            }
+        }
+    };
+    for (id, cancellation) in pending.drain() {
+        cancellation.cancel();
+        let _ = process.send_control(cancelled_interactive_response(&id, false));
+        let _ = emit(
+            event_tx,
+            AgentEvent::InputResolved {
+                request_id: id,
+                answers: None,
+            },
+        )
+        .await;
+    }
+    process.startup_input_pending(false);
+    result
 }
 
 fn interactive_question(
@@ -1985,6 +2285,31 @@ mod tests {
         pub(super) queued: mpsc::UnboundedSender<()>,
     }
 
+    #[test]
+    fn context_state_aggregate_preserves_zero_and_partial_fields() {
+        for (value, expected) in [
+            (
+                json!({"contextUsage":{"tokens":0,"contextWindow":1000}}),
+                Some((Some(0), Some(1000))),
+            ),
+            (
+                json!({"contextUsage":{"contextWindow":1000}}),
+                Some((None, Some(1000))),
+            ),
+            (json!({"contextUsage":{"tokens":0}}), Some((Some(0), None))),
+            (json!({"contextUsage":{}}), None),
+            (
+                json!({"contextUsage":{"tokens":-1,"contextWindow":0}}),
+                None,
+            ),
+        ] {
+            assert_eq!(
+                context_usage_from_state(&value)
+                    .map(|u| (u.reported_tokens(), u.reported_window())),
+                expected
+            );
+        }
+    }
     #[cfg(unix)]
     #[tokio::test]
     async fn closed_context_mailbox_parks_and_keeps_processing_events() {
@@ -2028,6 +2353,7 @@ mod tests {
         let actor = run_session(
             process,
             events,
+            VecDeque::new(),
             event_tx,
             controls,
             context_requests,
@@ -2135,6 +2461,7 @@ mod tests {
         let actor = tokio::spawn(run_session(
             process.clone(),
             process.take_events().unwrap(),
+            VecDeque::new(),
             event_tx,
             controls,
             context_requests,

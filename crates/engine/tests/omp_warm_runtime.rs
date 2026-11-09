@@ -421,3 +421,132 @@ async fn an_autonomous_wake_after_done_settles_once_and_leaves_the_runtime_warm(
     assert_eq!(rig.ledger.dones.load(Ordering::SeqCst), 3);
     rig.core.sessions.shutdown().await;
 }
+
+/// The real adapter supplies pending activity before the engine parks the turn.
+struct NativeOmp {
+    harness: zeron_harness::OmpHarness,
+    turn: Arc<Mutex<Option<zeron_harness::TurnControl>>>,
+    dones: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl Harness for NativeOmp {
+    fn id(&self) -> HarnessId {
+        HarnessId::Omp
+    }
+    fn display_name(&self) -> &str {
+        "OMP"
+    }
+    fn supports_steering(&self) -> bool {
+        true
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::StepBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::High]
+    }
+    fn deterministic_turn_end(&self) -> bool {
+        true
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        *self.turn.lock().unwrap() = Some(controls.turn.clone());
+        let dones = self.dones.clone();
+        Ok(self
+            .harness
+            .run(request, controls)
+            .await?
+            .inspect(move |event| {
+                if matches!(event, Ok(AgentEvent::Done { .. })) {
+                    dones.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .boxed())
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn omp_background_pending_blocks_reaper_then_settles_without_another_run() {
+    use std::os::unix::fs::PermissionsExt;
+    init_env();
+    let dir = tempfile::tempdir().unwrap();
+    let executable = dir.path().join("omp");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../harness/tests/fixtures/fake-omp-rpc.sh");
+    std::fs::write(&executable,format!("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 18.18.0; exit 0; fi\nexec '{}' \"$@\"\n",fixture.display())).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let log = dir.path().join("commands.log");
+    let turn = Arc::new(Mutex::new(None));
+    let dones = Arc::new(AtomicUsize::new(0));
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(NativeOmp {
+        harness: zeron_harness::OmpHarness::new()
+            .with_executable(executable)
+            .with_env(std::collections::HashMap::from([
+                ("FAKE_OMP_SCENARIO".into(), "yield-lifecycle-settled".into()),
+                ("FAKE_OMP_LOG".into(), log.to_string_lossy().into_owned()),
+            ]))
+            .with_timeouts(Duration::from_secs(2), Duration::from_secs(2)),
+        turn: turn.clone(),
+        dones: dones.clone(),
+    }));
+    let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Omp, None).unwrap();
+    let mut req = request("first");
+    req.model = Some("openai-codex/gpt-5.6-sol".into());
+    req.enable_workers_mcp = false;
+    req.cwd = dir.path().to_string_lossy().into_owned();
+    core.sessions
+        .dispatch(CHAT, HarnessId::Omp, req, None)
+        .await
+        .unwrap();
+    wait_for(
+        || status(&core) == Some(SessionStatus::Idle) && dones.load(Ordering::SeqCst) == 1,
+        "native yield",
+    )
+    .await;
+    let turn = turn.lock().unwrap().clone().unwrap();
+    assert!(
+        turn.background_live(),
+        "native async delivery was discarded at Done"
+    );
+    let pid = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    tokio::time::sleep(Duration::from_millis(IDLE_MS + 500)).await;
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .status()
+            .unwrap()
+            .success(),
+        "reaper killed pending native delivery"
+    );
+    let _ = turn.inspect_context().await;
+    wait_for(|| !turn.background_live(), "native session settlement").await;
+    assert_eq!(
+        dones.load(Ordering::SeqCst),
+        1,
+        "settlement added a completion"
+    );
+    core.sessions.shutdown().await;
+    assert!(
+        !std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+}

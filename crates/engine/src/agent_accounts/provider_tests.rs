@@ -33,7 +33,7 @@ fn chatgpt_access(email: &str, account_id: &str, plan: &str) -> String {
     }))
 }
 
-type Handler = dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync;
+type Handler = dyn Fn(&str, &str, &str, &str) -> (u16, String) + Send + Sync;
 
 /// A local stand-in for provider endpoints: `handler(method, path+query,
 /// body)` answers every request; `hits` records `"METHOD path"`.
@@ -46,6 +46,12 @@ struct MockServer {
 impl MockServer {
     async fn start(
         handler: impl Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static,
+    ) -> Self {
+        Self::start_with_headers(move |method, path, body, _head| handler(method, path, body)).await
+    }
+
+    async fn start_with_headers(
+        handler: impl Fn(&str, &str, &str, &str) -> (u16, String) + Send + Sync + 'static,
     ) -> Self {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -90,7 +96,7 @@ impl MockServer {
                     let method = first.next().unwrap_or("").to_string();
                     let path = first.next().unwrap_or("").to_string();
                     lock(&hits).push(format!("{method} {path}"));
-                    let (status, reply) = handler(&method, &path, &body);
+                    let (status, reply) = handler(&method, &path, &body, &head);
                     let response = http_response(
                         &format!("{status} X"),
                         &[("Content-Type", "application/json")],
@@ -1807,5 +1813,260 @@ async fn codex_banked_resets_list_persist_and_redeem_against_the_mock() {
             .consume_codex_reset_credit("no-such-account", "credit-2", "key-4")
             .await
             .is_err()
+    );
+}
+
+fn codex_quota_slot(user: &str, workspace: &str, access: &str) -> Slot {
+    let credentials = serde_json::json!({"tokens": {
+        "id_token": jwt(serde_json::json!({"email":format!("{user}@example.test"),"https://api.openai.com/auth":{"chatgpt_user_id":user,"chatgpt_account_id":workspace}})),
+        "access_token": access, "account_id": workspace,
+    }});
+    let detected = parse_codex_auth(credentials.clone()).unwrap();
+    Slot {
+        id: slot_id_for(HarnessId::Codex, &detected.account_key),
+        harness: HarnessId::Codex,
+        account_key: detected.account_key,
+        profile: detected.profile,
+        credentials,
+        claude_config: None,
+        saved_at: 1,
+        created_at: None,
+        store_key: None,
+    }
+}
+
+fn codex_quota_body(workspace: &str, consumed: u32) -> serde_json::Value {
+    serde_json::json!({"account_id":workspace,"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":consumed,"limit_window_seconds":604800,"reset_at":1900000000}},"rate_limit_reset_credits":{"available_count":0}})
+}
+
+#[tokio::test]
+async fn codex_usage_identity_composite_key_accepts_workspace_and_preserves_reset_credits() {
+    let server=MockServer::start(|_,path,_| {
+        if path.ends_with("/rate-limit-reset-credits") {
+            return (200,serde_json::json!({"available_count":1,"credits":[{"id":"fixture-reset","reset_type":"codex_rate_limits","status":"available","title":"Weekly reset"}]}).to_string());
+        }
+        let mut body=codex_quota_body("workspace",5);
+        body["rate_limit_reset_credits"]["available_count"]=1.into();
+        (200,body.to_string())
+    }).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (accounts, _) = accounts_with(dir.path(), mocked(&server.base));
+    for user in ["alice", "bob"] {
+        let slot = codex_quota_slot(user, "workspace", "fixture-access");
+        assert_eq!(slot.account_key, format!("{user}::workspace"));
+        let usage = accounts
+            .codex_usage(&slot)
+            .await
+            .expect("workspace response belongs to the composite slot");
+        assert_eq!(usage.windows[0].label, "Week");
+        assert!((usage.windows[0].used_fraction - 0.05).abs() < 0.0001);
+        assert_eq!(usage.codex_reset_credits.unwrap().available_count, 1);
+    }
+    assert_eq!(
+        server.hits("POST "),
+        0,
+        "quota inspection must never redeem credits"
+    );
+}
+
+#[tokio::test]
+async fn codex_usage_identity_foreign_missing_and_unverifiable_are_not_missing_credentials() {
+    for case in [
+        "foreign",
+        "missing-response",
+        "missing-workspace",
+        "mismatched-claims",
+        "missing-claims",
+    ] {
+        let mut body = codex_quota_body(
+            if case == "foreign" {
+                "foreign"
+            } else {
+                "workspace"
+            },
+            5,
+        );
+        if case == "missing-response" {
+            body.as_object_mut().unwrap().remove("account_id");
+        }
+        let server = MockServer::start(move |_, _, _| (200, body.to_string())).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (accounts, _) = accounts_with(dir.path(), mocked(&server.base));
+        let mut slot = codex_quota_slot(
+            "alice",
+            if case == "mismatched-claims" {
+                "other"
+            } else {
+                "workspace"
+            },
+            "fixture-access",
+        );
+        match case {
+            "missing-workspace" => {
+                slot.credentials["tokens"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("account_id");
+            }
+            "mismatched-claims" => slot.credentials["tokens"]["account_id"] = "workspace".into(),
+            "missing-claims" => {
+                slot.credentials["tokens"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("id_token");
+            }
+            _ => {}
+        }
+        let error = accounts.codex_usage(&slot).await.expect_err(case);
+        assert!(
+            !matches!(error, ProbeError::NoCredentials { .. }),
+            "{case}: response identity is distinct from absent credentials"
+        );
+        assert_eq!(server.hits("POST "), 0);
+    }
+}
+
+#[tokio::test]
+async fn codex_usage_recovery_accounts_remain_independent_through_401_and_new_credentials() {
+    let recovered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let response_state = recovered.clone();
+    let server = MockServer::start_with_headers(move |_, _, _, head| {
+        if !head.contains("chatgpt-account-id: workspace") {
+            return (200, codex_quota_body("foreign", 99).to_string());
+        }
+        if head.contains("quota-b-old") && !response_state.load(Ordering::SeqCst) {
+            return (401, "{}".into());
+        }
+        (200, codex_quota_body("workspace", 5).to_string())
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let (accounts, config) = accounts_with(dir.path(), mocked(&server.base));
+    let a = codex_quota_slot("alice", "workspace", "quota-a");
+    let mut b = codex_quota_slot("bob", "workspace", "quota-b-old");
+    accounts.write_slot(&a).unwrap();
+    accounts.write_slot(&b).unwrap();
+    let old = now_ms() - 7 * 86400000;
+    let mut prior = UsageEntry::default();
+    prior.record(
+        Ok(codex_usage_snapshot(&codex_quota_body("workspace", 4)).unwrap()),
+        "old-generation".into(),
+        old,
+    );
+    lock(&accounts.inner.usage).insert(usage_key(HarnessId::Codex, &b.account_key), prior);
+    let before_auth = std::fs::read(config.codex_auth_file()).ok();
+    let snapshot = accounts.list(true).await.unwrap();
+    if let Some(path) = std::env::var_os("COMET_USAGE_HTTP_RECEIPT") {
+        std::fs::write(path, serde_json::to_vec_pretty(&snapshot).unwrap()).unwrap();
+    }
+    let codex = rows(&snapshot, HarnessId::Codex);
+    let healthy = codex.iter().find(|row| row.id == a.id).unwrap();
+    let failed = codex.iter().find(|row| row.id == b.id).unwrap();
+    assert!((healthy.usage_windows[0].used_fraction - 0.05).abs() < 0.0001);
+    assert!(healthy.usage_error.is_none());
+    let a_time = healthy.usage_fetched_at;
+    assert_eq!(failed.usage_fetched_at, Some(old));
+    assert!((failed.usage_windows[0].used_fraction - 0.04).abs() < 0.0001);
+    assert!(failed.usage_error.as_deref().unwrap().contains("Accounts"));
+    assert_eq!(
+        lock(&accounts.inner.usage).len(),
+        2,
+        "users of a workspace need independent cache entries"
+    );
+    let calls = server.hits("GET ");
+    accounts.list(true).await.unwrap();
+    assert_eq!(
+        server.hits("GET "),
+        calls,
+        "unchanged rejected credentials respect backoff"
+    );
+    recovered.store(true, Ordering::SeqCst);
+    b.credentials["tokens"]["access_token"] = "quota-b-new".into();
+    accounts.write_slot(&b).unwrap();
+    lock(&accounts.inner.usage)
+        .get_mut(&usage_key(HarnessId::Codex, &b.account_key))
+        .unwrap()
+        .checked_at = now_ms() - 31000;
+    let snapshot = accounts.list(true).await.unwrap();
+    let codex = rows(&snapshot, HarnessId::Codex);
+    let healthy = codex.iter().find(|row| row.id == a.id).unwrap();
+    let restored = codex.iter().find(|row| row.id == b.id).unwrap();
+    assert_eq!(healthy.usage_fetched_at, a_time);
+    assert!(restored.usage_fetched_at.unwrap() > old);
+    assert!(restored.usage_error.is_none());
+    assert_eq!(restored.usage_windows[0].label, "Week");
+    assert!((restored.usage_windows[0].used_fraction - 0.05).abs() < 0.0001);
+    assert_eq!(
+        std::fs::read(config.codex_auth_file()).ok(),
+        before_auth,
+        "Usage never activates a saved login"
+    );
+    assert_eq!(server.hits("POST "), 0);
+}
+
+#[tokio::test]
+async fn codex_usage_recovery_missing_credentials_keeps_quota_and_exposes_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let accounts = AgentAccounts::new(AgentAccountsConfig::isolated(dir.path()));
+    let mut slot = codex_quota_slot("alice", "workspace", "fixture-access");
+    slot.credentials["tokens"]
+        .as_object_mut()
+        .unwrap()
+        .remove("access_token");
+    accounts.write_slot(&slot).unwrap();
+    let old = now_ms() - 86400000;
+    let mut prior = UsageEntry::default();
+    prior.record(
+        Ok(codex_usage_snapshot(&codex_quota_body("workspace", 26)).unwrap()),
+        "prior".into(),
+        old,
+    );
+    lock(&accounts.inner.usage).insert(usage_key(HarnessId::Codex, &slot.account_key), prior);
+    let snapshot = accounts.list(true).await.unwrap();
+    let codex = rows(&snapshot, HarnessId::Codex);
+    let row = &codex[0];
+    assert_eq!(row.usage_fetched_at, Some(old));
+    assert_eq!(row.usage_windows[0].used_fraction, 0.26);
+    assert!(
+        row.usage_error
+            .as_deref()
+            .unwrap()
+            .contains("Sign-in required")
+    );
+}
+
+#[tokio::test]
+async fn codex_usage_recovery_late_previous_credential_generation_cannot_publish() {
+    let changed = Arc::new(Mutex::new(None::<(AgentAccounts, Slot)>));
+    let write_during_request = changed.clone();
+    let server = MockServer::start_with_headers(move |_, _, _, _| {
+        let (accounts, slot) = lock(&write_during_request).as_ref().unwrap().clone();
+        accounts.write_slot(&slot).unwrap();
+        (200, codex_quota_body("workspace", 95).to_string())
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let (accounts, _) = accounts_with(dir.path(), mocked(&server.base));
+    let old_slot = codex_quota_slot("alice", "workspace", "old-access");
+    let mut new_slot = old_slot.clone();
+    new_slot.credentials["tokens"]["access_token"] = "new-access".into();
+    accounts.write_slot(&old_slot).unwrap();
+    *lock(&changed) = Some((accounts.clone(), new_slot));
+    let old_time = now_ms() - 86400000;
+    let mut prior = UsageEntry::default();
+    prior.record(
+        Ok(codex_usage_snapshot(&codex_quota_body("workspace", 5)).unwrap()),
+        "prior".into(),
+        old_time,
+    );
+    let key = usage_key(HarnessId::Codex, &old_slot.account_key);
+    lock(&accounts.inner.usage).insert(key.clone(), prior.clone());
+    accounts
+        .refresh_usage(&[(HarnessId::Codex, &old_slot, false)])
+        .await;
+    assert_eq!(
+        lock(&accounts.inner.usage)[&key],
+        prior,
+        "late old-generation quota changed a newer credential slot"
     );
 }

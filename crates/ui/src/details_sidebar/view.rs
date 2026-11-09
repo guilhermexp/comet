@@ -2007,10 +2007,37 @@ impl DetailsSidebar {
             })
     }
 
+    fn retain_usage_on_failure(&mut self, error: SharedString, cx: &mut Context<Self>) -> bool {
+        if let Some(snapshot) = &mut self.usage_snapshot {
+            for account in &mut snapshot.accounts {
+                if !account.usage_windows.is_empty() {
+                    account.usage_error.get_or_insert_with(|| {
+                        "Usage refresh unavailable — try Refresh again".into()
+                    });
+                }
+            }
+            let rows = provider_usage_rows(
+                snapshot,
+                &crate::settings::current(cx).usage_widget_hidden_account_ids,
+                chrono::Utc::now(),
+            );
+            if matches!(&self.usage,LoadState::Ready(previous) if previous==&rows) {
+                return false;
+            }
+            self.usage = LoadState::Ready(rows);
+        } else {
+            if matches!(&self.usage,LoadState::Error(previous) if previous==&error) {
+                return false;
+            }
+            self.usage = LoadState::Error(error);
+        }
+        true
+    }
+
     fn load_usage(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.app_state.read(cx).engine().cloned() else {
-            if self.usage_snapshot.is_none() {
-                self.usage = LoadState::Error("Engine not connected".into());
+            if self.retain_usage_on_failure("Engine not connected".into(), cx) {
+                cx.notify();
             }
             return;
         };
@@ -2030,6 +2057,7 @@ impl DetailsSidebar {
                 match result {
                     Ok(value) => match serde_json::from_value::<AgentAccountsSnapshot>(value) {
                         Ok(snapshot) => {
+                            // RPC pacing only. Rows use each account's quota measurement time.
                             this.usage_fetched_at = Some(std::time::Instant::now());
                             let snapshot = this.usage_snapshot.insert(snapshot);
                             let rows = provider_usage_rows(
@@ -2040,15 +2068,11 @@ impl DetailsSidebar {
                             this.usage = LoadState::Ready(rows);
                         }
                         Err(error) => {
-                            if this.usage_snapshot.is_none() {
-                                this.usage = LoadState::Error(error.to_string().into());
-                            }
+                            this.retain_usage_on_failure(error.to_string().into(), cx);
                         }
                     },
                     Err(error) => {
-                        if this.usage_snapshot.is_none() {
-                            this.usage = LoadState::Error(error.to_string().into());
-                        }
+                        this.retain_usage_on_failure(error.to_string().into(), cx);
                     }
                 };
                 cx.notify();
@@ -3548,6 +3572,8 @@ impl DetailsSidebar {
                 .unwrap_or_else(|| "Not signed in".into())
                 .into(),
         };
+        let header_selector = format!("usage-provider-{key}");
+        let summary_selector = format!("usage-summary-{key}:{summary}");
         let reset_badge: Option<SharedString> = row
             .weekly_reset_badge
             .clone()
@@ -3558,6 +3584,11 @@ impl DetailsSidebar {
             UsageTone::Warning => (theme.warning, theme.warning.opacity(0.12)),
             UsageTone::Danger => (theme.danger, theme.danger.opacity(0.12)),
         };
+        let measurement_selector = row
+            .measurement_text
+            .as_ref()
+            .map(|text| format!("usage-measurement-{key}:{text}"));
+        let recovery_selector = format!("usage-recovery-{key}");
         let windows = row.windows.clone();
         let usage_lines = row.usage_lines.clone();
         div()
@@ -3566,6 +3597,7 @@ impl DetailsSidebar {
             .child(
                 div()
                     .id(SharedString::from(format!("usage-provider-{key}")))
+                    .debug_selector(move || header_selector.clone())
                     .h(px(34.0))
                     .px(px(10.0))
                     .flex()
@@ -3647,6 +3679,7 @@ impl DetailsSidebar {
                                     .truncate()
                                     .text_size(px(12.0))
                                     .text_color(tone_text)
+                                    .debug_selector(move || summary_selector.clone())
                                     .child(summary),
                             ),
                     )
@@ -3669,6 +3702,36 @@ impl DetailsSidebar {
                         .border_color(theme.border.opacity(0.4))
                         .px(px(10.0))
                         .py(px(9.0))
+                        .when_some(row.measurement_text.clone(), |body, text| {
+                            let selector = measurement_selector.unwrap();
+                            body.child(
+                                div()
+                                    .debug_selector(move || selector.clone())
+                                    .pb(px(6.0))
+                                    .text_size(px(11.0))
+                                    .text_color(theme.text_muted)
+                                    .child(text),
+                            )
+                        })
+                        .when_some(row.warning.clone(), |body, text| {
+                            body.child(
+                                div()
+                                    .pb(px(6.0))
+                                    .text_size(px(11.0))
+                                    .text_color(theme.text_muted)
+                                    .child(text),
+                            )
+                        })
+                        .when_some(row.recovery_text.clone(), |body, text| {
+                            body.child(
+                                div()
+                                    .debug_selector(move || recovery_selector.clone())
+                                    .pb(px(8.0))
+                                    .text_size(px(11.0))
+                                    .text_color(theme.text_muted)
+                                    .child(text),
+                            )
+                        })
                         .children(windows.into_iter().map(|window| {
                             let remaining = 1.0 - window.used_fraction;
                             let fill = if window.remaining_percent <= 10 {
@@ -4517,6 +4580,166 @@ mod tests {
             context_file_access(&remote, Some("device-b")),
             ContextFileAccess::Local
         );
+    }
+    #[gpui::test]
+    fn codex_usage_freshness_render_retains_historical_details_and_account_action(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use chrono::TimeZone;
+        use gpui::Modifiers;
+        let data = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            crate::settings::init(crate::settings::UiSettings::default(), data.path(), cx);
+            cx.set_global(Theme::dark());
+        });
+        let state = cx.new(|_| crate::state::AppState::new());
+        let workers = cx.new(|cx| crate::workers::model::WorkersModel::detached(state.clone(), cx));
+        let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), cx));
+        let pickers = composer.read_with(cx, |composer, _| composer.pickers().clone());
+        let sidebar = cx.new(|cx| {
+            DetailsSidebar::new(
+                state,
+                workers,
+                DetailsSidebarPreferences::default(),
+                pickers,
+                composer,
+                cx,
+            )
+        });
+        let now = chrono::Utc.with_ymd_and_hms(2026, 11, 9, 12, 0, 0).unwrap();
+        let snapshot:zeron_proto::AgentAccountsSnapshot=serde_json::from_value(serde_json::json!({"accounts":[
+            {"id":"a","harness":"codex","email":"healthy@example.test","active":true,"switchable":true,"usageWindows":[{"label":"Week","usedFraction":0.05}],"usageFetchedAt":now.timestamp_millis()},
+            {"id":"b","harness":"codex","email":"saved-with-a-long-name@example.test","active":false,"switchable":true,"usageWindows":[{"label":"Week","usedFraction":0.04}],"usageFetchedAt":(now-chrono::Duration::days(7)).timestamp_millis(),"usageError":"Sign-in required — reconnect this account in Accounts"},
+            {"id":"old","harness":"codex","active":false,"switchable":true,"usageWindows":[{"label":"Week","usedFraction":0.26}],"usageFetchedAt":(now-chrono::Duration::days(3)).timestamp_millis()}
+        ],"warnings":[]})).unwrap();
+        struct Probe {
+            sidebar: Entity<DetailsSidebar>,
+            rows: Vec<super::ProviderUsageRow>,
+            width: f32,
+            _observe: Subscription,
+        }
+        impl Render for Probe {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let theme = Theme::of(cx).clone();
+                let rows = self.rows.clone();
+                let body = self.sidebar.update(cx, |s, cx| {
+                    div().children(
+                        rows.into_iter()
+                            .map(|row| s.render_usage_row(row, &theme, cx)),
+                    )
+                });
+                div().w(px(self.width)).h(px(900.0)).child(body)
+            }
+        }
+        let rows = super::provider_usage_rows(&snapshot, &Default::default(), now)
+            .into_iter()
+            .filter(|row| row.harness == zeron_proto::HarnessId::Codex)
+            .collect();
+        let (probe, window) = cx.add_window_view(|_, cx| Probe {
+            sidebar: sidebar.clone(),
+            rows,
+            width: 300.0,
+            _observe: cx.observe(&sidebar, |_, _, cx| cx.notify()),
+        });
+        window.update(|w, cx| w.draw(cx).clear());
+        for text in [
+            "usage-summary-a:Week 95%",
+            "usage-summary-b:Sign-in required",
+            "usage-summary-old:Out of date",
+        ] {
+            assert!(
+                window.debug_bounds(text).is_some(),
+                "missing visible {text}"
+            );
+        }
+        let header = window.debug_bounds("usage-provider-b").unwrap();
+        window.simulate_click(header.center(), Modifiers::default());
+        for light in [false, true] {
+            for width in [300.0, 500.0] {
+                window.update(|_, cx| {
+                    cx.set_global(if light { Theme::light() } else { Theme::dark() })
+                });
+                probe.update(window, |p, cx| {
+                    p.width = width;
+                    cx.notify();
+                });
+                window.update(|w, cx| w.draw(cx).clear());
+                assert!(
+                    window
+                        .debug_bounds("usage-measurement-b:Last known · Nov 2, 12:00 UTC")
+                        .is_some(),
+                    "historical percentage needs its measurement time"
+                );
+                assert!(
+                    window.debug_bounds("usage-recovery-b").is_some(),
+                    "account recovery action must stay visible"
+                );
+            }
+        }
+        let mut recovered = snapshot;
+        recovered.accounts[1].usage_error = None;
+        recovered.accounts[1].usage_fetched_at = Some(now.timestamp_millis());
+        recovered.accounts[1].usage_windows[0].used_fraction = 0.05;
+        probe.update(window, |p, cx| {
+            p.rows = super::provider_usage_rows(&recovered, &Default::default(), now)
+                .into_iter()
+                .filter(|row| row.harness == zeron_proto::HarnessId::Codex)
+                .collect();
+            cx.notify();
+        });
+        window.update(|w, cx| w.draw(cx).clear());
+        assert!(window.debug_bounds("usage-summary-b:Week 95%").is_some());
+        assert!(window.debug_bounds("usage-recovery-b").is_none());
+    }
+    #[gpui::test]
+    fn codex_usage_freshness_failed_refresh_keeps_measurement_but_marks_rows_historical(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let data = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            crate::settings::init(crate::settings::UiSettings::default(), data.path(), cx);
+            cx.set_global(Theme::dark());
+        });
+        let state = cx.new(|_| crate::state::AppState::new());
+        let workers = cx.new(|cx| crate::workers::model::WorkersModel::detached(state.clone(), cx));
+        let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), cx));
+        let pickers = composer.read_with(cx, |composer, _| composer.pickers().clone());
+        let sidebar = cx.new(|cx| {
+            DetailsSidebar::new(
+                state,
+                workers,
+                DetailsSidebarPreferences::default(),
+                pickers,
+                composer,
+                cx,
+            )
+        });
+        let now = chrono::Utc::now();
+        let snapshot:zeron_proto::AgentAccountsSnapshot=serde_json::from_value(serde_json::json!({"accounts":[{"id":"a","harness":"codex","active":true,"switchable":true,"usageWindows":[{"label":"Week","usedFraction":0.05}],"usageFetchedAt":now.timestamp_millis()}],"warnings":[]})).unwrap();
+        sidebar.update(cx, |s, cx| {
+            s.usage = super::LoadState::Ready(super::provider_usage_rows(
+                &snapshot,
+                &Default::default(),
+                now,
+            ));
+            s.usage_snapshot = Some(snapshot);
+            s.load_usage(cx); // The disconnected engine is a real failed refresh path.
+            assert_eq!(
+                s.usage_snapshot.as_ref().unwrap().accounts[0].usage_fetched_at,
+                Some(now.timestamp_millis())
+            );
+            let super::LoadState::Ready(rows) = &s.usage else {
+                panic!("failed refresh erased retained rows");
+            };
+            let row = rows
+                .iter()
+                .find(|row| row.account_id.as_deref() == Some("a"))
+                .unwrap();
+            assert_eq!(row.weekly_summary.as_deref(), Some("Out of date"));
+            assert_eq!(row.windows[0].remaining_percent, 95);
+        });
     }
 }
 

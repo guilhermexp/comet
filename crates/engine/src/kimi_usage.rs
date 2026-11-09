@@ -101,11 +101,13 @@ struct CachedKimiUsage {
     credential: CredentialFingerprint,
     windows: Vec<AgentUsageWindow>,
     fetched_at: Instant,
+    measured_at_ms: i64,
 }
 
 pub(crate) struct KimiUsageSnapshot {
     pub present: bool,
     pub usage_windows: Vec<AgentUsageWindow>,
+    pub usage_fetched_at: Option<i64>,
     pub warning: Option<String>,
 }
 
@@ -114,6 +116,7 @@ impl KimiUsageSnapshot {
         Self {
             present: false,
             usage_windows: Vec::new(),
+            usage_fetched_at: None,
             warning: None,
         }
     }
@@ -122,6 +125,7 @@ impl KimiUsageSnapshot {
         Self {
             present,
             usage_windows: Vec::new(),
+            usage_fetched_at: None,
             warning: Some(error.to_string()),
         }
     }
@@ -226,6 +230,7 @@ impl KimiUsage {
                 return KimiUsageSnapshot {
                     present: true,
                     usage_windows: cached.windows.clone(),
+                    usage_fetched_at: Some(cached.measured_at_ms),
                     warning: None,
                 };
             }
@@ -233,6 +238,7 @@ impl KimiUsage {
             return KimiUsageSnapshot {
                 present: true,
                 usage_windows: Vec::new(),
+                usage_fetched_at: None,
                 warning: None,
             };
         }
@@ -244,14 +250,17 @@ impl KimiUsage {
         };
         match self.fetch_usage(&credential.access_token).await {
             Ok(usage_windows) => {
+                let measured_at_ms = Utc::now().timestamp_millis();
                 *self.usage_cache() = Some(CachedKimiUsage {
                     credential: credential.fingerprint(),
                     windows: usage_windows.clone(),
                     fetched_at: Instant::now(),
+                    measured_at_ms,
                 });
                 KimiUsageSnapshot {
                     present: true,
                     usage_windows,
+                    usage_fetched_at: Some(measured_at_ms),
                     warning: None,
                 }
             }
@@ -1095,6 +1104,8 @@ mod tests {
 
         assert_eq!(forced.usage_windows.len(), 1);
         assert_eq!(cached.usage_windows.len(), 1);
+        assert!(forced.usage_fetched_at.is_some());
+        assert_eq!(cached.usage_fetched_at, forced.usage_fetched_at);
         assert_eq!(requests.lock().unwrap().len(), 1);
     }
 

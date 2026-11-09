@@ -180,7 +180,12 @@ fn newest_candidate(candidates: Vec<PathBuf>) -> Option<PathBuf> {
     Some(best)
 }
 
-type VersionKey = (PathBuf, Option<std::time::SystemTime>, u64);
+type VersionKey = (
+    PathBuf,
+    Option<std::time::SystemTime>,
+    u64,
+    Option<[u8; 32]>,
+);
 
 struct VersionEntry {
     version: Option<semver::Version>,
@@ -267,10 +272,53 @@ pub fn binary_version(path: &Path) -> Option<semver::Version> {
     binary_version_with(path, VERSION_PROBE_TIMEOUT)
 }
 
+#[derive(Clone)]
+struct VersionLaunch {
+    cwd: PathBuf,
+    environment: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+}
+
+/// Same bounded probe/cache/parser, scoped to the actual child's launch context.
+/// Only the context digest is retained in the cache; environment values are not logged.
+pub(crate) fn binary_version_for_launch(
+    path: &Path,
+    cwd: &Path,
+    environment: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+) -> Option<semver::Version> {
+    let launch = VersionLaunch {
+        cwd: cwd.to_path_buf(),
+        environment,
+    };
+    binary_version_scoped(path, VERSION_PROBE_TIMEOUT, Some(&launch))
+}
+
 fn binary_version_with(path: &Path, timeout: std::time::Duration) -> Option<semver::Version> {
+    binary_version_scoped(path, timeout, None)
+}
+
+fn binary_version_scoped(
+    path: &Path,
+    timeout: std::time::Duration,
+    launch: Option<&VersionLaunch>,
+) -> Option<semver::Version> {
     let canonical = path.canonicalize().ok()?;
     let metadata = canonical.metadata().ok()?;
-    let key = (canonical, metadata.modified().ok(), metadata.len());
+    let context = launch.map(|launch| {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        for value in std::iter::once(launch.cwd.as_os_str()).chain(
+            launch
+                .environment
+                .iter()
+                .flat_map(|(key, value)| [key.as_os_str(), value.as_os_str()]),
+        ) {
+            let bytes = value.as_encoded_bytes();
+            digest.update((bytes.len() as u64).to_le_bytes());
+            digest.update(bytes);
+        }
+        <[u8; 32]>::from(digest.finalize())
+    });
+    let key = (canonical, metadata.modified().ok(), metadata.len(), context);
     let alias = path
         .file_stem()
         .unwrap_or_default()
@@ -310,7 +358,7 @@ fn binary_version_with(path: &Path, timeout: std::time::Duration) -> Option<semv
         let stamp = cache.invalidation_stamp(&names);
         (names, stamp)
     };
-    let (version, expires) = match probe_version(path, timeout) {
+    let (version, expires) = match probe_version(path, timeout, launch) {
         Probe::Answered(Some(version)) => (Some(version), None),
         Probe::Answered(None) => (None, Some(std::time::Instant::now() + VERSION_FAILURE_TTL)),
         Probe::Inconclusive => (
@@ -336,7 +384,9 @@ fn binary_version_with(path: &Path, timeout: std::time::Duration) -> Option<semv
     if let Some(previous) = cache.entries.get(&key) {
         aliases.extend(previous.aliases.iter().cloned());
     }
-    cache.entries.retain(|(p, _, _), _| p != &key.0);
+    // Keep the existing one-entry-per-executable bound. A context change
+    // cannot reuse the old answer, and does not grow the retained cache.
+    cache.entries.retain(|(p, _, _, _), _| p != &key.0);
     cache.entries.insert(
         key.clone(),
         VersionEntry {
@@ -355,12 +405,22 @@ fn binary_version_with(path: &Path, timeout: std::time::Duration) -> Option<semv
     version
 }
 
-fn probe_version(path: &Path, timeout: std::time::Duration) -> Probe {
+fn probe_version(
+    path: &Path,
+    timeout: std::time::Duration,
+    launch: Option<&VersionLaunch>,
+) -> Probe {
     #[cfg(not(windows))]
     let probe = || -> Probe {
         use std::io::Read;
         use std::process::{Command, Stdio};
         let mut command = Command::new(path);
+        if let Some(launch) = launch {
+            command
+                .current_dir(&launch.cwd)
+                .env_clear()
+                .envs(&launch.environment);
+        }
         command
             .arg("--version")
             .stdin(Stdio::null())
@@ -428,6 +488,7 @@ fn probe_version(path: &Path, timeout: std::time::Duration) -> Probe {
     #[cfg(windows)]
     let probe = || -> Probe {
         let path = path.to_path_buf();
+        let launch = launch.cloned();
         // Use the native launcher for npm .cmd/.bat shims and job-tree cleanup.
         // A separate runtime is safe even when descriptors run inside Tokio.
         std::thread::spawn(move || {
@@ -439,6 +500,13 @@ fn probe_version(path: &Path, timeout: std::time::Duration) -> Probe {
             };
             runtime.block_on(async {
                 let mut command = crate::process::Command::new(&path);
+                if let Some(launch) = &launch {
+                    command
+                        .as_std_mut()
+                        .current_dir(&launch.cwd)
+                        .env_clear()
+                        .envs(&launch.environment);
+                }
                 command
                     .arg("--version")
                     .stdin(crate::process::Stdio::null())
@@ -823,6 +891,38 @@ pub(crate) fn find_on_paths_matching_with(
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_version_cache_retains_one_context_per_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("launch-context-cli");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nprintf '%s\\n' \"$FIXTURE_NATIVE_VERSION\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for i in 0..8 {
+            let mut env: std::collections::BTreeMap<_, _> = std::env::vars_os().collect();
+            env.insert("FIXTURE_NATIVE_VERSION".into(), format!("1.0.{i}").into());
+            assert_eq!(
+                binary_version_for_launch(&path, dir.path(), env),
+                Some(semver::Version::new(1, 0, i))
+            );
+        }
+        let canonical = path.canonicalize().unwrap();
+        assert_eq!(
+            version_cache()
+                .entries
+                .keys()
+                .filter(|(p, _, _, _)| p == &canonical)
+                .count(),
+            1,
+            "launch-dependent keys must not expand the per-executable cache cardinality"
+        );
+    }
     use super::*;
     use std::collections::HashMap;
 
@@ -1058,7 +1158,7 @@ mod tests {
         for entry in version_cache()
             .entries
             .iter_mut()
-            .filter(|((p, _, _), _)| p == &canonical)
+            .filter(|((p, _, _, _), _)| p == &canonical)
             .map(|(_, entry)| entry)
         {
             assert!(entry.expires.is_some(), "a timeout is cached only briefly");
@@ -1072,7 +1172,7 @@ mod tests {
         let entry = entries
             .entries
             .iter()
-            .find(|((p, _, _), _)| p == &canonical)
+            .find(|((p, _, _, _), _)| p == &canonical)
             .unwrap()
             .1;
         assert!(entry.expires.is_none(), "an answer is kept");
@@ -1099,7 +1199,7 @@ mod tests {
         for entry in version_cache()
             .entries
             .iter_mut()
-            .filter(|((p, _, _), _)| p == &canonical)
+            .filter(|((p, _, _, _), _)| p == &canonical)
             .map(|(_, entry)| entry)
         {
             assert!(entry.expires.is_some(), "a failure is cached only briefly");
@@ -1144,7 +1244,7 @@ mod tests {
             !version_cache()
                 .entries
                 .keys()
-                .any(|(p, _, _)| p == &canonical),
+                .any(|(p, _, _, _)| p == &canonical),
             "the stale answer was cached"
         );
         // The next caller probes again.

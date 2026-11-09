@@ -212,6 +212,7 @@ struct RunHandle {
     run_id: String,
     steerable: bool,
     runtime_config: RuntimeConfig,
+    context_usage: Option<context_breakdown::RuntimeContextUsage>,
     steer_tx: mpsc::Sender<SteerMessage>,
     /// Harness-level cancellation (protocol interrupt + child teardown).
     interrupt_token: CancellationToken,
@@ -1244,6 +1245,7 @@ impl SessionsEngine {
                             .filter(|handle| handle.run_id == run_id)
                         {
                             handle.runtime_config.request = request.clone();
+                            handle.context_usage = None;
                         }
                         lock(&self.inner.last_requests)
                             .insert(chat_id.to_string(), request.clone());
@@ -1498,6 +1500,7 @@ impl SessionsEngine {
                 run_id: run_id.clone(),
                 steerable: harness.supports_steering(),
                 runtime_config: RuntimeConfig::new(harness_id, &request, harness.clone()),
+                context_usage: None,
                 steer_tx,
                 interrupt_token,
                 stops_turn_in_place: harness.supports_steering() && harness.stops_turn_in_place(),
@@ -4481,6 +4484,7 @@ async fn drive_run(
     let device_id = inner.device_id.clone();
     // Captured for post-run auto-titling (the request moves into the harness).
     let harness_id = harness.id();
+    let mut context_binding = RuntimeConfig::new(harness_id, &request, harness.clone());
     let user_prompt = request.prompt.clone();
     let run_cwd = request.cwd.clone();
     let resumed_session = request.resume.clone();
@@ -5557,6 +5561,12 @@ async fn drive_run(
             }
             // The composer's context indicator reads the session row, not the
             // doc meta; missing fields keep the previous measurement (merge).
+            inner.record_runtime_context_usage(
+                &chat_id,
+                &run_id,
+                &context_binding,
+                zeron_proto::ContextUsage::reported(*tokens, *window),
+            );
             inner.set_context_usage(
                 &chat_id,
                 zeron_proto::ContextUsage::reported(*tokens, *window),
@@ -5836,6 +5846,14 @@ async fn drive_run(
                 .get(&chat_id)
                 .filter(|h| h.run_id == run_id)
                 .and_then(|h| lock(&h.routed_steers).pop_front());
+            // Steered is the existing native delivery acknowledgement. Advancing
+            // on enqueue would relabel old-model events while configuration waits.
+            if let Some(request) = confirmed
+                .as_ref()
+                .and_then(|steer| steer.request.as_deref())
+            {
+                context_binding = RuntimeConfig::new(harness_id, request, harness.clone());
+            }
             // Consumed: a steer carrying the fork history delivered it to
             // this runtime's provider session.
             if confirmed.is_some_and(|steer| steer.fork_history)
@@ -5894,6 +5912,12 @@ async fn drive_run(
                 context_usage: Some(context_usage),
                 ..
             } => {
+                inner.record_runtime_context_usage(
+                    &chat_id,
+                    &run_id,
+                    &context_binding,
+                    *context_usage,
+                );
                 inner.set_context_usage(&chat_id, *context_usage);
             }
             _ => {}

@@ -392,15 +392,20 @@ async fn context_rpc_never_spawns_and_reads_only_the_selected_live_host() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(unavailable.availability, ContextAvailability::NotApplicable);
+    assert_eq!(unavailable.availability, ContextAvailability::Partial);
     assert!(
-        !unavailable.stale,
-        "Partial is not a retained Available measurement"
+        unavailable.stale,
+        "useful Partial facts remain explicitly historical after exit"
     );
-    assert_eq!(unavailable.used_tokens, None);
-    assert_eq!(
-        unavailable.reason.as_deref(),
-        Some("No live runtime to inspect")
+    assert_eq!(unavailable.used_tokens, first.used_tokens);
+    assert_eq!(unavailable.observed_at_ms, first.observed_at_ms);
+    assert_eq!(unavailable.model, first.model);
+    assert!(
+        unavailable
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("retained snapshot")
     );
     assert_eq!(
         std::fs::read_to_string(&log)
@@ -411,7 +416,7 @@ async fn context_rpc_never_spawns_and_reads_only_the_selected_live_host() {
         1
     );
     println!(
-        "SANITIZED host/RPC smoke: no-spawn, ownership, coalescing, native categories, Partial becomes unavailable after runtime exit; one prompt, one inspection"
+        "SANITIZED host/RPC smoke: no-spawn, ownership, coalescing, native categories, useful Partial retained stale after runtime exit; one prompt, one inspection"
     );
     core.sessions.shutdown().await;
 }
@@ -498,7 +503,7 @@ impl zeron_harness::Harness for ControlledInspection {
 }
 
 #[tokio::test]
-async fn only_available_context_reports_are_retained_after_failures_and_runtime_exit() {
+async fn measured_context_reports_are_retained_after_failures_and_runtime_exit() {
     use zeron_harness::HarnessError;
     let (pending, mut native) = tokio::sync::mpsc::unbounded_channel();
     let registry = HarnessRegistry::new();
@@ -605,10 +610,13 @@ async fn only_available_context_reports_are_retained_after_failures_and_runtime_
             }
         };
         let second: ContextBreakdown = serde_json::from_value(second).unwrap();
-        let available = availability == ContextAvailability::Available;
+        let available = matches!(
+            availability,
+            ContextAvailability::Available | ContextAvailability::Partial
+        );
         let unsupported = availability == ContextAvailability::Unsupported;
         let expected_second = if available {
-            ContextAvailability::Available
+            availability
         } else if unsupported {
             ContextAvailability::Unsupported
         } else {
@@ -668,7 +676,7 @@ async fn only_available_context_reports_are_retained_after_failures_and_runtime_
             availability,
             "ended",
             if available {
-                ContextAvailability::Available
+                availability
             } else {
                 ContextAvailability::NotApplicable
             },
@@ -681,7 +689,7 @@ async fn only_available_context_reports_are_retained_after_failures_and_runtime_
     core.shutdown().await;
     assert_eq!(
         actual, expected,
-        "only an Available measurement can become a retained stale snapshot"
+        "only useful Available/Partial measurements can become retained stale snapshots"
     );
 }
 

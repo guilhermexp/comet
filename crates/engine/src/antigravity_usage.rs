@@ -103,11 +103,13 @@ struct CredentialFingerprint([u8; 32]);
 struct CachedAntigravityUsage {
     windows: Vec<AgentUsageWindow>,
     fetched_at: Instant,
+    measured_at_ms: i64,
 }
 
 pub(crate) struct AntigravityUsageSnapshot {
     pub present: bool,
     pub usage_windows: Vec<AgentUsageWindow>,
+    pub usage_fetched_at: Option<i64>,
     pub warning: Option<String>,
     pub email: Option<String>,
 }
@@ -117,6 +119,7 @@ impl AntigravityUsageSnapshot {
         Self {
             present,
             usage_windows: Vec::new(),
+            usage_fetched_at: None,
             warning: Some(error.to_string()),
             email,
         }
@@ -236,10 +239,11 @@ impl AntigravityUsage {
         now: i64,
     ) -> AntigravityUsageSnapshot {
         let identity = cred.fingerprint();
-        if !force && let Some(windows) = self.cached_windows(&identity) {
+        if !force && let Some((windows, measured_at_ms)) = self.cached_windows(&identity) {
             return AntigravityUsageSnapshot {
                 present: true,
                 usage_windows: windows,
+                usage_fetched_at: Some(measured_at_ms),
                 warning: None,
                 email: cred.email.clone(),
             };
@@ -266,16 +270,19 @@ impl AntigravityUsage {
 
         match result {
             Ok(windows) => {
+                let measured_at_ms = Utc::now().timestamp_millis();
                 lock(&self.usage_cache).insert(
                     identity,
                     CachedAntigravityUsage {
                         windows: windows.clone(),
                         fetched_at: Instant::now(),
+                        measured_at_ms,
                     },
                 );
                 AntigravityUsageSnapshot {
                     present: true,
                     usage_windows: windows,
+                    usage_fetched_at: Some(measured_at_ms),
                     warning: None,
                     email: cred.email.clone(),
                 }
@@ -284,11 +291,14 @@ impl AntigravityUsage {
         }
     }
 
-    fn cached_windows(&self, identity: &CredentialFingerprint) -> Option<Vec<AgentUsageWindow>> {
+    fn cached_windows(
+        &self,
+        identity: &CredentialFingerprint,
+    ) -> Option<(Vec<AgentUsageWindow>, i64)> {
         lock(&self.usage_cache)
             .get(identity)
             .filter(|cached| cached.fetched_at.elapsed() < self.usage_ttl)
-            .map(|cached| cached.windows.clone())
+            .map(|cached| (cached.windows.clone(), cached.measured_at_ms))
     }
 
     /// Renews the access token in memory. Without an OAuth client there is no way
@@ -1190,11 +1200,13 @@ mod tests {
                     resets_at: None,
                 }],
                 fetched_at: Instant::now(),
+                measured_at_ms: 1234,
             },
         );
 
         let warm = usage.snapshots(false, 0).await;
         assert_eq!(warm[0].usage_windows.len(), 1);
+        assert_eq!(warm[0].usage_fetched_at, Some(1234));
         assert!(warm[0].warning.is_none());
 
         // `force` skips the cache and hits the network again.

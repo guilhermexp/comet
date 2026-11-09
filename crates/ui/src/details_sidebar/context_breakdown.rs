@@ -43,6 +43,7 @@ pub(super) struct PanelState {
     failure: Option<(Availability, SharedString)>,
     mcp_scroll: gpui::UniformListScrollHandle,
     memory_scroll: gpui::UniformListScrollHandle,
+    help_focus: Option<gpui::FocusHandle>,
 }
 impl PanelState {
     fn fraction(&self) -> Option<f64> {
@@ -316,6 +317,29 @@ impl DetailsSidebar {
                 .map(|r| availability_label(r.availability))
                 .unwrap_or("Unavailable")
         };
+        let help = report
+            .as_ref()
+            .map(|report| {
+                context_help(
+                    report,
+                    self.context_breakdown
+                        .failure
+                        .as_ref()
+                        .map(|(_, reason)| reason.as_ref()),
+                )
+            })
+            .or_else(|| {
+                self.context_breakdown
+                    .failure
+                    .as_ref()
+                    .map(|(_, reason)| reason.to_string())
+            });
+        let help_expanded = self.sidebar.context_disclosure_expanded("help:expanded");
+        let help_focus = self
+            .context_breakdown
+            .help_focus
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone();
         let hover = theme.element_hover;
         let focus = theme.element_active;
         body = body.child(
@@ -331,6 +355,47 @@ impl DetailsSidebar {
                         .text_color(theme.text_muted)
                         .child(state),
                 )
+                .when_some(help.clone(), |header, help| {
+                    header.child(
+                        div()
+                            .id("context-help")
+                            .debug_selector(|| "context-help".into())
+                            .track_focus(&help_focus)
+                            .tab_index(0)
+                            .role(gpui::Role::Button)
+                            .aria_label("Context measurement details")
+                            .aria_expanded(help_expanded)
+                            .h(px(24.0))
+                            .px(px(4.0))
+                            .rounded(px(4.0))
+                            .text_size(px(11.5))
+                            .text_color(theme.text_muted)
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(hover))
+                            .focus_visible(move |s| s.bg(focus))
+                            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                                    cx.stop_propagation();
+                                    this.sidebar.toggle_context_disclosure("help:expanded");
+                                    this.emit_preferences(cx);
+                                    cx.notify();
+                                }
+                            }))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                window.focus(&help_focus, cx);
+                                this.sidebar.toggle_context_disclosure("help:expanded");
+                                this.emit_preferences(cx);
+                                cx.notify();
+                            }))
+                            .child("Info")
+                            .tooltip(move |_, cx| {
+                                cx.new(|_| ActionTooltip {
+                                    label: help.clone().into(),
+                                })
+                                .into()
+                            }),
+                    )
+                })
                 .child(
                     div()
                         .id("context-refresh")
@@ -354,14 +419,20 @@ impl DetailsSidebar {
                         .child("Refresh"),
                 ),
         );
+        if let Some(help) = help.filter(|_| help_expanded) {
+            body =
+                body.child(note(help, theme).debug_selector(|| "context-measurement-help".into()));
+        }
         if let Some(report) = report {
             let total = report
                 .used_tokens
                 .map(format_token_count)
                 .unwrap_or_else(|| "—".into());
             let total = if report.used_tokens.is_some()
-                && report.used_basis.as_deref() != Some("provider-anchor")
-            {
+                && !matches!(
+                    report.used_basis.as_deref(),
+                    Some("provider-anchor" | "native-aggregate")
+                ) {
                 format!("≈{total}")
             } else {
                 total
@@ -370,37 +441,62 @@ impl DetailsSidebar {
                 .capacity
                 .map(format_token_count)
                 .unwrap_or_else(|| "—".into());
-            body = body.child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .text_size(px(12.5))
-                    .child(div().text_color(theme.text).child("Used / capacity"))
-                    .child(
-                        div()
-                            .text_color(theme.text_muted)
-                            .child(format!("{total} / {capacity}")),
-                    ),
-            );
-            let mut bar = div()
-                .h(px(5.0))
-                .w_full()
-                .flex()
-                .rounded_full()
-                .overflow_hidden()
-                .bg(theme.border);
-            for (index, fraction) in report.segments() {
-                bar = bar.child(
+            if report.used_tokens.is_some() || report.capacity.is_some() {
+                body = body.child(
                     div()
-                        .h_full()
-                        .flex_none()
-                        .w(gpui::relative(fraction))
-                        .bg(category_color(&report.categories[index], theme)),
+                        .debug_selector(|| "context-totals".into())
+                        .flex()
+                        .justify_between()
+                        .items_center()
+                        .text_size(px(12.5))
+                        .child(div().text_color(theme.text).child("Used / capacity"))
+                        .child(
+                            div()
+                                .text_color(theme.text_muted)
+                                .child(format!("{total} / {capacity}")),
+                        ),
                 );
             }
-            body = body.child(bar);
-            for (index, row) in report.categories.iter().enumerate() {
+            if let (Some(used), Some(capacity)) =
+                (report.used_tokens, report.capacity.filter(|n| *n > 0))
+            {
+                let mut bar = div()
+                    .debug_selector(|| "context-budget-bar".into())
+                    .h(px(5.0))
+                    .w_full()
+                    .flex()
+                    .rounded_full()
+                    .overflow_hidden()
+                    .bg(theme.border);
+                let segments = report.segments();
+                if segments.is_empty() && used > 0 {
+                    bar = bar.child(
+                        div()
+                            .h_full()
+                            .flex_none()
+                            .w(gpui::relative(
+                                (used as f64 / capacity as f64).min(1.0) as f32
+                            ))
+                            .bg(theme.accent),
+                    );
+                }
+                for (index, fraction) in segments {
+                    bar = bar.child(
+                        div()
+                            .h_full()
+                            .flex_none()
+                            .w(gpui::relative(fraction))
+                            .bg(category_color(&report.categories[index], theme)),
+                    );
+                }
+                body = body.child(bar);
+            }
+            for (index, row) in report
+                .categories
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.tokens.is_some())
+            {
                 let nested = row.parent_id.is_some();
                 let label = if nested {
                     format!("{} · included", row.label)
@@ -478,82 +574,6 @@ impl DetailsSidebar {
             }
             body = body.child(self.render_context_items(report.clone(), false, theme, cx));
             body = body.child(self.render_context_items(report.clone(), true, theme, cx));
-            let source = match report.source.as_str() {
-                "omp-native-v1" if report.used_basis.as_deref() == Some("provider-anchor") => {
-                    "OMP · Provider total, category estimates"
-                }
-                "omp-native-v1" => "OMP · Local estimates",
-                "claude-summary" => "Claude · Summary estimates",
-                _ => "Native runtime",
-            };
-            body = body.child(note(source, theme));
-            if let Some(native) = &report.native {
-                body = body.child(note(
-                    match native.has_local_changes {
-                        Some(true) => "Local changes reported since the provider snapshot",
-                        Some(false) => "No local changes reported",
-                        None => "Local changes unknown; fingerprints unavailable",
-                    },
-                    theme,
-                ));
-                if let Some(residual) = native.system_context.unattributed_tokens {
-                    body = body.child(note(format!("System context residual: {residual:+} tokens · BPE boundary estimate, included in System context"), theme).debug_selector(|| "context-native-residual".into()));
-                }
-                if native.deferred.schemas_in_context == Some(false) {
-                    body = body.child(note("Active schemas omitted by model policy", theme));
-                }
-                if native.deferred.active_estimate_reason.is_some() {
-                    body = body.child(note(
-                        "Tool estimates use the declared roster; provider activation is unknown",
-                        theme,
-                    ));
-                }
-                if native.deferred.last_request.tools.availability == Availability::Available {
-                    body = body.child(note(
-                        format!(
-                            "Last request deferred: {} names · historical only",
-                            native.deferred.last_request.tools.items.len()
-                        ),
-                        theme,
-                    ));
-                }
-                if let Some(at) = native.captured_at_ms {
-                    body = body.child(note(format!("Native snapshot {}", time_label(at)), theme));
-                }
-            }
-            if let Some(model) = &report.model {
-                body = body.child(note(format!("Model · {model}"), theme));
-            }
-            if report.stale {
-                body = body.child(note(
-                    format!(
-                        "Retained snapshot{}",
-                        report
-                            .model
-                            .as_ref()
-                            .map(|m| format!(" · {m}"))
-                            .unwrap_or_default()
-                    ),
-                    theme,
-                ));
-            }
-            body = body.child(note(
-                format!("Observed {}", time_label(report.observed_at_ms)),
-                theme,
-            ));
-            body = body.child(note(
-                report
-                    .measured_at_ms
-                    .map(|at| format!("Provider measurement {}", time_label(at)))
-                    .unwrap_or_else(|| "Provider measurement time unknown".into()),
-                theme,
-            ));
-            if let Some(reason) = &report.reason {
-                body = body.child(note(reason.clone(), theme));
-            }
-        }
-        if let Some((_, reason)) = &self.context_breakdown.failure {
-            body = body.child(note(reason.clone(), theme));
         }
         body.into_any_element()
     }
@@ -578,6 +598,9 @@ impl DetailsSidebar {
             list.availability,
             Availability::Available | Availability::Partial
         );
+        if !available || (list.availability == Availability::Partial && list.items.is_empty()) {
+            return div().into_any_element();
+        }
         let expanded = self.sidebar.context_disclosure_expanded(section);
         let count = if available {
             list.items.len().to_string()
@@ -749,18 +772,84 @@ impl DetailsSidebar {
                     theme,
                 ));
             }
-            if let Some(reason) = &list.reason {
-                body = body.child(note(reason.clone(), theme));
-            }
         }
         body.into_any_element()
     }
+}
+fn context_help(report: &ContextBreakdown, failure: Option<&str>) -> String {
+    let precision = match report.used_basis.as_deref() {
+        Some("provider-anchor") => "Provider total; category estimates",
+        Some("native-aggregate") => "Native total; composition unavailable",
+        _ if report.used_tokens.is_some() => "Local estimates",
+        _ => "No total reported",
+    };
+    let mut parts = vec![
+        format!("{} · {precision}", report.source),
+        format!("Observed {}", time_label(report.observed_at_ms)),
+    ];
+    parts.push(
+        report
+            .measured_at_ms
+            .map(|at| format!("Provider measurement {}", time_label(at)))
+            .unwrap_or_else(|| "Provider measurement time unknown".into()),
+    );
+    if let Some(model) = &report.model {
+        parts.push(format!("Model · {model}"));
+    }
+    if report.stale {
+        parts.push("Last known snapshot".into());
+    }
+    if let Some(native) = &report.native {
+        parts.push(
+            match native.has_local_changes {
+                Some(true) => "Local changes reported since the provider snapshot",
+                Some(false) => "No local changes reported",
+                None => "Local changes unknown; fingerprints unavailable",
+            }
+            .into(),
+        );
+        if let Some(residual) = native.system_context.unattributed_tokens {
+            parts.push(format!("System context residual: {residual:+} tokens · BPE boundary estimate, included in System context"));
+        }
+        if native.deferred.schemas_in_context == Some(false) {
+            parts.push("Active schemas omitted by model policy".into());
+        }
+        if native.deferred.active_estimate_reason.is_some() {
+            parts.push(
+                "Tool estimates use the declared roster; provider activation is unknown".into(),
+            );
+        }
+        if native.deferred.last_request.tools.availability == Availability::Available {
+            parts.push(format!(
+                "Last request deferred: {} names · historical only",
+                native.deferred.last_request.tools.items.len()
+            ));
+        }
+        if let Some(at) = native.captured_at_ms {
+            parts.push(format!("Native snapshot {}", time_label(at)));
+        }
+    }
+    for (label, list) in [
+        ("MCP tools", &report.mcp_tools),
+        ("Memory files", &report.memory_files),
+    ] {
+        if let Some(reason) = &list.reason {
+            parts.push(format!("{label} · {reason}"));
+        }
+    }
+    if let Some(reason) = &report.reason {
+        parts.push(reason.clone());
+    }
+    if let Some(failure) = failure.filter(|failure| Some(*failure) != report.reason.as_deref()) {
+        parts.push(failure.into());
+    }
+    parts.join(" · ")
 }
 fn availability_label(value: Availability) -> &'static str {
     match value {
         Availability::Available => "Snapshot",
         Availability::Partial => "Partial",
-        Availability::Unsupported => "Unsupported",
+        Availability::Unsupported => "Unavailable",
         Availability::NotApplicable => "Unavailable",
         Availability::Error => "Failed",
     }
@@ -1123,6 +1212,7 @@ mod tests {
         state.set_context(Some(context("a")));
         state.toggle_context_disclosure("expanded");
         state.toggle_context_disclosure("mcp:expanded");
+        state.toggle_context_disclosure("help:expanded");
         assert!(!state.context_disclosure_expanded("memory:expanded"));
         assert!(!state.projects_worked_collapsed());
         let prefs: DetailsSidebarPreferences =
@@ -1131,10 +1221,48 @@ mod tests {
         restored.set_context(Some(context("b")));
         assert!(!restored.context_disclosure_expanded("expanded"));
         assert!(!restored.context_disclosure_expanded("mcp:expanded"));
+        assert!(!restored.context_disclosure_expanded("help:expanded"));
         restored.set_context(Some(context("a")));
         assert!(restored.context_disclosure_expanded("expanded"));
         assert!(restored.context_disclosure_expanded("mcp:expanded"));
+        assert!(restored.context_disclosure_expanded("help:expanded"));
         assert!(!restored.context_disclosure_expanded("memory:expanded"));
+    }
+    #[test]
+    fn context_help_preserves_redaction_and_truncation_reasons() {
+        let mut report = ContextBreakdown::default();
+        report.memory_files.reason = Some("Memory metadata redacted by runtime".into());
+        report.mcp_tools.reason = Some("Native list truncated at 512 items".into());
+        let help = context_help(&report, None);
+        assert!(help.contains("Memory metadata redacted"));
+        assert!(help.contains("truncated at 512"));
+    }
+    #[test]
+    fn context_help_preserves_local_changes_and_both_retained_and_refresh_reasons() {
+        for (changes, text) in [
+            (
+                Some(true),
+                "Local changes reported since the provider snapshot",
+            ),
+            (Some(false), "No local changes reported"),
+            (None, "Local changes unknown; fingerprints unavailable"),
+        ] {
+            let report = ContextBreakdown {
+                reason: Some("Retained snapshot has partial attribution".into()),
+                native: Some(zeron_proto::ContextNativeMetadata {
+                    has_local_changes: changes,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let help = context_help(&report, Some("Latest refresh failed"));
+            assert!(help.contains(text), "{help}");
+            assert!(
+                help.contains("Retained snapshot has partial attribution"),
+                "{help}"
+            );
+            assert!(help.contains("Latest refresh failed"), "{help}");
+        }
     }
     #[gpui::test]
     fn context_budget_light_dark_narrow_rows_and_independent_bounded_lists(
@@ -1206,7 +1334,11 @@ mod tests {
                     cx.notify();
                 });
                 window.update(|w, cx| w.draw(cx).clear());
-                assert!(window.debug_bounds("context-native-residual").is_some());
+                assert!(
+                    window.debug_bounds("context-native-residual").is_none(),
+                    "technical notes belong in help, not the default body"
+                );
+                assert!(window.debug_bounds("context-help").is_some());
                 let label = window.debug_bounds("context-category-label-0").unwrap();
                 let tokens = window.debug_bounds("context-category-tokens-0").unwrap();
                 assert!(
@@ -1216,6 +1348,22 @@ mod tests {
                 assert!(tokens.right() <= gpui::px(width - 12.0));
             }
         }
+        let help = window.debug_bounds("context-help").unwrap();
+        window.simulate_click(help.center(), Modifiers::default());
+        window.update(|w, cx| w.draw(cx).clear());
+        assert!(window.debug_bounds("context-measurement-help").is_some());
+        window.simulate_keystrokes("enter");
+        window.update(|w, cx| w.draw(cx).clear());
+        assert!(
+            window.debug_bounds("context-measurement-help").is_none(),
+            "keyboard activation must toggle the same scoped help"
+        );
+        window.simulate_keystrokes("space");
+        window.update(|w, cx| w.draw(cx).clear());
+        assert!(window.debug_bounds("context-measurement-help").is_some());
+        window.simulate_keystrokes("space");
+        window.update(|w, cx| w.draw(cx).clear());
+        assert!(window.debug_bounds("context-measurement-help").is_none());
         let mcp = window.debug_bounds("context-mcp:expanded").unwrap();
         window.simulate_click(mcp.center(), Modifiers::default());
         window.update(|w, cx| w.draw(cx).clear());
@@ -1234,6 +1382,75 @@ mod tests {
         window.update(|w, cx| w.draw(cx).clear());
         assert!(window.debug_bounds("context-mcp-list").is_none());
         assert!(window.debug_bounds("context-memory-list").is_some());
+        for (availability, used, capacity, measured_lists, expected_total, expected_bar) in [
+            (Availability::Unsupported, None, None, false, false, false),
+            (
+                Availability::Partial,
+                Some(0),
+                Some(1000),
+                false,
+                true,
+                true,
+            ),
+            (Availability::Partial, None, Some(1000), false, true, false),
+            (
+                Availability::Available,
+                Some(0),
+                Some(1000),
+                true,
+                true,
+                true,
+            ),
+        ] {
+            sidebar.update(window, |s, cx| {
+                let mut report = ContextBreakdown {
+                    availability,
+                    used_tokens: used,
+                    capacity,
+                    source: "codex-aggregate".into(),
+                    used_basis: Some("native-aggregate".into()),
+                    ..Default::default()
+                };
+                if measured_lists {
+                    report.memory_files.availability = Availability::Available;
+                }
+                s.context_breakdown.snapshot = Some(Arc::new(report));
+                cx.notify();
+            });
+            window.update(|w, cx| w.draw(cx).clear());
+            assert_eq!(
+                window.debug_bounds("context-totals").is_some(),
+                expected_total
+            );
+            assert_eq!(
+                window.debug_bounds("context-budget-bar").is_some(),
+                expected_bar
+            );
+            assert!(
+                window.debug_bounds("context-mcp:expanded").is_none(),
+                "unsupported lists have no empty disclosure"
+            );
+            assert_eq!(
+                window.debug_bounds("context-memory:expanded").is_some(),
+                measured_lists
+            );
+        }
+        sidebar.update(window, |s, cx| {
+            s.context_breakdown.snapshot = None;
+            s.context_breakdown.failure = Some((
+                Availability::Error,
+                "Initial context read failed; refresh to retry".into(),
+            ));
+            cx.notify();
+        });
+        window.update(|w, cx| w.draw(cx).clear());
+        assert!(window.debug_bounds("context-totals").is_none());
+        let help = window
+            .debug_bounds("context-help")
+            .expect("an initial failure must retain accessible help without a snapshot");
+        window.simulate_click(help.center(), Modifiers::default());
+        window.update(|w, cx| w.draw(cx).clear());
+        assert!(window.debug_bounds("context-measurement-help").is_some());
         println!(
             "SANITIZED GPUI context layout: light/dark at 300/500px; truncated label/count columns; two independent 7-row viewports"
         );

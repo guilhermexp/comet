@@ -829,31 +829,8 @@ fn dispatch_action(
             }))
         }
         "list_presets" => {
-            let bootstrap = client.bootstrap().map_err(|error| error.to_string())?;
-            // Screen order, exactly as Settings ▸ Presets shows it: that list
-            // IS the fallback order (`fallback_order`, 1-based), and the star
-            // (quick_launch) is a separate `preferred` flag — never a
-            // re-sort, so the emitted position always matches the screen even
-            // when the starred preset is not first. Disabled presets are
-            // filtered out, so `enabled` is not emitted (it would always be
-            // true).
-            Ok(json!({
-                "presets": bootstrap
-                    .presets
-                    .into_iter()
-                    .filter(|preset| preset.enabled)
-                    .enumerate()
-                    .map(|(index, preset)| json!({
-                        "id": preset.id,
-                        "label": preset.label,
-                        "command": preset.command,
-                        "cli_id": preset.cli_id,
-                        "is_default": preset.is_default,
-                        "fallback_order": index + 1,
-                        "preferred": preset.quick_launch
-                    }))
-                    .collect::<Vec<_>>()
-            }))
+            let settings = client.settings().map_err(|error| error.to_string())?;
+            Ok(list_presets_response(settings.presets))
         }
         "launch_worker" => {
             let mut plan = parse_launch_plan(arguments.clone())?;
@@ -1124,6 +1101,111 @@ fn dispatch_action(
         _ => Err(format!(
             "Unknown workers action '{action}'. Use action=help."
         )),
+    }
+}
+
+// The response formatter consumes Settings' typed projection; availability is
+// decided there, never by an independent detector in the controller.
+fn list_presets_response(presets: Vec<crate::WorkersPresetSetting>) -> Value {
+    let presets = presets
+        .into_iter()
+        .filter(|preset| preset.enabled && preset.installed)
+        .enumerate()
+        .map(|(index, preset)| {
+            json!({
+                "id":preset.id, "label":preset.label, "command":preset.command,
+                // Compatibility fields remain inert in this MCP wire.
+                "cli_id":Value::Null, "is_default":false,
+                "fallback_order":index+1, "preferred":preset.quick_launch,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({"presets":presets})
+}
+
+#[cfg(test)]
+mod preset_availability_tests {
+    use super::*;
+    fn projected(presets: Value, installed: &[&str]) -> Vec<crate::WorkersPresetSetting> {
+        let catalog = unpeel_core::runtime_catalog::builtin_runtime_catalog();
+        let runtimes = catalog
+            .current_platform_descriptors()
+            .map(|runtime| crate::WorkersRuntime {
+                cli_id: runtime.legacy_slug.clone(),
+                label: runtime.label.clone(),
+                icon: runtime.display.icon.clone(),
+                tint_color_hex: runtime.display.tint.clone(),
+                spinner_tint_color_hex: runtime.display.spinner_tint.clone(),
+                supports_quick_launch: runtime.supports_quick_launch,
+                installed: installed.contains(&runtime.legacy_slug.as_str()),
+                installed_path: None,
+                install_command: None,
+                official_url: None,
+            })
+            .collect::<Vec<_>>();
+        crate::preset_settings(serde_json::from_value(presets).unwrap(), &runtimes)
+    }
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn list_presets_matches_the_five_enabled_installed_settings_rows() {
+        let ids = [
+            "omp",
+            "claude",
+            "codex",
+            "cline",
+            "amp",
+            "gemini",
+            "pi",
+            "opencode",
+            "kiro-cli",
+            "muse",
+            "prime-agent",
+            "cursor",
+            "grok",
+            "agy",
+        ];
+        let raw=ids.into_iter().map(|id|json!({"id":id,"label":id,"command":id,"enabled":!matches!(id,"cursor"|"grok"|"agy"),"quick_launch":id=="claude"})).collect::<Vec<_>>();
+        let settings = projected(
+            json!(raw),
+            &[
+                "omp", "claude", "codex", "pi", "opencode", "cursor", "grok", "agy",
+            ],
+        );
+        let response = list_presets_response(settings);
+        let rows = response["presets"].as_array().unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|p| p["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["omp", "claude", "codex", "pi", "opencode"]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|p| p["fallback_order"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5]
+        );
+        assert_eq!(rows[0]["preferred"], false);
+        assert_eq!(rows[1]["preferred"], true);
+        assert!(rows.iter().all(|p| p["cli_id"].is_null()
+            && p["is_default"] == false
+            && p.get("enabled").is_none()));
+    }
+    #[test]
+    fn list_presets_preserves_custom_commands_and_empty_projection() {
+        let command = "my-private-worker-wrapper --safe-mode";
+        let settings = projected(
+            json!([
+                {"id":"custom","label":"Custom","command":command,"enabled":true,"quick_launch":true,"project_id":"project-a"},
+                {"id":"off","label":"Off","command":command,"enabled":false,"quick_launch":true}
+            ]),
+            &[],
+        );
+        let response = list_presets_response(settings);
+        assert_eq!(response["presets"].as_array().unwrap().len(), 1);
+        assert_eq!(response["presets"][0]["id"], "custom");
+        assert_eq!(response["presets"][0]["command"], command);
+        assert_eq!(list_presets_response(vec![]), json!({"presets":[]}));
     }
 }
 

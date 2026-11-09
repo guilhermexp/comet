@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+if [ "${1:-}" = "--version" ]; then echo 18.17.0; exit 0; fi
 
 emit() { printf '%s\n' "$1"; }
 # Value of a TOP-LEVEL string key.
@@ -99,7 +100,40 @@ if [ "$scenario" = "stderr-crash" ]; then
   exit 7
 fi
 
-emit '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2]}'
+if [ "$scenario" = discovery-startup ]; then
+  case " $* " in *" --no-ui "*) : ;; *) exit 71 ;; esac
+  case " $* " in *" --no-extensions "*) exit 72 ;; esac
+fi
+if [ "$scenario" != startup-extension-before-ready ]; then
+  emit '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2]}'
+fi
+
+if [ "$scenario" = startup-extension ] || [ "$scenario" = startup-extension-before-ready ] || [ "$scenario" = startup-extension-eof ]; then
+  case " $* " in *" --no-ui "*) exit 73 ;; esac
+  emit '{"type":"extension_ui_request","id":"startup-question","method":"confirm","title":"Startup confirmation"}'
+  [ -z "${FAKE_OMP_LOG:-}" ] || printf '%s startup\n' "$$" >> "$FAKE_OMP_LOG"
+  [ "$scenario" != startup-extension-eof ] || exit 8
+  blocked_command=
+  while IFS= read -r startup_line; do
+    if [ "$(field type "$startup_line")" = extension_ui_response ]; then
+      if has "$startup_line" '"cancelled":true'; then exit 0; fi
+      break
+    fi
+    blocked_command=$startup_line
+  done
+  [ -z "$blocked_command" ] || respond "$blocked_command" '{"protocolVersion":2}'
+  if [ "$scenario" = startup-extension-before-ready ]; then emit '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2]}'; fi
+
+fi
+
+if [ "$scenario" = startup-extension-cancel-burst ]; then
+  sequence=0
+  while [ "$sequence" -lt 300 ]; do
+    emit "{\"type\":\"extension_ui_request\",\"id\":\"burst-$sequence\",\"method\":\"confirm\",\"title\":\"Fixture\"}"
+    emit "{\"type\":\"extension_ui_request\",\"id\":\"cancel-$sequence\",\"targetId\":\"burst-$sequence\",\"method\":\"cancel\"}"
+    sequence=$((sequence + 1))
+  done
+fi
 
 if [ "$scenario" = "startup-event-flood" ] || [ "$scenario" = "startup-event-overflow" ]; then
   event_count=300
@@ -185,8 +219,28 @@ while IFS= read -r line; do
         respond "$line" '{"protocolVersion":2}'
       fi
       ;;
+    identity_probe)
+      emit "{\"type\":\"prompt_result\",\"id\":\"$(field id "$line")\",\"status\":\"completed\"}"
+      respond "$line" '{}'
+      ;;
     get_context_breakdown)
-      if [ "$scenario" = "context-unknown" ]; then
+      case "$scenario" in
+        prompt-outcome-legacy-long)
+          respond "$line" '{"schemaVersion":1}'
+          emit '{"type":"agent_end","messages":[]}'
+          continue ;;
+        yield-lifecycle-*)
+          respond "$line" '{"schemaVersion":1}'
+          if [ "$scenario" = yield-lifecycle-wake ]; then
+            emit '{"type":"agent_start"}'
+            emit '{"type":"command_output","text":"wake answer"}'
+            emit '{"type":"agent_end","messages":[],"yielded":true,"isTerminal":true}'
+          fi
+          emit '{"type":"session_settled"}'
+          emit '{"type":"command_output","text":"settlement observed"}'
+          continue ;;
+      esac
+      if [ "$scenario" = "context-unknown" ] || [ "$scenario" = "context-aggregate" ]; then
         emit "{\"type\":\"response\",\"id\":\"$(field id "$line")\",\"command\":\"get_context_breakdown\",\"success\":false,\"error\":\"Unknown command: get_context_breakdown\"}"
         continue
       fi
@@ -195,6 +249,14 @@ while IFS= read -r line; do
       respond "$line" '{"schemaVersion":1,"identity":{"sessionId":"s-1","model":{"provider":"openai-codex","id":"gpt-5.6-sol"},"contextWindow":1000000,"compactionEpoch":0,"contextUsageRevision":1,"messageCount":2},"snapshot":{"capturedAtMs":1000,"lastProviderAtMs":900,"usedBasis":"provider-anchor","streaming":false,"pendingRequest":false},"total":{"usedTokens":828300,"contextWindow":1000000,"reserveTokens":33000,"freeTokens":138700},"categories":{"messages":{"tokens":828300,"basis":"provider-anchor-residual"},"systemPrompt":{"tokens":0,"basis":"tokenizer-estimate"},"systemTools":{"tokens":0,"basis":"tokenizer-estimate"},"systemContext":{"tokens":0,"basis":"tokenizer-estimate"},"skills":{"tokens":0,"basis":"tokenizer-estimate"}}}'
       ;;
     get_state)
+      if [ "$scenario" = "context-aggregate" ]; then
+        if [ -f "$FAKE_OMP_HOLD_PATH" ]; then
+          respond "$line" '{"sessionId":"s-1","model":{"provider":"fixture","id":"model-b"},"contextUsage":{"tokens":200,"contextWindow":2000}}'
+        else
+          respond "$line" '{"sessionId":"s-1","model":{"provider":"fixture","id":"model-a"},"contextUsage":{"tokens":0,"contextWindow":1000}}'
+        fi
+        continue
+      fi
       if [ "$scenario" = "live-event-flood" ]; then
         sequence=0
         while [ "$sequence" -lt 1100 ]; do
@@ -267,6 +329,14 @@ while IFS= read -r line; do
       ;;
     # Fire-and-forget frames: no response exists for them.
     extension_ui_response|host_tool_result)
+      if [ "$scenario" = prompt-outcome-host-wait ] || [ "$scenario" = prompt-outcome-input-wait ]; then
+        emit "{\"type\":\"prompt_result\",\"id\":\"$modern_prompt_id\",\"status\":\"completed\",\"sessionSettled\":true}"
+        continue
+      fi
+      if [ "$scenario" = structured-compact-input ] && [ "$(field id "$line")" = compact-question ]; then
+        emit '{"type":"manual_compaction_end","aborted":false,"result":{"tokensBefore":500000}}'
+        continue
+      fi
       ;;
     abort)
       case "$scenario" in
@@ -300,6 +370,104 @@ while IFS= read -r line; do
       ;;
     prompt)
       case "$scenario" in
+        prompt-outcome-active|prompt-outcome-host-wait|prompt-outcome-input-wait)
+          modern_prompt_id=$(field id "$line")
+          respond "$line" '{}'
+          emit '{"type":"agent_start"}'
+          case "$scenario" in
+            prompt-outcome-active)
+              count=0
+              while [ "$count" -lt 5 ]; do
+                emit '{"type":"command_output","text":"active"}'
+                sleep 0.08
+                count=$((count + 1))
+              done
+              emit "{\"type\":\"prompt_result\",\"id\":\"$modern_prompt_id\",\"status\":\"completed\",\"sessionSettled\":true}" ;;
+            prompt-outcome-host-wait)
+              emit "{\"type\":\"host_tool_call\",\"id\":\"host-hold\",\"toolCallId\":\"workers-hold\",\"toolName\":\"workers\",\"arguments\":{\"action\":\"hold\",\"path\":\"${FAKE_OMP_HOLD_PATH}\"}}"
+              emit '{"type":"command_output","text":"host waiting"}' ;;
+            prompt-outcome-input-wait)
+              emit '{"type":"extension_ui_request","id":"long-input","method":"confirm","title":"Fixture confirmation"}' ;;
+          esac
+          continue ;;
+        structured-compact-input)
+          respond "$line" '{"agentInvoked":false}'
+          emit '{"type":"manual_compaction_start"}'
+          emit '{"type":"extension_ui_request","id":"compact-question","method":"confirm","title":"Compact fixture","message":"Proceed?"}'
+          continue ;;
+        prompt-outcome-legacy-long)
+          respond "$line" '{}'
+          emit '{"type":"command_output","text":"legacy active"}'
+          continue ;;
+        prompt-outcome-rejection)
+          emit "{\"type\":\"response\",\"id\":\"$(field id "$line")\",\"command\":\"prompt\",\"success\":false,\"error\":\"fixture admission rejected\"}"
+          continue ;;
+        structured-compact-*)
+          [ "$scenario" = structured-compact-before-ack ] || respond "$line" '{"agentInvoked":false}'
+          [ "$scenario" = structured-compact-unscoped ] || emit '{"type":"manual_compaction_start"}'
+          emit '{"type":"agent_end","messages":[]}'
+          emit '{"type":"command_output","text":"arbitrary prose cannot decide success"}'
+          case "$scenario" in
+            structured-compact-aborted) emit '{"type":"manual_compaction_end","aborted":true}' ;;
+            structured-compact-error) emit '{"type":"manual_compaction_end","aborted":false,"errorMessage":"native compact failure"}' ;;
+            structured-compact-skipped) emit '{"type":"manual_compaction_end","aborted":false,"skipped":true,"errorMessage":"nothing to compact"}' ;;
+            *) emit '{"type":"manual_compaction_end","aborted":false,"result":{"tokensBefore":500000}}' ;;
+          esac
+          [ "$scenario" != structured-compact-before-ack ] || respond "$line" '{"agentInvoked":false}'
+          continue ;;
+        yield-lifecycle-*)
+          respond "$line" '{}'
+          if [ "$(field message "$line")" = second ]; then
+            emit '{"type":"command_output","text":"second answer"}'
+            emit "{\"type\":\"prompt_result\",\"id\":\"$(field id "$line")\",\"status\":\"completed\",\"sessionSettled\":true}"
+            continue
+          fi
+          emit '{"type":"command_output","text":"before yield"}'
+          emit '{"type":"agent_end","messages":[],"yielded":false,"isTerminal":true}'
+          emit '{"type":"command_output","text":"after continuation"}'
+          emit '{"type":"agent_end","messages":[],"yielded":true,"isTerminal":false,"awaitingAsyncWork":true}'
+          emit "{\"type\":\"prompt_result\",\"id\":\"$(field id "$line")\",\"agentInvoked\":true,\"status\":\"completed\",\"sessionSettled\":false}"
+          continue ;;
+        prompt-outcome-*)
+          prompt_id=$(field id "$line")
+          if [ "$(field message "$line")" = second ]; then
+            emit "{\"type\":\"prompt_result\",\"id\":\"$previous_prompt\",\"status\":\"error\",\"error\":{\"message\":\"late failure\"},\"sessionSettled\":true}"
+            emit '{"type":"prompt_result","id":"foreign","status":"completed","sessionSettled":true}'
+            respond "$line" '{}'
+            emit '{"type":"command_output","text":"second answer"}'
+            emit "{\"type\":\"prompt_result\",\"id\":\"$prompt_id\",\"status\":\"completed\",\"sessionSettled\":true}"
+            continue
+          fi
+          previous_prompt=$prompt_id
+          case "$scenario" in
+            prompt-outcome-sync) : ;;
+            prompt-outcome-before-ack) : ;;
+            *) respond "$line" '{}' ;;
+          esac
+          emit '{"type":"command_output","text":"local answer"}'
+          # A synchronous local success ACK is completion, so native output
+          # precedes it (docs/rpc.md: prompt payload); no prompt_result follows.
+          if [ "$scenario" = prompt-outcome-sync ]; then
+            respond "$line" '{"agentInvoked":false}'
+            continue
+          fi
+          case "$scenario" in
+            prompt-outcome-error|prompt-outcome-aborted|prompt-outcome-missing) emit '{"type":"agent_end","messages":[],"isTerminal":true,"yielded":true}' ;;
+          esac
+          outcome=completed
+          case "$scenario" in
+            prompt-outcome-error|prompt-outcome-legacy-error) outcome=error ;;
+            prompt-outcome-aborted) outcome=aborted ;;
+          esac
+          if [ "$scenario" = prompt-outcome-legacy-error ] || [ "$scenario" = prompt-outcome-legacy-completed ]; then
+            emit "{\"type\":\"response\",\"command\":\"prompt\",\"id\":\"$prompt_id\",\"success\":false,\"error\":\"native failure\"}"
+          fi
+          case "$scenario" in
+            prompt-outcome-sync|prompt-outcome-missing) : ;;
+            *) emit "{\"type\":\"prompt_result\",\"id\":\"$prompt_id\",\"agentInvoked\":false,\"status\":\"$outcome\",\"error\":{\"message\":\"native failure\"},\"sessionSettled\":true}" ;;
+          esac
+          if [ "$scenario" = prompt-outcome-before-ack ]; then respond "$line" '{}'; fi
+          continue ;;
         timing-*)
           turn_count=$((turn_count + 1))
           if [ "$scenario" = "timing-warm" ] && [ "$turn_count" = 2 ]; then
@@ -464,7 +632,7 @@ while IFS= read -r line; do
         has "$answer" '"timedOut":false' || fail_stage decline 28
         if has "$answer" '"confirmed"'; then fail_stage decline 29; fi
         emit '{"type":"agent_end","messages":[]}'
-      elif [ "$scenario" = "require-system-prompt" ]; then
+      elif [ "$scenario" = "require-system-prompt" ] || [ "$scenario" = "startup-extension" ] || [ "$scenario" = startup-extension-before-ready ] || [ "$scenario" = startup-extension-cancel-burst ]; then
         emit '{"type":"agent_end","messages":[]}'
       elif [ "$scenario" = "require-skill-scope" ]; then
         emit '{"type":"agent_end","messages":[]}'
@@ -689,7 +857,7 @@ while IFS= read -r line; do
       elif [ "$scenario" = "context-active" ]; then
         emit '{"type":"agent_start"}'
         emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"active"}}'
-      elif [ "$scenario" = "multi-turn" ] || [ "$scenario" = "context-unknown" ] || [ "$scenario" = "context-exit" ] || [ "$scenario" = "context-timeout" ]; then
+      elif [ "$scenario" = "multi-turn" ] || [ "$scenario" = "context-unknown" ] || [ "$scenario" = "context-aggregate" ] || [ "$scenario" = "context-exit" ] || [ "$scenario" = "context-timeout" ]; then
         # One agent run per prompt, in the SAME process. A steer that reaches
         # a turn in flight is answered by the main loop below.
         turn_count=$((turn_count + 1))

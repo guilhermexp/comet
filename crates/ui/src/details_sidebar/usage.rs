@@ -13,6 +13,43 @@ pub enum ProviderUsageState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageFreshness {
+    Current,
+    Stale,
+    Unknown,
+    SignInRequired,
+}
+
+fn quota_freshness(account: &AgentAccount, now: DateTime<Utc>) -> UsageFreshness {
+    if let Some(error) = &account.usage_error {
+        let error = error.to_ascii_lowercase();
+        let auth_status = error
+            .split(|c: char| !c.is_ascii_digit())
+            .any(|token| matches!(token, "401" | "403"));
+        if ["sign-in", "sign in", "signed out"]
+            .iter()
+            .any(|text| error.contains(text))
+            || auth_status
+        {
+            return UsageFreshness::SignInRequired;
+        }
+        return UsageFreshness::Stale;
+    }
+    let Some(measured) = account
+        .usage_fetched_at
+        .and_then(DateTime::from_timestamp_millis)
+        .filter(|at| *at <= now)
+    else {
+        return UsageFreshness::Unknown;
+    };
+    if now.signed_duration_since(measured) > chrono::Duration::minutes(5) {
+        UsageFreshness::Stale
+    } else {
+        UsageFreshness::Current
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageTone {
     Neutral,
     Warning,
@@ -61,9 +98,11 @@ pub struct ProviderUsageRow {
     /// Absolute reset moments for all windows, including when the row is collapsed.
     pub reset_tooltip: Option<String>,
     pub usage_lines: Vec<AgentUsageLine>,
-    /// The engine warning for this harness, carried only by rows that have no
-    /// quota of their own to show — "No usage yet" names the wrong cause when
-    /// the probe failed or the credential expired.
+    /// Quota freshness comes from collection metadata, never the RPC receipt.
+    pub freshness: Option<UsageFreshness>,
+    pub measurement_text: Option<String>,
+    pub recovery_text: Option<String>,
+    /// Per-account collection error; harness warnings fill only rows without quota.
     pub warning: Option<String>,
 }
 
@@ -261,6 +300,9 @@ fn placeholder_usage_row(harness: HarnessId, warning: Option<String>) -> Provide
         weekly_reset_badge: None,
         reset_tooltip: None,
         usage_lines: Vec::new(),
+        freshness: None,
+        measurement_text: None,
+        recovery_text: None,
         warning,
     }
 }
@@ -271,6 +313,23 @@ fn account_usage_row(
     warning: Option<String>,
     now: DateTime<Utc>,
 ) -> ProviderUsageRow {
+    let freshness = (!account.usage_windows.is_empty() || account.usage_error.is_some())
+        .then(|| quota_freshness(account, now));
+    let historical = freshness.is_some_and(|state| state != UsageFreshness::Current);
+    let measurement_text = (!account.usage_windows.is_empty()).then(|| {
+        let time = account
+            .usage_fetched_at
+            .and_then(DateTime::from_timestamp_millis)
+            .filter(|at| *at <= now)
+            .map(|at| at.format("%b %-d, %H:%M UTC").to_string());
+        if historical {
+            time.map(|time| format!("Last known · {time}"))
+                .unwrap_or_else(|| "Last known · time unavailable".into())
+        } else {
+            time.map(|time| format!("Measured {time}"))
+                .unwrap_or_default()
+        }
+    });
     let windows: Vec<_> = account
         .usage_windows
         .iter()
@@ -280,21 +339,27 @@ fn account_usage_row(
                 label: window.label.clone(),
                 used_fraction: window.used_fraction.clamp(0.0, 1.0),
                 remaining_percent: remaining,
-                reset_text: reset_text(window.resets_at, now),
-                pace: derive_usage_pace(
-                    window.used_fraction,
-                    window.resets_at,
-                    if window.label.to_lowercase().contains("week") {
-                        Some(10_080)
-                    } else if window.label.to_lowercase().contains("session")
-                        || window.label.to_lowercase().contains("5h")
-                    {
-                        Some(300)
-                    } else {
-                        None
-                    },
-                    now,
-                ),
+                reset_text: (!historical)
+                    .then(|| reset_text(window.resets_at, now))
+                    .flatten(),
+                pace: (!historical)
+                    .then(|| {
+                        derive_usage_pace(
+                            window.used_fraction,
+                            window.resets_at,
+                            if window.label.to_lowercase().contains("week") {
+                                Some(10_080)
+                            } else if window.label.to_lowercase().contains("session")
+                                || window.label.to_lowercase().contains("5h")
+                            {
+                                Some(300)
+                            } else {
+                                None
+                            },
+                            now,
+                        )
+                    })
+                    .flatten(),
             }
         })
         .collect();
@@ -306,9 +371,13 @@ fn account_usage_row(
         .find(|window| window.label.to_lowercase().contains("week"))
         .or_else(|| windows.first());
     let primary_remaining_percent = primary_window.map(|w| w.remaining_percent);
-    let weekly_summary =
-        primary_window.map(|window| format!("{} {}%", window.label, window.remaining_percent));
-    let weekly_reset_badge = primary_window.and_then(|window| {
+    let weekly_summary = match freshness {
+        Some(UsageFreshness::Stale) => Some("Out of date".into()),
+        Some(UsageFreshness::Unknown) => Some("Freshness unknown".into()),
+        Some(UsageFreshness::SignInRequired) => Some("Sign-in required".into()),
+        _ => primary_window.map(|window| format!("{} {}%", window.label, window.remaining_percent)),
+    };
+    let weekly_reset_badge = primary_window.filter(|_| !historical).and_then(|window| {
         reset_badge_text(
             account
                 .usage_windows
@@ -324,7 +393,7 @@ fn account_usage_row(
     } else {
         ProviderUsageState::Ready
     };
-    let weekly_tone = if state == ProviderUsageState::Ready {
+    let weekly_tone = if state == ProviderUsageState::Ready && !historical {
         weekly_usage_tone(primary_remaining_percent)
     } else {
         UsageTone::Neutral
@@ -346,13 +415,18 @@ fn account_usage_row(
         weekly_tone,
         windows,
         weekly_reset_badge,
-        reset_tooltip: (!account.usage_windows.is_empty())
+        reset_tooltip: (!account.usage_windows.is_empty() && !historical)
             .then(|| crate::settings::accounts::usage_resets(&account.usage_windows, now)),
         usage_lines: account.usage_lines.clone(),
-        // A provider already showing quota must not double as an error channel.
-        warning: (state != ProviderUsageState::Ready)
-            .then_some(warning)
-            .flatten(),
+        freshness,
+        measurement_text,
+        recovery_text: (freshness == Some(UsageFreshness::SignInRequired))
+            .then(|| "Open Settings → Accounts to reconnect.".into()),
+        warning: account.usage_error.clone().or_else(|| {
+            (state != ProviderUsageState::Ready)
+                .then_some(warning)
+                .flatten()
+        }),
     }
 }
 
@@ -413,6 +487,7 @@ mod tests {
     }
 
     fn account(
+        now: DateTime<Utc>,
         id: &str,
         harness: HarnessId,
         active: bool,
@@ -433,7 +508,7 @@ mod tests {
             auth_kind: None,
             switchable: true,
             saved_at: None,
-            usage_fetched_at: None,
+            usage_fetched_at: Some(now.timestamp_millis()),
             usage_error: None,
             provider: None,
         }
@@ -445,6 +520,7 @@ mod tests {
         let reset = Utc.with_ymd_and_hms(2026, 10, 7, 12, 0, 0).unwrap();
         let snapshot = AgentAccountsSnapshot {
             accounts: vec![account(
+                now,
                 "cursor-active",
                 HarnessId::Cursor,
                 true,
@@ -468,11 +544,13 @@ mod tests {
 
     #[test]
     fn rows_are_claude_then_codex_then_kimi_then_antigravity_and_use_active_accounts() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
         let reset = Utc.with_ymd_and_hms(2026, 8, 25, 12, 0, 0).unwrap();
         let rolling_reset = Utc.with_ymd_and_hms(2026, 8, 20, 15, 0, 0).unwrap();
         let snapshot = AgentAccountsSnapshot {
             accounts: vec![
                 account(
+                    now,
                     "codex-active",
                     HarnessId::Codex,
                     true,
@@ -483,6 +561,7 @@ mod tests {
                     }],
                 ),
                 account(
+                    now,
                     "claude-old",
                     HarnessId::ClaudeCode,
                     false,
@@ -493,6 +572,7 @@ mod tests {
                     }],
                 ),
                 account(
+                    now,
                     "claude-active",
                     HarnessId::ClaudeCode,
                     true,
@@ -503,6 +583,7 @@ mod tests {
                     }],
                 ),
                 account(
+                    now,
                     "kimi-managed",
                     HarnessId::Kimi,
                     true,
@@ -520,6 +601,7 @@ mod tests {
                     ],
                 ),
                 account(
+                    now,
                     "antigravity-managed",
                     HarnessId::Antigravity,
                     true,
@@ -549,7 +631,6 @@ mod tests {
             ],
             warnings: Vec::new(),
         };
-        let now = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
         let rows = usage_rows_hiding(&snapshot, &["claude-old"], now);
         // Every provider is listed; Cursor and Grok have no login here and ride
         // along as placeholders after the four detected ones.
@@ -598,7 +679,8 @@ mod tests {
 
     #[test]
     fn local_usage_lines_keep_provider_ready_without_remote_windows() {
-        let mut codex = account("codex-local", HarnessId::Codex, true, vec![]);
+        let now = Utc::now();
+        let mut codex = account(now, "codex-local", HarnessId::Codex, true, vec![]);
         codex.usage_lines = vec![AgentUsageLine {
             label: "24h".into(),
             value: "12K tokens".into(),
@@ -639,6 +721,7 @@ mod tests {
         let now = Utc::now();
         let snapshot = AgentAccountsSnapshot {
             accounts: vec![account(
+                now,
                 "claude-active",
                 HarnessId::ClaudeCode,
                 true,
@@ -663,17 +746,18 @@ mod tests {
     }
 
     #[test]
-    fn warning_replaces_the_generic_summary_only_on_rows_without_quota() {
+    fn warning_is_per_account_when_retained_quota_exists() {
         let now = Utc::now();
-        let mut codex = account("codex-active", HarnessId::Codex, true, vec![]);
+        let mut codex = account(now, "codex-active", HarnessId::Codex, true, vec![]);
         codex.usage_windows = vec![AgentUsageWindow {
             label: "Weekly".into(),
             used_fraction: 0.15,
             resets_at: None,
         }];
+        codex.usage_error = Some("Usage check failed (503)".into());
         let snapshot = AgentAccountsSnapshot {
             accounts: vec![
-                account("kimi-managed", HarnessId::Kimi, true, vec![]),
+                account(now, "kimi-managed", HarnessId::Kimi, true, vec![]),
                 codex,
             ],
             warnings: vec![
@@ -699,8 +783,16 @@ mod tests {
             kimi.warning.as_deref(),
             Some("Kimi Code Usage returned an invalid payload")
         );
-        // A provider already showing quota is not an error channel.
-        assert_eq!(rows_for(&rows, HarnessId::Codex)[0].warning, None);
+        assert_eq!(
+            rows_for(&rows, HarnessId::Codex)[0].warning.as_deref(),
+            Some("Usage check failed (503)")
+        );
+        assert_eq!(
+            rows_for(&rows, HarnessId::Codex)[0]
+                .weekly_summary
+                .as_deref(),
+            Some("Out of date")
+        );
         // The placeholder carries its harness warning too.
         assert_eq!(
             rows_for(&rows, HarnessId::Grok)[0].warning.as_deref(),
@@ -714,6 +806,7 @@ mod tests {
         let badge = |reset| {
             let snapshot = AgentAccountsSnapshot {
                 accounts: vec![account(
+                    now,
                     "claude-active",
                     HarnessId::ClaudeCode,
                     true,
@@ -757,6 +850,7 @@ mod tests {
         let check_tone = |used_fraction| {
             let snapshot = AgentAccountsSnapshot {
                 accounts: vec![account(
+                    now,
                     "claude-active",
                     HarnessId::ClaudeCode,
                     true,
@@ -793,6 +887,7 @@ mod tests {
         // NoUsage
         let no_usage_snapshot = AgentAccountsSnapshot {
             accounts: vec![account(
+                now,
                 "claude-active",
                 HarnessId::ClaudeCode,
                 true,
@@ -809,6 +904,7 @@ mod tests {
         // drives summary and tone together — the widget paints the summary with the tone.
         let non_weekly_snapshot = AgentAccountsSnapshot {
             accounts: vec![account(
+                now,
                 "kimi-active",
                 HarnessId::Kimi,
                 true,
@@ -835,6 +931,7 @@ mod tests {
 
         let make_snapshot = |used_fraction, resets_at| AgentAccountsSnapshot {
             accounts: vec![account(
+                now,
                 "claude-active",
                 HarnessId::ClaudeCode,
                 true,
@@ -867,9 +964,9 @@ mod tests {
     #[test]
     fn hidden_account_is_omitted_and_two_visible_claudes_are_two_rows() {
         let now = Utc::now();
-        let mut alice = account("claude-alice", HarnessId::ClaudeCode, true, vec![]);
+        let mut alice = account(now, "claude-alice", HarnessId::ClaudeCode, true, vec![]);
         alice.email = Some("alice@example.com".into());
-        let mut bob = account("claude-bob", HarnessId::ClaudeCode, false, vec![]);
+        let mut bob = account(now, "claude-bob", HarnessId::ClaudeCode, false, vec![]);
         bob.email = Some("bob@example.com".into());
         let snapshot = AgentAccountsSnapshot {
             accounts: vec![alice, bob],
@@ -896,8 +993,9 @@ mod tests {
 
     #[test]
     fn cursor_account_appears_when_visible() {
+        let now = Utc::now();
         let snapshot = AgentAccountsSnapshot {
-            accounts: vec![account("cursor-1", HarnessId::Cursor, true, vec![])],
+            accounts: vec![account(now, "cursor-1", HarnessId::Cursor, true, vec![])],
             warnings: vec![],
         };
         let rows = usage_rows(&snapshot, Utc::now());
@@ -912,8 +1010,9 @@ mod tests {
 
     #[test]
     fn grok_account_appears_when_visible() {
+        let now = Utc::now();
         let snapshot = AgentAccountsSnapshot {
-            accounts: vec![account("grok-1", HarnessId::Grok, true, vec![])],
+            accounts: vec![account(now, "grok-1", HarnessId::Grok, true, vec![])],
             warnings: vec![],
         };
         let rows = usage_rows(&snapshot, Utc::now());
@@ -928,8 +1027,9 @@ mod tests {
 
     #[test]
     fn hiding_every_account_of_a_provider_removes_it_entirely() {
+        let now = Utc::now();
         let snapshot = AgentAccountsSnapshot {
-            accounts: vec![account("kimi-managed", HarnessId::Kimi, true, vec![])],
+            accounts: vec![account(now, "kimi-managed", HarnessId::Kimi, true, vec![])],
             warnings: vec![AgentAccountWarning {
                 harness: HarnessId::Kimi,
                 message: "Kimi Code Usage returned an invalid payload".into(),
@@ -955,9 +1055,9 @@ mod tests {
     #[test]
     fn hiding_one_of_two_accounts_keeps_the_provider_without_a_placeholder() {
         let now = Utc::now();
-        let mut alice = account("claude-alice", HarnessId::ClaudeCode, true, vec![]);
+        let mut alice = account(now, "claude-alice", HarnessId::ClaudeCode, true, vec![]);
         alice.email = Some("alice@example.com".into());
-        let mut bob = account("claude-bob", HarnessId::ClaudeCode, false, vec![]);
+        let mut bob = account(now, "claude-bob", HarnessId::ClaudeCode, false, vec![]);
         bob.email = Some("bob@example.com".into());
         let snapshot = AgentAccountsSnapshot {
             accounts: vec![alice, bob],
@@ -970,4 +1070,179 @@ mod tests {
         assert_eq!(claude[0].account_id.as_deref(), Some("claude-alice"));
         assert_ne!(claude[0].state, ProviderUsageState::NotSignedIn);
     }
+    #[test]
+    fn usage_freshness_preserves_automatic_cli_refresh_instructions() {
+        let now = Utc::now();
+        let mut claude = account(
+            now,
+            "claude",
+            HarnessId::ClaudeCode,
+            true,
+            vec![AgentUsageWindow {
+                label: "Week".into(),
+                used_fraction: 0.05,
+                resets_at: None,
+            }],
+        );
+        claude.usage_error =
+            Some("Session expired — it refreshes the next time claude runs".into());
+        let row = super::account_usage_row(&claude, true, None, now);
+        assert_eq!(row.freshness, Some(super::UsageFreshness::Stale));
+        assert_eq!(row.weekly_summary.as_deref(), Some("Out of date"));
+        assert!(
+            row.recovery_text.is_none(),
+            "automatic native refresh must not request reconnect"
+        );
+        assert_eq!(row.warning, claude.usage_error);
+        claude.harness = HarnessId::Codex;
+        claude.usage_error = Some("Sign-in required — reconnect this account in Accounts".into());
+        let row = super::account_usage_row(&claude, true, None, now);
+        assert_eq!(row.freshness, Some(super::UsageFreshness::SignInRequired));
+        assert!(row.recovery_text.is_some());
+    }
+
+    #[test]
+    fn codex_usage_freshness_uses_measurement_age_error_and_clock() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 9, 12, 0, 0).unwrap();
+        for (age, error, expected) in [
+            (Some(0), None, "Week 95%"),
+            (Some(300000), None, "Week 95%"),
+            (Some(300001), None, "Out of date"),
+            (None, None, "Freshness unknown"),
+            (Some(-1), None, "Freshness unknown"),
+            (Some(0), Some("Usage check failed (503)"), "Out of date"),
+            (
+                Some(0),
+                Some("Usage check failed (retry in 4010s)"),
+                "Out of date",
+            ),
+            (
+                Some(0),
+                Some("Request 5401 failed on port 4030"),
+                "Out of date",
+            ),
+            (Some(0), Some("HTTP 401"), "Sign-in required"),
+            (Some(0), Some("HTTP (403)"), "Sign-in required"),
+            (
+                Some(0),
+                Some("Session expired — sign in again"),
+                "Sign-in required",
+            ),
+        ] {
+            let mut account = account(
+                now,
+                "codex",
+                HarnessId::Codex,
+                true,
+                vec![AgentUsageWindow {
+                    label: "Week".into(),
+                    used_fraction: 0.05,
+                    resets_at: Some(now + chrono::Duration::hours(1)),
+                }],
+            );
+            account.usage_fetched_at = age.map(|age| now.timestamp_millis() - age);
+            account.usage_error = error.map(str::to_owned);
+            let rows = usage_rows(
+                &AgentAccountsSnapshot {
+                    accounts: vec![account],
+                    warnings: vec![],
+                },
+                now,
+            );
+            let row = rows_for(&rows, HarnessId::Codex)[0];
+            assert_eq!(row.weekly_summary.as_deref(), Some(expected));
+            if expected != "Week 95%" {
+                assert!(row.weekly_reset_badge.is_none());
+                assert!(row.windows[0].pace.is_none());
+                assert!(row.windows[0].reset_text.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn codex_usage_freshness_is_per_account_and_recovery_requires_new_measurement() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 9, 12, 0, 0).unwrap();
+        let make = |id, used| {
+            account(
+                now,
+                id,
+                HarnessId::Codex,
+                false,
+                vec![AgentUsageWindow {
+                    label: "Week".into(),
+                    used_fraction: used,
+                    resets_at: Some(now - chrono::Duration::days(1)),
+                }],
+            )
+        };
+        let mut failed = make("b", 0.04);
+        failed.usage_error = Some("Session expired — sign in again".into());
+        failed.usage_fetched_at = Some((now - chrono::Duration::days(7)).timestamp_millis());
+        let mut snapshot = AgentAccountsSnapshot {
+            accounts: vec![make("a", 0.05), failed],
+            warnings: vec![],
+        };
+        let rows = usage_rows(&snapshot, now);
+        let rows = rows_for(&rows, HarnessId::Codex);
+        assert_eq!(rows[0].weekly_summary.as_deref(), Some("Week 95%"));
+        assert_eq!(rows[1].weekly_summary.as_deref(), Some("Sign-in required"));
+        assert_eq!(rows[1].windows[0].remaining_percent, 96);
+        assert!(rows[1].warning.as_deref().unwrap().contains("sign in"));
+        snapshot.accounts[1].usage_error = None; // RPC success alone cannot freshen a quota.
+        assert_eq!(
+            rows_for(&usage_rows(&snapshot, now), HarnessId::Codex)[1]
+                .weekly_summary
+                .as_deref(),
+            Some("Out of date")
+        );
+        snapshot.accounts[1].usage_fetched_at = Some(now.timestamp_millis());
+        snapshot.accounts[1].usage_windows[0].used_fraction = 0.05;
+        assert_eq!(
+            rows_for(&usage_rows(&snapshot, now), HarnessId::Codex)[1]
+                .weekly_summary
+                .as_deref(),
+            Some("Week 95%")
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires the sanitized snapshot exported by the engine HTTP fixture"]
+fn codex_usage_freshness_http_snapshot_to_row() {
+    let path = std::env::var_os("COMET_USAGE_HTTP_RECEIPT").expect("HTTP fixture receipt");
+    let snapshot: AgentAccountsSnapshot =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let measured_now = snapshot
+        .accounts
+        .iter()
+        .filter_map(|a| a.usage_fetched_at)
+        .max()
+        .and_then(DateTime::from_timestamp_millis)
+        .unwrap();
+    let rows = provider_usage_rows(&snapshot, &BTreeSet::new(), measured_now);
+    let codex = rows
+        .iter()
+        .filter(|r| r.harness == HarnessId::Codex)
+        .collect::<Vec<_>>();
+    assert_eq!(codex.len(), 2);
+    let healthy = codex
+        .iter()
+        .find(|r| r.freshness == Some(UsageFreshness::Current))
+        .unwrap();
+    assert_eq!(healthy.weekly_summary.as_deref(), Some("Week 95%"));
+    assert_eq!(healthy.windows[0].remaining_percent, 95);
+    let rejected = codex
+        .iter()
+        .find(|r| r.freshness == Some(UsageFreshness::SignInRequired))
+        .unwrap();
+    assert_eq!(rejected.weekly_summary.as_deref(), Some("Sign-in required"));
+    assert_eq!(rejected.windows[0].remaining_percent, 96);
+    assert!(
+        rejected
+            .measurement_text
+            .as_ref()
+            .unwrap()
+            .starts_with("Last known")
+    );
+    assert_ne!(healthy.account_id, rejected.account_id);
 }

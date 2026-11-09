@@ -937,7 +937,10 @@ fn list_presets_emits_screen_order_with_fallback_order_and_preferred()
         home.path().join("app-state.json"),
         serde_json::to_vec(&json!({
             "projects": [],
+            "comet_workers_preset_catalog_version": 2,
+            "native_preset_overlay_migrated": true,
             "presets": [
+                {"id":"absent-enabled","label":"Gemini fixture","command":"gemini","enabled":true,"quick_launch":true},
                 { "id": "omp", "label": "OMP CLI", "command": "omp", "enabled": true, "quick_launch": false },
                 { "id": "disabled", "label": "pi", "command": "pi", "enabled": false, "quick_launch": true },
                 { "id": "claude", "label": "claude", "command": "claude", "enabled": true, "quick_launch": true },
@@ -949,6 +952,18 @@ fn list_presets_emits_screen_order_with_fallback_order_and_preferred()
     )?;
     let _guard = UnpeelHomeGuard::set(home.path());
 
+    // Independent oracle: the same Settings projection the actual screen uses.
+    // No assumption about CLIs installed on this test host.
+    let _shell = EnvironmentVariableGuard::set("SHELL", "/bin/sh");
+    let _profile = EnvironmentVariableGuard::set("HOME", home.path());
+    let settings = zeron_workers_unpeel::LocalWorkersClient::new().settings()?;
+    let expected = settings
+        .presets
+        .iter()
+        .filter(|preset| preset.enabled && preset.installed)
+        .enumerate()
+        .map(|(index, preset)| (preset.id.as_str(), index as u64 + 1, preset.quick_launch))
+        .collect::<Vec<_>>();
     let response = controller_mcp_handle_request(json!({
         "jsonrpc": "2.0",
         "id": 10,
@@ -974,11 +989,50 @@ fn list_presets_emits_screen_order_with_fallback_order_and_preferred()
             )
         })
         .collect();
-    assert_eq!(
-        rows,
-        vec![("omp", 1, false), ("claude", 2, true), ("codex", 3, false)]
+    assert_eq!(rows, expected);
+    assert!(
+        presets
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|preset| preset.get("enabled").is_none())
     );
-    assert!(presets[0].get("enabled").is_none());
+    Ok(())
+}
+
+#[test]
+fn list_presets_keeps_initialized_empty_lists_and_settings_errors()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _lock = ENV_LOCK.lock();
+    for invalid in [false, true] {
+        let home = TempDir::new()?;
+        let path = home.path().join("app-state.json");
+        let mut state = json!({"projects":[],"presets":[],"comet_workers_preset_catalog_version":2,"native_preset_overlay_migrated":true,"active_tabs":{},"pinned_sessions":{},"unrelated":{"keep":true}});
+        if invalid {
+            state["comet_workers_resources"] = json!({"hibernation_enabled":"invalid"});
+        }
+        fs::write(&path, serde_json::to_vec(&state)?)?;
+        let before = fs::read(&path)?;
+        let _guard = UnpeelHomeGuard::set(home.path());
+        let _shell = EnvironmentVariableGuard::set("SHELL", "/bin/sh");
+        let _profile = EnvironmentVariableGuard::set("HOME", home.path());
+        let response=controller_mcp_handle_request(json!({"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"workers","arguments":{"action":"list_presets"}}})).unwrap();
+        assert_eq!(
+            response["result"]["isError"], invalid,
+            "Settings errors must not fall back to a builtin/disabled list: {response}"
+        );
+        if !invalid {
+            assert_eq!(
+                response["result"]["structuredContent"]["presets"],
+                json!([])
+            );
+        }
+        assert_eq!(
+            fs::read(&path)?,
+            before,
+            "a list must preserve initialized state and unrelated keys"
+        );
+    }
     Ok(())
 }
 

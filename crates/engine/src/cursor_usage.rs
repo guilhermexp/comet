@@ -79,11 +79,13 @@ struct CachedCursorUsage {
     credential: CredentialFingerprint,
     windows: Vec<AgentUsageWindow>,
     fetched_at: Instant,
+    measured_at_ms: i64,
 }
 
 pub(crate) struct CursorUsageSnapshot {
     pub present: bool,
     pub usage_windows: Vec<AgentUsageWindow>,
+    pub usage_fetched_at: Option<i64>,
     pub warning: Option<String>,
     pub email: Option<String>,
 }
@@ -93,6 +95,7 @@ impl CursorUsageSnapshot {
         Self {
             present: false,
             usage_windows: Vec::new(),
+            usage_fetched_at: None,
             warning: None,
             email: None,
         }
@@ -102,6 +105,7 @@ impl CursorUsageSnapshot {
         Self {
             present,
             usage_windows: Vec::new(),
+            usage_fetched_at: None,
             warning: Some(error.to_string()),
             email,
         }
@@ -242,6 +246,7 @@ impl CursorUsage {
                 return CursorUsageSnapshot {
                     present: true,
                     usage_windows: cached.windows.clone(),
+                    usage_fetched_at: Some(cached.measured_at_ms),
                     warning: None,
                     email,
                 };
@@ -250,6 +255,7 @@ impl CursorUsage {
             return CursorUsageSnapshot {
                 present: true,
                 usage_windows: Vec::new(),
+                usage_fetched_at: None,
                 warning: None,
                 email,
             };
@@ -263,6 +269,7 @@ impl CursorUsage {
                 Some(cached) if cached.credential == fingerprint => CursorUsageSnapshot {
                     present: true,
                     usage_windows: cached.windows.clone(),
+                    usage_fetched_at: Some(cached.measured_at_ms),
                     warning: Some(error.to_string()),
                     email: email.clone(),
                 },
@@ -272,14 +279,17 @@ impl CursorUsage {
 
         match self.fetch_usage(&session.access_token).await {
             Ok(usage_windows) => {
+                let measured_at_ms = Utc::now().timestamp_millis();
                 *self.usage_cache() = Some(CachedCursorUsage {
                     credential: fingerprint,
                     windows: usage_windows.clone(),
                     fetched_at: Instant::now(),
+                    measured_at_ms,
                 });
                 CursorUsageSnapshot {
                     present: true,
                     usage_windows,
+                    usage_fetched_at: Some(measured_at_ms),
                     warning: None,
                     email,
                 }
@@ -699,6 +709,8 @@ mod tests {
         // Stale-if-error: retained windows served with the warning.
         assert_eq!(second.usage_windows.len(), 1);
         assert!(second.warning.is_some());
+        assert!(first.usage_fetched_at.is_some());
+        assert_eq!(second.usage_fetched_at, first.usage_fetched_at);
         server.await.unwrap();
         assert_eq!(requests.lock().unwrap().len(), 2);
     }

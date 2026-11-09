@@ -2,6 +2,15 @@
 
 Tracks local/private fork changes against upstream.
 
+## 2026-11-09 — Lifecycle OMP, Usage e Context (implementação local para aceite)
+
+- OMP correlaciona admissão e resultado por request, usa o resultado moderno desde versão verificada 18.18.0, preserva yield/wake/background e conclui compactação pelo evento estruturado. O watchdog moderno mede inatividade após ACK, sem consumir esperas de host tools/input ou interromper streaming ativo. O probe nativo usa o ambiente/cwd reais do processo e seu cache separa esses inputs. Startup atende diálogos durante negociação/configuração, com saída limitada e sem bloquear o stream ainda não exposto; discovery sem Chat usa `--no-ui` preservando extensões/skills.
+- `workers(action=list_presets)` usa a disponibilidade da mesma projeção de Settings e oferece apenas enabled+installed, preservando ordem, favoritos e comandos personalizados. Prova do novo código em fixtures; a tool viva do app instalado não foi substituída.
+- Usage do Codex verifica o workspace autenticado sem confundir a chave composta do slot; erros por conta ficam visíveis com a última quota, backoff e proteção contra resposta de credencial antiga. Resumo identifica histórico/sign-in e a expansão mostra horário e recuperação pelos controles existentes.
+- Os coletores Kimi/Antigravity/Grok/Cursor propagam o horário real da quota pelo campo existente, mantendo o instante do cache; isso preserva a apresentação saudável sob a nova regra de freshness.
+- Context aproveita agregados normalizados de runtime/modelo corretos como Partial, preservando zero e horário de observação. OMP sem RPC detalhada usa estado read-only com ausência cacheada; o painel evita orçamento/listas vazios e concentra os metadados na ajuda Info acessível por teclado.
+- Provas locais Cargo e fixtures HTTP/GPUI, sem provider pago ou alteração de login. Captura nativa e recuperação do 401 real não comprovadas. Composição completa no OMP instalado continua dependente de produtor externo compatível. Sem instalação, push ou release; aceite e arquivamento pertencem ao orquestrador.
+
 ## 2026-11-07: v1.0.18
 
 - Turn stats usa a soma das durações nativas das chamadas ao modelo. Timing ausente, parcial ou interrompido antes de concluir a chamada fica indisponível; tokens, cache e custo recebidos são preservados.

@@ -1,13 +1,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::process::{Child, ChildStdout, Command, Stdio};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use super::protocol::{
     ChunkAssembler, MAX_INBOUND_BYTES, MAX_PENDING_REQUESTS, parse_frame, sanitize_diagnostic,
@@ -80,9 +80,21 @@ fn skill_scope_overlay() -> std::io::Result<PathBuf> {
 /// Keeping one queue avoids a second copy/buffer during the transition.
 const EVENT_BUFFER_CAPACITY: usize = 1024;
 
+/// Per-request admission, available before send. A native rejection and a
+/// failure before dispatch are distinct from losing the response after send.
+#[derive(Clone, Default)]
+// 0: not sent; 1: registered for send; 2: explicitly rejected by the peer.
+pub(super) struct PromptAdmission(Arc<AtomicU8>);
+impl PromptAdmission {
+    pub(super) fn awaits_result(&self) -> bool {
+        self.0.load(Ordering::Acquire) == 1
+    }
+}
+
 struct Pending {
     command: String,
     resolve: oneshot::Sender<Result<Value, String>>,
+    admission: Option<PromptAdmission>,
 }
 
 struct Inner {
@@ -100,6 +112,9 @@ struct Inner {
     /// True once the public event receiver is taken; protects the switch from
     /// startup buffering to the existing live-channel backpressure behavior.
     events_taken: Mutex<bool>,
+    /// Includes raw frames retained by interactive startup, not just channel slots.
+    startup_retained: AtomicU64,
+    startup_input: watch::Sender<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -111,7 +126,16 @@ pub struct OmpProcess {
     inner: Arc<Inner>,
     child: Arc<tokio::sync::Mutex<Child>>,
     events: Arc<Mutex<Option<mpsc::Receiver<Value>>>>,
-    capabilities: OmpCapabilities,
+    capabilities: Arc<Mutex<OmpCapabilities>>,
+    modern_lifecycle: bool,
+}
+
+/// A spawned child is observable before readiness and protocol negotiation.
+pub struct OmpStartup {
+    ready: oneshot::Receiver<Result<OmpCapabilities, String>>,
+    timeout: Duration,
+    executable: PathBuf,
+    cwd: PathBuf,
 }
 
 impl Clone for OmpProcess {
@@ -120,7 +144,8 @@ impl Clone for OmpProcess {
             inner: Arc::clone(&self.inner),
             child: Arc::clone(&self.child),
             events: Arc::clone(&self.events),
-            capabilities: self.capabilities,
+            capabilities: Arc::clone(&self.capabilities),
+            modern_lifecycle: self.modern_lifecycle,
         }
     }
 }
@@ -133,6 +158,25 @@ impl std::fmt::Debug for OmpProcess {
 
 impl OmpProcess {
     pub async fn start(launch: OmpLaunch) -> Result<Self, HarnessError> {
+        let (process, startup) = Self::spawn(launch).await?;
+        process.initialize(startup).await?;
+        Ok(process)
+    }
+
+    pub(super) async fn start_discovery(launch: OmpLaunch) -> Result<Self, HarnessError> {
+        let (process, startup) = Self::spawn_with_policy(launch, true).await?;
+        process.initialize(startup).await?;
+        Ok(process)
+    }
+
+    pub(super) async fn spawn(launch: OmpLaunch) -> Result<(Self, OmpStartup), HarnessError> {
+        Self::spawn_with_policy(launch, false).await
+    }
+
+    async fn spawn_with_policy(
+        launch: OmpLaunch,
+        no_ui: bool,
+    ) -> Result<(Self, OmpStartup), HarnessError> {
         let mut command = Command::new(&launch.executable);
         command
             .args(["--mode", "rpc-ui", "--auto-approve", "--allow-home"])
@@ -157,6 +201,9 @@ impl OmpProcess {
                 .arg("--append-system-prompt")
                 .arg(system_prompt_append);
         }
+        if no_ui {
+            command.arg("--no-ui");
+        }
         if launch.ephemeral {
             command.arg("--no-session");
         }
@@ -173,6 +220,33 @@ impl OmpProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Probe the same wrapper under the actual child environment (including
+        // composed PATH) and cwd. A source wrapper can choose a different build
+        // from these inputs even when its own file metadata is unchanged.
+        let executable = launch.executable.clone();
+        let cwd = launch.cwd.clone();
+        // Use std's native environment-key semantics (case-insensitive on
+        // Windows), so an explicit PATH also replaces an inherited Path.
+        let mut probe_environment = std::process::Command::new(&executable);
+        probe_environment.envs(std::env::vars_os());
+        for (key, value) in command.as_std_mut().get_envs() {
+            if let Some(value) = value {
+                probe_environment.env(key, value);
+            } else {
+                probe_environment.env_remove(key);
+            }
+        }
+        let environment = probe_environment
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value.to_owned())))
+            .collect();
+        let modern_lifecycle = tokio::task::spawn_blocking(move || {
+            crate::executable::binary_version_for_launch(&executable, &cwd, environment)
+        })
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|version| version >= semver::Version::new(18, 18, 0));
         // Which `omp` we resolved is the first thing a "before ready" failure
         // needs and the one thing the error never carried: PATH, the login
         // shell's PATH and `OMP_EXECUTABLE` can each point at a different
@@ -260,6 +334,8 @@ impl OmpProcess {
             stderr_tail,
             frames_before_ready: AtomicU64::new(0),
             events_taken: Mutex::new(false),
+            startup_retained: AtomicU64::new(0),
+            startup_input: watch::channel(false).0,
         });
         let (event_tx, event_rx) = mpsc::channel(EVENT_BUFFER_CAPACITY);
         let (ready_tx, ready_rx) = oneshot::channel::<Result<OmpCapabilities, String>>();
@@ -272,69 +348,104 @@ impl OmpProcess {
             ready_tx,
         ));
 
-        let mut process = Self {
+        let process = Self {
             inner,
             child: Arc::new(tokio::sync::Mutex::new(child)),
             events: Arc::new(Mutex::new(Some(event_rx))),
-            capabilities: OmpCapabilities::default(),
+            capabilities: Arc::new(Mutex::new(OmpCapabilities::default())),
+            modern_lifecycle,
         };
-        match tokio::time::timeout(launch.handshake_timeout, ready_rx).await {
-            Ok(Ok(Ok(capabilities))) => {
-                process.capabilities = capabilities;
+        Ok((
+            process,
+            OmpStartup {
+                ready: ready_rx,
+                timeout: launch.handshake_timeout,
+                executable: launch.executable,
+                cwd: launch.cwd,
+            },
+        ))
+    }
+
+    pub(super) async fn initialize(&self, startup: OmpStartup) -> Result<(), HarnessError> {
+        let result = self.with_input_budget(startup.timeout, startup.ready).await;
+        let error = match result {
+            Some(Ok(Ok(capabilities))) => {
+                *lock(&self.capabilities) = capabilities;
                 if capabilities.chunked_frames {
-                    process.negotiate_chunked_frames().await;
+                    self.negotiate_chunked_frames().await;
                 }
-                let fatal = lock(&process.inner.fatal).clone();
-                if let Some(message) = fatal {
-                    let _ = process.shutdown().await;
-                    return Err(HarnessError::Protocol(message));
-                }
-                Ok(process)
+                lock(&self.inner.fatal).clone()
             }
-            Ok(Ok(Err(message))) => {
-                let _ = process.shutdown().await;
-                Err(HarnessError::Protocol(format!(
-                    "{message} (executable: {})",
-                    launch.executable.display()
-                )))
+            Some(Ok(Err(message))) => Some(format!(
+                "{message} (executable: {})",
+                startup.executable.display()
+            )),
+            Some(Err(_)) => Some(fatal_message(&self.inner, "OMP RPC exited before ready")),
+            None => {
+                let alive = self.child_state().await;
+                tracing::warn!(target: "zeron_harness::omp", executable=%startup.executable.display(), cwd=%startup.cwd.display(), child=%alive,
+                    waited_ms=startup.timeout.as_millis() as u64,
+                    stdout_frames_before_deadline=self.inner.frames_before_ready.load(Ordering::SeqCst),
+                    "OMP RPC handshake timed out");
+                Some(fatal_message(&self.inner, "OMP RPC handshake timed out"))
             }
-            Ok(Err(_)) => {
-                let _ = process.shutdown().await;
-                Err(HarnessError::Protocol(fatal_message(
-                    &process.inner,
-                    "OMP RPC exited before ready",
-                )))
-            }
-            Err(_) => {
-                // O `omp` nao escreve nada em stderr no caminho feliz, entao
-                // `fatal_message` costuma devolver a string nua e a ocorrencia
-                // seguinte fica tao cega quanto a primeira. Registrar o prazo
-                // real, se o filho ainda estava vivo e quantos frames ja
-                // tinham saido separa "boot lento" de "processo travado" de
-                // "protocolo mudo" — que exigem correcoes diferentes.
-                let alive = process.child_state().await;
-                tracing::warn!(
-                    target: "zeron_harness::omp",
-                    executable = %launch.executable.display(),
-                    cwd = %launch.cwd.display(),
-                    waited_ms = launch.handshake_timeout.as_millis() as u64,
-                    child = %alive,
-                    stdout_frames_before_deadline =
-                        process.inner.frames_before_ready.load(Ordering::SeqCst),
-                    knob = "ZERON_OMP_HANDSHAKE_MS",
-                    "OMP RPC handshake timed out"
-                );
-                let _ = process.shutdown().await;
-                Err(HarnessError::Protocol(fatal_message(
-                    &process.inner,
-                    "OMP RPC handshake timed out",
-                )))
-            }
+        };
+        if let Some(message) = error {
+            let _ = self.shutdown().await;
+            Err(HarnessError::Protocol(message))
+        } else {
+            Ok(())
         }
     }
 
     pub fn capabilities(&self) -> OmpCapabilities {
-        self.capabilities
+        *lock(&self.capabilities)
+    }
+
+    pub(super) fn modern_lifecycle(&self) -> bool {
+        self.modern_lifecycle
+    }
+
+    pub(super) fn startup_input_pending(&self, pending: bool) {
+        self.inner.startup_input.send_replace(pending);
+    }
+
+    /// Pause a transport budget only while a startup dialog awaits a person.
+    /// No timer or polling is added to the event loop.
+    async fn with_input_budget<F: std::future::Future>(
+        &self,
+        mut budget: Duration,
+        future: F,
+    ) -> Option<F::Output> {
+        tokio::pin!(future);
+        let mut input = self.inner.startup_input.subscribe();
+        loop {
+            let waiting_for_input = *input.borrow_and_update();
+            if waiting_for_input {
+                tokio::select! {
+                    result = &mut future => return Some(result),
+                    _ = input.changed() => {},
+                }
+            } else {
+                let started = tokio::time::Instant::now();
+                tokio::select! {
+                    result = &mut future => return Some(result),
+                    _ = input.changed() => { budget = budget.saturating_sub(started.elapsed()); },
+                    _ = tokio::time::sleep(budget) => {
+                        if !*input.borrow() { return None; }
+                        budget = Duration::ZERO;
+                    },
+                }
+            }
+        }
+    }
+
+    /// Allocate identity before registering prompt state or constructing its send future.
+    pub fn request_id(&self) -> String {
+        format!(
+            "comet-{}",
+            self.inner.sequence.fetch_add(1, Ordering::Relaxed) + 1
+        )
     }
 
     /// Pede a v2 do protocolo, a que parte um frame acima de 1 MiB em
@@ -365,6 +476,25 @@ impl OmpProcess {
         command: Value,
         timeout: Duration,
     ) -> Result<Value, HarnessError> {
+        self.request_with_admission(command, timeout, None).await
+    }
+
+    pub(super) async fn request_prompt(
+        &self,
+        command: Value,
+        timeout: Duration,
+        admission: PromptAdmission,
+    ) -> Result<Value, HarnessError> {
+        self.request_with_admission(command, timeout, Some(admission))
+            .await
+    }
+
+    async fn request_with_admission(
+        &self,
+        command: Value,
+        timeout: Duration,
+        admission: Option<PromptAdmission>,
+    ) -> Result<Value, HarnessError> {
         if self.inner.closed.load(Ordering::SeqCst) {
             return Err(HarnessError::Protocol("OMP RPC process is closed".into()));
         }
@@ -377,10 +507,15 @@ impl OmpProcess {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| HarnessError::Protocol("OMP RPC command has no type".into()))?
             .to_owned();
-        let id = format!(
-            "comet-{}",
-            self.inner.sequence.fetch_add(1, Ordering::Relaxed) + 1
-        );
+        let id = match command.get("id") {
+            None => self.request_id(),
+            Some(Value::String(id)) if !id.is_empty() && id.len() <= 256 => id.clone(),
+            _ => {
+                return Err(HarnessError::Protocol(
+                    "OMP RPC request id is invalid".into(),
+                ));
+            }
+        };
         let mut frame = command;
         frame
             .as_object_mut()
@@ -395,11 +530,20 @@ impl OmpProcess {
                     "OMP RPC pending request limit exceeded".into(),
                 ));
             }
+            if pending.contains_key(&id) {
+                return Err(HarnessError::Protocol(
+                    "OMP RPC duplicate pending request id".into(),
+                ));
+            }
+            if let Some(admission) = &admission {
+                admission.0.store(1, Ordering::Release);
+            }
             pending.insert(
                 id.clone(),
                 Pending {
                     command: command_name.clone(),
                     resolve: tx,
+                    admission: admission.clone(),
                 },
             );
         }
@@ -409,6 +553,9 @@ impl OmpProcess {
             .send(WriteMessage::Frame(serialized))
             .is_err()
         {
+            if let Some(admission) = &admission {
+                admission.0.store(0, Ordering::Release);
+            }
             lock(&self.inner.pending).remove(&id);
             return Err(HarnessError::Protocol("OMP RPC stdin is closed".into()));
         }
@@ -429,22 +576,22 @@ impl OmpProcess {
             id: &id,
             active: true,
         };
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(Ok(value))) => {
+        match self.with_input_budget(timeout, rx).await {
+            Some(Ok(Ok(value))) => {
                 guard.active = false;
                 Ok(value)
             }
-            Ok(Ok(Err(message))) => {
+            Some(Ok(Err(message))) => {
                 guard.active = false;
                 Err(HarnessError::Protocol(message))
             }
-            Ok(Err(_)) => {
+            Some(Err(_)) => {
                 guard.active = false;
                 Err(HarnessError::Protocol(format!(
                     "OMP RPC {command_name} response channel closed"
                 )))
             }
-            Err(_) => Err(HarnessError::Protocol(format!(
+            None => Err(HarnessError::Protocol(format!(
                 "OMP RPC {command_name} request timed out"
             ))),
         }
@@ -459,12 +606,25 @@ impl OmpProcess {
     }
 
     pub fn take_events(&self) -> Result<mpsc::Receiver<Value>, HarnessError> {
-        let mut events_taken = lock(&self.inner.events_taken);
+        let mut taken = lock(&self.inner.events_taken);
+        let receiver = self.take_startup_events()?;
+        *taken = true;
+        Ok(receiver)
+    }
+
+    pub(super) fn take_startup_events(&self) -> Result<mpsc::Receiver<Value>, HarnessError> {
         let receiver = lock(&self.events)
             .take()
             .ok_or_else(|| HarnessError::Protocol("OMP RPC events already taken".into()))?;
-        *events_taken = true;
         Ok(receiver)
+    }
+
+    pub(super) fn activate_events(&self) {
+        *lock(&self.inner.events_taken) = true;
+    }
+
+    pub(super) fn consumed_startup_input(&self) {
+        self.inner.startup_retained.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Por que o reader de stdout parou, nas palavras dele (teto de frame,
@@ -580,6 +740,18 @@ async fn read_stdout(
                     if *events_taken {
                         Some(frame)
                     } else {
+                        if inner.startup_retained.fetch_add(1, Ordering::Relaxed)
+                            >= EVENT_BUFFER_CAPACITY as u64
+                        {
+                            let message = format!(
+                                "OMP RPC event buffer exceeded its limit of {EVENT_BUFFER_CAPACITY} frames"
+                            );
+                            fail(&inner, message.clone());
+                            if let Some(ready) = ready_tx.take() {
+                                let _ = ready.send(Err(message));
+                            }
+                            return;
+                        }
                         match event_tx.try_send(frame) {
                             Ok(()) => None,
                             Err(mpsc::error::TrySendError::Closed(_)) => return,
@@ -691,6 +863,9 @@ fn route_response(inner: &Inner, frame: Value) {
                 .and_then(Value::as_str)
                 .unwrap_or("OMP RPC request failed"),
         );
+        if let Some(admission) = &pending.admission {
+            admission.0.store(2, Ordering::Release);
+        }
         let _ = pending.resolve.send(Err(message));
         return;
     }

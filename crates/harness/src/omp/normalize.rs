@@ -15,6 +15,7 @@ const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
 pub enum AgentEndDisposition {
     Continue,
     Complete,
+    Interrupted,
     Error(String),
 }
 
@@ -176,7 +177,9 @@ impl OmpNormalizer {
     }
 
     pub fn classify_agent_end(&mut self, frame: &Value) -> AgentEndDisposition {
-        if frame.get("isTerminal").and_then(Value::as_bool) == Some(false)
+        if frame.get("yielded").and_then(Value::as_bool) == Some(false)
+            || frame.get("yielded").and_then(Value::as_bool) != Some(true)
+                && frame.get("isTerminal").and_then(Value::as_bool) == Some(false)
             || !self.subagents.is_empty()
         {
             return AgentEndDisposition::Continue;

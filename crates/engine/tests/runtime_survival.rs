@@ -1325,7 +1325,7 @@ async fn omp_update_keeps_active_steers_and_sends_in_the_same_runtime() {
 }
 
 #[tokio::test]
-async fn omp_update_waits_for_background_work_after_done() {
+async fn omp_background_update_waits_for_background_work_after_done() {
     let rig = rig_for_harness(false, false, HarnessId::Omp);
     rig.core
         .sessions
@@ -1452,4 +1452,44 @@ async fn omp_update_drains_an_accepted_steer_before_retiring_at_done() {
     drop(lease);
     rig.core.registry.end_update(HarnessId::Omp);
     rig.core.sessions.shutdown().await;
+}
+
+#[tokio::test]
+async fn omp_background_stop_and_shutdown_release_pending_delivery() {
+    for shutdown in [false, true] {
+        let rig = rig_for_harness(false, false, HarnessId::Omp);
+        rig.core
+            .sessions
+            .dispatch(
+                CHAT,
+                HarnessId::Omp,
+                RunRequest {
+                    harness: Some(HarnessId::Omp),
+                    ..request("native pending delivery")
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        wait_for(|| rig.ledger.turn.lock().unwrap().is_some(), "OMP runtime").await;
+        let turn = rig.ledger.turn.lock().unwrap().clone().unwrap();
+        turn.set_background(1);
+        rig.ledger.release.notify_one();
+        settle(&rig, 1).await;
+        if shutdown {
+            rig.core.sessions.shutdown().await;
+        } else {
+            rig.core
+                .doc_host
+                .queue_command(CHAT, SessionCommandPayload::Interrupt {})
+                .unwrap();
+        }
+        wait_for(
+            || rig.ledger.kills.load(Ordering::SeqCst) == 1,
+            "explicit teardown despite native pending delivery",
+        )
+        .await;
+        assert!(!rig.core.sessions.live_run_steerable(CHAT));
+        rig.core.sessions.shutdown().await;
+    }
 }
